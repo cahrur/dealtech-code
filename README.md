@@ -104,25 +104,9 @@ cd /srv/ai-platform && docker compose up -d --build
 # Lihat: https://docs.openclaw.ai/install/docker
 ```
 
-**3. Konfigurasi 9router** — tambahkan AI provider keys via terminal:
+**3. Konfigurasi 9router** — tambahkan AI provider keys via command 9router:
 ```bash
-nano /srv/ai-platform/9router/config.json
-```
-
-Isi dengan API keys provider yang kamu punya:
-```json
-{
-  "port": 4000,
-  "providers": {
-    "anthropic": {
-      "apiKey": "sk-ant-xxx"
-    },
-    "openai": {
-      "apiKey": "sk-xxx"
-    }
-  },
-  "defaultModel": "claude-sonnet-4-6"
-}
+9router --help
 ```
 
 **4. Start 9router:**
