@@ -167,6 +167,50 @@ APP_PORT=8080
 LOG_LEVEL=info
 ```
 
+## GitHub Integration
+
+### Setup Token
+
+1. GitHub → Settings → Developer settings → Personal access tokens → Tokens (classic)
+2. Generate new token → scope: **`repo`** (full control of private repositories)
+3. Tambah ke `.env` di VPS:
+
+```bash
+echo "GITHUB_TOKEN=ghp_xxx" >> /srv/ai-platform/.env
+docker compose restart backend
+```
+
+> Untuk tim/organisasi: buat GitHub account khusus (bot account), invite ke org dengan akses repo yang dibutuhkan, lalu generate token dari account tersebut.
+
+### Buat Project + Create Repo GitHub Baru
+
+```json
+POST /api/projects
+{
+  "name": "My Project",
+  "openclaw_agent_id": "default",
+  "description": "Deskripsi project",
+  "create_github_repo": true,
+  "github_org": "nama-organisasi",
+  "github_private": true
+}
+```
+
+`repo_url` akan otomatis diisi dari repo yang baru dibuat.
+
+### Buat Project dari Repo yang Sudah Ada (termasuk private)
+
+```json
+POST /api/projects
+{
+  "name": "Existing Project",
+  "repo_url": "https://github.com/org/repo.git",
+  "openclaw_agent_id": "default"
+}
+```
+
+Token GitHub otomatis dipakai untuk clone private repo dan push branch hasil kerja agent.
+
 ## Management Menu
 
 ```bash
