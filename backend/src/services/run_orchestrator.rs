@@ -46,8 +46,15 @@ pub async fn execute_run(
     repo_url: String,
     policy_config: PolicyConfig,
 ) {
-    if let Err(e) = run_inner(db, redis, config, run_id, team_slug, project_slug, repo_url, policy_config).await {
+    if let Err(e) = run_inner(db.clone(), redis, config, run_id, team_slug, project_slug, repo_url, policy_config).await {
         tracing::error!(run_id = %run_id, error = %e, "Agent run failed");
+        let _ = sqlx::query(
+            "UPDATE agent_runs SET status='failed_agent', finished_at=NOW(), error_message=$1 WHERE id=$2"
+        )
+        .bind(e.to_string())
+        .bind(run_id)
+        .execute(db.as_ref())
+        .await;
     }
 }
 
