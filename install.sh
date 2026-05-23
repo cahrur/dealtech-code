@@ -515,7 +515,8 @@ info() { echo -e "${CYAN}[i]${NC} $1"; }
 
 admin_menu() {
   ADMIN_KEY=$(grep "^ADMIN_API_KEY=" "$PLATFORM_DIR/.env" 2>/dev/null | cut -d= -f2)
-  BASE_URL="http://localhost:8080"
+  DOMAIN=$(grep "^DOMAIN=" "$PLATFORM_DIR/.env" 2>/dev/null | cut -d= -f2)
+  BASE_URL="https://$DOMAIN"
   while true; do
     echo ""
     echo -e "${BOLD}${CYAN}╔══════════════════════════════════════╗${NC}"
