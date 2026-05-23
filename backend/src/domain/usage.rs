@@ -12,6 +12,7 @@ pub struct UsageLog {
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub total_tokens: i64,
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
 }
 

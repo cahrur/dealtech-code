@@ -63,9 +63,12 @@ pub struct AgentRun {
     pub worktree_path: Option<String>,
     pub commit_sha: Option<String>,
     pub pr_url: Option<String>,
+    #[serde(with = "time::serde::rfc3339::option")]
     pub started_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
     pub finished_at: Option<OffsetDateTime>,
     pub error_message: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
 }
 
@@ -77,6 +80,7 @@ pub struct RunEvent {
     pub seq: i64,
     pub event_type: String,
     pub payload: serde_json::Value,
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
 }
 

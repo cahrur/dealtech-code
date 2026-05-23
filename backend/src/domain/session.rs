@@ -9,7 +9,9 @@ pub struct CodingSession {
     pub project_id: Uuid,
     pub user_id: Uuid,
     pub title: String,
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
 }
 

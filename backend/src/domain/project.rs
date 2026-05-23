@@ -12,7 +12,9 @@ pub struct Project {
     pub repo_url: String,
     pub openclaw_agent_id: String,
     pub description: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
 }
 
