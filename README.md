@@ -186,8 +186,15 @@ bash /srv/ai-platform/manage.sh
   7) Restart backend
   8) View backend logs
   9) View all logs
+  a) Admin Panel
   0) Exit
 ```
+
+**Admin Panel** (opsi `a`) — kelola API key via terminal tanpa web:
+- List semua API key
+- Buat API key baru (otomatis spawn Docker container untuk user)
+- Revoke API key (otomatis destroy container)
+- Lihat usage stats per key
 
 Direct commands:
 ```bash

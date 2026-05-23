@@ -513,6 +513,50 @@ log()  { echo -e "${GREEN}[✓]${NC} $1"; }
 warn() { echo -e "${YELLOW}[!]${NC} $1"; }
 info() { echo -e "${CYAN}[i]${NC} $1"; }
 
+admin_menu() {
+  ADMIN_KEY=$(grep "^ADMIN_API_KEY=" "$PLATFORM_DIR/.env" 2>/dev/null | cut -d= -f2)
+  BASE_URL="http://localhost:8080"
+  while true; do
+    echo ""
+    echo -e "${BOLD}${CYAN}╔══════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}${CYAN}║         Admin Panel                  ║${NC}"
+    echo -e "${BOLD}${CYAN}╚══════════════════════════════════════╝${NC}"
+    echo "  1) List semua API key"
+    echo "  2) Buat API key baru"
+    echo "  3) Revoke API key"
+    echo "  4) Usage stats"
+    echo "  0) Kembali ke menu utama"
+    echo ""
+    read -rp "Choose [0-4]: " ch
+    case "$ch" in
+      1)
+        echo "" && curl -s -H "X-API-Key: $ADMIN_KEY" "$BASE_URL/api/apikeys" | python3 -m json.tool
+        ;;
+      2)
+        read -rp "Nama key: " name
+        read -rp "Role (admin/developer/viewer): " role
+        echo "" && curl -s -X POST \
+          -H "X-API-Key: $ADMIN_KEY" \
+          -H "Content-Type: application/json" \
+          -d "{\"name\":\"$name\",\"role\":\"$role\"}" \
+          "$BASE_URL/api/apikeys" | python3 -m json.tool
+        echo -e "\n${YELLOW}[!]${NC} Simpan key di atas — hanya tampil sekali!"
+        ;;
+      3)
+        read -rp "Key ID (UUID): " kid
+        echo "" && curl -s -X POST \
+          -H "X-API-Key: $ADMIN_KEY" \
+          "$BASE_URL/api/apikeys/$kid/revoke" | python3 -m json.tool
+        ;;
+      4)
+        echo "" && curl -s -H "X-API-Key: $ADMIN_KEY" "$BASE_URL/api/usage" | python3 -m json.tool
+        ;;
+      0) break ;;
+      *) warn "Invalid option" ;;
+    esac
+  done
+}
+
 show_menu() {
   while true; do
     echo ""
@@ -528,6 +572,7 @@ show_menu() {
     echo "  7) Restart backend"
     echo "  8) View backend logs"
     echo "  9) View all logs"
+    echo "  a) Admin Panel"
     echo "  0) Exit"
     echo ""
     read -rp "Choose [0-9]: " choice
@@ -549,6 +594,7 @@ show_menu() {
       7) cd "$PLATFORM_DIR" && docker compose restart backend && log "Backend restarted" ;;
       8) cd "$PLATFORM_DIR" && docker compose logs -f backend ;;
       9) cd "$PLATFORM_DIR" && docker compose logs -f ;;
+      a|A) admin_menu ;;
       0) break ;;
       *) warn "Invalid option" ;;
     esac
