@@ -22,20 +22,31 @@ pub async fn save_event(
     event_type: &str,
     payload: Value,
 ) -> anyhow::Result<i64> {
+    let mut tx = db.begin().await?;
+    // Lock session row to prevent concurrent seq generation (race condition fix)
+    sqlx::query("SELECT id FROM coding_sessions WHERE id = $1 FOR UPDATE")
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await?;
     let seq: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(seq), 0) + 1 FROM run_events WHERE session_id = $1",
+    )
+    .bind(session_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    sqlx::query(
         "INSERT INTO run_events (id, run_id, session_id, seq, event_type, payload)
-         VALUES ($1, $2, $3, (
-             SELECT COALESCE(MAX(seq), 0) + 1 FROM run_events WHERE session_id = $2
-         ), $4, $5)
-         RETURNING seq",
+         VALUES ($1, $2, $3, $4, $5, $6)",
     )
     .bind(Uuid::new_v4())
     .bind(run_id)
     .bind(session_id)
+    .bind(seq)
     .bind(event_type)
     .bind(&payload)
-    .fetch_one(db)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(seq)
 }
 

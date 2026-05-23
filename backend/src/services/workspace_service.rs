@@ -44,6 +44,19 @@ pub async fn prepare_workspace(
         if !status.success() {
             return Err(AppError::Internal(anyhow::anyhow!("git clone failed")));
         }
+        // Empty repo has no HEAD — create initial commit so worktrees work
+        let has_head = Command::new("git")
+            .args(["-C", workspace_path.to_str().unwrap(), "rev-parse", "HEAD"])
+            .output().await.map(|o| o.status.success()).unwrap_or(false);
+        if !has_head {
+            let _ = Command::new("git")
+                .args(["-C", workspace_path.to_str().unwrap(),
+                    "commit", "--allow-empty", "-m", "chore: initial commit"])
+                .output().await;
+            let _ = Command::new("git")
+                .args(["-C", workspace_path.to_str().unwrap(), "push", "origin", "HEAD"])
+                .output().await;
+        }
     }
     Ok(workspace_path)
 }
