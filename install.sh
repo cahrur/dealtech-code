@@ -317,6 +317,7 @@ ${DOMAIN} {
 
   reverse_proxy /api/* backend:8080
   reverse_proxy /health backend:8080
+  reverse_proxy /9router/* localhost:20128
 
   log {
     output file /var/log/caddy/access.log
@@ -518,7 +519,7 @@ show_menu() {
     echo "  1) Start 9router"
     echo "  2) Stop 9router"
     echo "  3) Status 9router"
-    echo "  4) Open 9router (Terminal UI)"
+    echo "  4) Open 9router (Web UI URL)"
     echo "  5) Start platform (docker compose up)"
     echo "  6) Stop platform (docker compose down)"
     echo "  7) Restart backend"
@@ -536,7 +537,10 @@ show_menu() {
         ;;
       2) pkill -f "9router" 2>/dev/null && log "9router stopped" || warn "9router was not running" ;;
       3) pgrep -f "9router" > /dev/null && log "9router is running" || warn "9router is NOT running" ;;
-      4) 9router ;;
+      4)
+        DOMAIN=$(grep "^DOMAIN=" "$PLATFORM_DIR/.env" 2>/dev/null | cut -d= -f2)
+        info "9router Web UI: https://$DOMAIN/9router"
+        ;;
       5) cd "$PLATFORM_DIR" && docker compose up -d && log "Platform started" ;;
       6) cd "$PLATFORM_DIR" && docker compose down && log "Platform stopped" ;;
       7) cd "$PLATFORM_DIR" && docker compose restart backend && log "Backend restarted" ;;

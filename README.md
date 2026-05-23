@@ -120,6 +120,22 @@ curl https://yourdomain.com/health
 # → ok
 ```
 
+## Update
+
+Setiap ada perubahan code, jalankan di VPS:
+
+```bash
+cd ~/dealtech-code
+sudo bash update.sh
+```
+
+Script `update.sh` otomatis:
+1. Pull latest code dari GitHub
+2. Copy backend source ke `/srv/ai-platform/app/backend/`
+3. Rebuild dan restart backend container
+4. Update `manage.sh`
+5. Update Caddyfile (tambah proxy baru jika ada)
+
 ## Konfigurasi
 
 Semua config di `/srv/ai-platform/.env` (chmod 600):
@@ -164,7 +180,7 @@ bash /srv/ai-platform/manage.sh
   1) Start 9router
   2) Stop 9router
   3) Status 9router
-  4) Open 9router (Terminal UI)
+  4) Open 9router (Web UI URL)
   5) Start platform (docker compose up)
   6) Stop platform (docker compose down)
   7) Restart backend
