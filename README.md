@@ -90,21 +90,47 @@ Lalu otomatis:
 
 ### Setelah instalasi:
 
-**1. Install OpenClaw Gateway** (bind ke `127.0.0.1:18789`):
+**1. Deploy backend** (repo sudah ada di VPS dari langkah clone):
+```bash
+cp -r ~/dealtech-code/backend/* /srv/ai-platform/app/backend/
+```
+
+```bash
+cd /srv/ai-platform && docker compose up -d --build
+```
+
+**2. Install OpenClaw Gateway** (bind ke `127.0.0.1:18789`):
 ```bash
 # Lihat: https://docs.openclaw.ai/install/docker
 ```
 
-**2. Konfigurasi 9router** via panel web:
+**3. Konfigurasi 9router** — tambahkan AI provider keys via terminal:
+```bash
+nano /srv/ai-platform/9router/config.json
+```
 
-Setelah 9router distart, buka panel di `http://localhost:4000` dan tambahkan AI provider keys (Anthropic, OpenAI, dll) langsung dari UI panel.
+Isi dengan API keys provider yang kamu punya:
+```json
+{
+  "port": 4000,
+  "providers": {
+    "anthropic": {
+      "apiKey": "sk-ant-xxx"
+    },
+    "openai": {
+      "apiKey": "sk-xxx"
+    }
+  },
+  "defaultModel": "claude-sonnet-4-6"
+}
+```
 
-**3. Start 9router:**
+**4. Start 9router:**
 ```bash
 bash /srv/ai-platform/manage.sh start
 ```
 
-**4. Verifikasi:**
+**5. Verifikasi:**
 ```bash
 curl https://yourdomain.com/health
 # → ok
