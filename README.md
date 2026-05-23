@@ -56,16 +56,18 @@ Git Worktree Disposable → branch → test → commit → PR
 ### Single command deploy:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/cahrur/dealtech-code/main/install.sh | sudo bash
+git clone https://github.com/cahrur/dealtech-code.git
 ```
-
-Atau clone dulu:
 
 ```bash
-git clone https://github.com/cahrur/dealtech-code.git
 cd dealtech-code
+```
+
+```bash
 sudo bash install.sh
 ```
+
+> **Penting:** Jalankan setiap perintah **satu per satu**. Script installer bersifat interaktif — akan menanyakan domain, email, dan konfigurasi lainnya.
 
 Installer akan menanyakan:
 - Domain (contoh: `ai.mudahdeal.com`)
@@ -346,4 +348,3 @@ cargo clippy -- -D warnings
 ## License
 
 Internal use only.
-```
