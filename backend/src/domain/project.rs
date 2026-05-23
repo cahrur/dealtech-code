@@ -30,9 +30,12 @@ pub struct ProjectMember {
 #[derive(Debug, Deserialize)]
 pub struct CreateProjectRequest {
     pub name: String,
-    pub repo_url: String,
+    pub repo_url: Option<String>,
     pub openclaw_agent_id: String,
     pub description: Option<String>,
+    pub create_github_repo: Option<bool>,
+    pub github_org: Option<String>,
+    pub github_private: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]

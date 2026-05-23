@@ -37,6 +37,7 @@ pub async fn create(
     req: CreateProjectRequest,
 ) -> Result<Project> {
     let slug = req.name.to_lowercase().replace(' ', "-");
+    let repo_url = req.repo_url.unwrap_or_default();
     let project = sqlx::query_as::<_, Project>(
         "INSERT INTO projects (id, team_id, name, slug, repo_url, openclaw_agent_id, description)
          VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *",
@@ -45,7 +46,7 @@ pub async fn create(
     .bind(team_id)
     .bind(&req.name)
     .bind(&slug)
-    .bind(&req.repo_url)
+    .bind(&repo_url)
     .bind(&req.openclaw_agent_id)
     .bind(&req.description)
     .fetch_one(db)

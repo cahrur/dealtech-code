@@ -27,8 +27,28 @@ pub async fn get_one(
 pub async fn create(
     State(state): State<AppState>,
     Extension(user_id): Extension<Uuid>,
-    Json(req): Json<CreateProjectRequest>,
+    Json(mut req): Json<CreateProjectRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>)> {
+    if req.create_github_repo.unwrap_or(false) {
+        match &state.config.github_token {
+            Some(token) => {
+                let repo = crate::infra::github::create_repo(
+                    token,
+                    &req.name,
+                    req.description.as_deref(),
+                    req.github_private.unwrap_or(true),
+                    req.github_org.as_deref(),
+                ).await.map_err(AppError::Internal)?;
+                req.repo_url = Some(repo.clone_url);
+            }
+            None => return Err(AppError::BadRequest("GITHUB_TOKEN not configured".to_string())),
+        }
+    }
+    if req.repo_url.is_none() {
+        return Err(AppError::BadRequest(
+            "repo_url required, or set create_github_repo: true".to_string(),
+        ));
+    }
     let project = project_service::create(&state.db, user_id, user_id, req).await?;
     Ok((StatusCode::CREATED, Json(serde_json::json!({ "data": project, "success": true }))))
 }

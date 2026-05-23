@@ -16,6 +16,7 @@ pub struct Config {
     pub redis_port: u16,
 
     pub admin_api_key: Option<String>,
+    pub github_token: Option<String>,
 
     pub openclaw_base_url: String,
     pub openclaw_gateway_token: String,
@@ -44,6 +45,7 @@ impl Config {
             redis_port: env::var("REDIS_PORT").unwrap_or_else(|_| "6379".into()).parse()?,
 
             admin_api_key: env::var("ADMIN_API_KEY").ok(),
+            github_token: env::var("GITHUB_TOKEN").ok(),
 
             openclaw_base_url: env::var("OPENCLAW_BASE_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:18789".into()),
