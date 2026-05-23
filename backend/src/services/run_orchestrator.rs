@@ -106,16 +106,28 @@ async fn run_inner(
         model: run.model.clone(),
     };
 
+    let (err_tx, mut err_rx) = tokio::sync::oneshot::channel::<String>();
     let cfg = config.clone();
     tokio::spawn(async move {
         if let Err(e) = openclaw_service::run_stream(&cfg, input, tx).await {
             tracing::error!("OpenClaw stream error: {}", e);
+            let _ = err_tx.send(e.to_string());
         }
     });
 
     while let Some(ev) = rx.recv().await {
         emit(&db, &mut redis, run_id, session_id, &ev.event_type,
             serde_json::json!({"run_id": run_id, "session_id": session_id, "data": ev.payload})).await?;
+    }
+
+    // If OpenClaw errored, mark run as failed instead of completed
+    if let Ok(err_msg) = err_rx.try_recv() {
+        set_status(&db, run_id, "failed_agent").await?;
+        sqlx::query("UPDATE agent_runs SET error_message=$1 WHERE id=$2")
+            .bind(&err_msg).bind(run_id).execute(db.as_ref()).await?;
+        emit(&db, &mut redis, run_id, session_id, "agent_run.failed",
+            serde_json::json!({"run_id": run_id, "error": err_msg})).await?;
+        return Ok(());
     }
 
     set_status(&db, run_id, "collecting_diff").await?;
