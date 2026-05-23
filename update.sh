@@ -47,6 +47,20 @@ source "$REPO_DIR/install.sh"
 write_manage_script
 log "Management script updated"
 
+# 4b. Reconfigure OpenClaw (bind=lan, /v1/responses, token sync)
+info "Reconfiguring OpenClaw..."
+configure_openclaw
+
+# 4c. Update OPENCLAW_BASE_URL to correct Docker gateway
+if docker network inspect ai-platform_default &>/dev/null; then
+    DOCKER_GW=$(docker network inspect ai-platform_default --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}' 2>/dev/null)
+    if [[ -n "$DOCKER_GW" ]]; then
+        sed -i "s|OPENCLAW_BASE_URL=.*|OPENCLAW_BASE_URL=http://$DOCKER_GW:18789|" "$PLATFORM_DIR/.env"
+        log "OPENCLAW_BASE_URL updated to http://$DOCKER_GW:18789"
+        docker compose -f "$PLATFORM_DIR/docker-compose.yml" restart backend 2>/dev/null || true
+    fi
+fi
+
 # 5. Update Caddyfile — tambah 9router proxy jika belum ada
 info "Checking Caddyfile for 9router proxy..."
 if ! grep -q "9router" "$PLATFORM_DIR/Caddyfile"; then

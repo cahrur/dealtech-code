@@ -346,6 +346,7 @@ setup_firewall() {
   ufw allow 22/tcp  comment "SSH"
   ufw allow 80/tcp  comment "HTTP"
   ufw allow 443/tcp comment "HTTPS"
+  ufw allow from 172.16.0.0/12 to any port 18789 comment "Docker to OpenClaw"
   ufw --force enable
   log "Firewall configured (22, 80, 443 open)"
   warn "OpenClaw port $OPENCLAW_PORT is NOT exposed — private only"
@@ -453,6 +454,15 @@ start_services() {
   done
   log "Redis ready"
 
+  # Detect Docker gateway IP and update OPENCLAW_BASE_URL
+  if docker network inspect ai-platform_default &>/dev/null; then
+    DOCKER_GW=$(docker network inspect ai-platform_default --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}' 2>/dev/null)
+    if [[ -n "$DOCKER_GW" ]]; then
+      sed -i "s|OPENCLAW_BASE_URL=.*|OPENCLAW_BASE_URL=http://$DOCKER_GW:18789|" "$ENV_FILE"
+      log "OPENCLAW_BASE_URL updated to http://$DOCKER_GW:18789"
+    fi
+  fi
+
   log "Infrastructure services running"
 
   # Build and start backend
@@ -497,6 +507,30 @@ install_openclaw() {
   else
     warn "OpenClaw install gagal — install manual: npm install -g openclaw@latest"
   fi
+}
+
+# ─── Configure OpenClaw Gateway ──────────────────────────────────────────────
+configure_openclaw() {
+  section "Configuring OpenClaw Gateway"
+  local config_file="$HOME/.openclaw/openclaw.json"
+  if [[ ! -f "$config_file" ]]; then
+    warn "OpenClaw config not found — jalankan 'openclaw onboard --install-daemon' dulu"
+    return
+  fi
+  info "Setting bind=lan, enabling /v1/responses, syncing token..."
+  echo "import json,os,shutil" > /tmp/oc_cfg.py
+  echo "f=os.path.expanduser('~/.openclaw/openclaw.json')" >> /tmp/oc_cfg.py
+  echo "c=json.load(open(f))" >> /tmp/oc_cfg.py
+  echo "shutil.copy(f,f+'.bak')" >> /tmp/oc_cfg.py
+  echo "c.setdefault('gateway',{})['bind']='lan'" >> /tmp/oc_cfg.py
+  echo "c.setdefault('gateway',{}).setdefault('http',{}).setdefault('endpoints',{}).setdefault('responses',{})['enabled']=True" >> /tmp/oc_cfg.py
+  echo "e='/srv/ai-platform/.env'" >> /tmp/oc_cfg.py
+  echo "t=[l.strip().split('=',1)[1] for l in open(e) if l.startswith('OPENCLAW_GATEWAY_TOKEN=')]" >> /tmp/oc_cfg.py
+  echo "if t: c.setdefault('gateway',{}).setdefault('auth',{})['token']=t[0]" >> /tmp/oc_cfg.py
+  echo "json.dump(c,open(f,'w'),indent=2)" >> /tmp/oc_cfg.py
+  python3 /tmp/oc_cfg.py && log "OpenClaw configured (bind=lan, /v1/responses=enabled, token synced)" || warn "OpenClaw config failed"
+  rm -f /tmp/oc_cfg.py
+  pgrep -f openclaw > /dev/null && { pkill -f openclaw 2>/dev/null; sleep 2; nohup openclaw start > /srv/ai-platform/logs/openclaw.log 2>&1 & log "OpenClaw restarted"; }
 }
 
 # ─── Write 9router config ─────────────────────────────────────────────────────
@@ -703,6 +737,7 @@ main() {
   install_deps
   install_nodejs_9router
   install_openclaw
+  configure_openclaw
   create_dirs
   write_env
   write_compose

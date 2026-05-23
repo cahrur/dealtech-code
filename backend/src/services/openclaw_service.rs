@@ -29,7 +29,7 @@ pub async fn run_stream(
 ) -> Result<()> {
     let client = Client::new();
     let body = serde_json::json!({
-        "model": input.model,
+        "model": "openclaw",
         "stream": true,
         "user": input.user_id,
         "instructions": input.instructions,

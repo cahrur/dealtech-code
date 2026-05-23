@@ -93,6 +93,11 @@ async fn run_inner(
         .bind(&branch_name).bind(worktree.to_str().unwrap()).bind(run_id)
         .execute(db.as_ref()).await?;
 
+    // Save user prompt to messages before running
+    let _ = crate::services::session_service::add_message(
+        db.as_ref(), session_id, "user", &run.prompt
+    ).await;
+
     set_status(&db, run_id, "running_agent").await?;
 
     let instructions = openclaw_service::build_agent_instructions(&project_slug, &project_slug, &branch_name);
@@ -115,9 +120,24 @@ async fn run_inner(
         }
     });
 
+    let mut assistant_response = String::new();
+
     while let Some(ev) = rx.recv().await {
+        // Collect assistant delta for message history
+        if ev.event_type == "assistant.delta" {
+            if let Some(delta) = ev.payload.get("delta").and_then(|d| d.as_str()) {
+                assistant_response.push_str(delta);
+            }
+        }
         emit(&db, &mut redis, run_id, session_id, &ev.event_type,
             serde_json::json!({"run_id": run_id, "session_id": session_id, "data": ev.payload})).await?;
+    }
+
+    // Save assistant response to messages
+    if !assistant_response.is_empty() {
+        let _ = crate::services::session_service::add_message(
+            db.as_ref(), session_id, "assistant", &assistant_response
+        ).await;
     }
 
     // If OpenClaw errored, mark run as failed instead of completed

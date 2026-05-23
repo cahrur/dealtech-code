@@ -89,12 +89,24 @@ pub async fn update(
 }
 
 pub async fn check_member(db: &PgPool, project_id: Uuid, user_id: Uuid) -> Result<String> {
-    sqlx::query_scalar::<_, String>(
+    if let Some(role) = sqlx::query_scalar::<_, String>(
         "SELECT role FROM project_members WHERE project_id = $1 AND user_id = $2",
     )
     .bind(project_id)
     .bind(user_id)
     .fetch_optional(db)
-    .await?
-    .ok_or_else(|| AppError::Forbidden("Not a project member".to_string()))
+    .await? {
+        return Ok(role);
+    }
+    // Admin keys can access all projects
+    let is_admin: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM api_keys WHERE id = $1 AND role = 'admin' AND revoked_at IS NULL)"
+    )
+    .bind(user_id)
+    .fetch_one(db)
+    .await?;
+    if is_admin {
+        return Ok("admin".to_string());
+    }
+    Err(AppError::Forbidden("Not a project member".to_string()))
 }
