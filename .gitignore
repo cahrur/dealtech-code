@@ -1,0 +1,57 @@
+# Claude AI (jangan di-commit)
+.claude/
+
+# Rust build artifacts
+backend/target/
+backend/**/*.rs.bk
+backend/.cargo/
+
+# Environment & secrets
+.env
+*.env
+!.env.example
+**/.env
+**/secrets/
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-error.log*
+
+# OS
+.DS_Store
+.DS_Store?
+Thumbs.db
+ehthumbs.db
+desktop.ini
+
+# IDE
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+logs/
+/srv/
+
+# Docker override
+docker-compose.override.yml
+
+# Certificates & keys
+*.pem
+*.key
+*.cert
+*.crt
+*.p12
+
+# Backup files
+*.bak
+*.backup
+
+# Compiled output
+dist/
+build/
