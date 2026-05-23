@@ -197,6 +197,19 @@ bash /srv/ai-platform/manage.sh status   # cek status
 bash /srv/ai-platform/manage.sh logs     # tail backend logs
 ```
 
+## URLs
+
+Semua URL menggunakan domain yang dikonfigurasi saat instalasi.
+
+| URL | Keterangan |
+|---|---|
+| `https://domain/health` | Health check backend |
+| `https://domain/api/*` | REST API endpoints |
+| `wss://domain/ws` | WebSocket realtime |
+| `https://domain/9router/` | 9router Web UI (manajemen AI provider) |
+
+> **Catatan:** Port 9router (`20128`) tidak dibuka ke publik — diakses via Caddy proxy di path `/9router/`.
+
 ## API Reference
 
 ### Autentikasi
