@@ -231,6 +231,8 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     env_file: .env
+    ports:
+      - "127.0.0.1:8080:8080"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
@@ -516,7 +518,7 @@ info() { echo -e "${CYAN}[i]${NC} $1"; }
 admin_menu() {
   ADMIN_KEY=$(grep "^ADMIN_API_KEY=" "$PLATFORM_DIR/.env" 2>/dev/null | cut -d= -f2)
   DOMAIN=$(grep "^DOMAIN=" "$PLATFORM_DIR/.env" 2>/dev/null | cut -d= -f2)
-  BASE_URL="https://$DOMAIN"
+  BASE_URL="http://localhost:8080"
   while true; do
     echo ""
     echo -e "${BOLD}${CYAN}╔══════════════════════════════════════╗${NC}"
