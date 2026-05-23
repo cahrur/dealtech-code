@@ -1,5 +1,5 @@
 # ── Stage 1: dependency cache ──────────────────────────────────────────────────
-FROM rust:1.85-slim-bookworm AS deps
+FROM rust:1.88-slim-bookworm AS deps
 WORKDIR /app
 RUN apt-get update && apt-get install -y \
     pkg-config libssl-dev git \
