@@ -19,6 +19,8 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y \
     ca-certificates curl git \
     && rm -rf /var/lib/apt/lists/*
+# NOTE: runs as root — required for docker.sock access (container management)
+# For production hardening: use tecnativa/docker-socket-proxy to restrict docker API
 WORKDIR /app
 COPY --from=builder /app/target/release/backend .
 COPY --from=builder /app/migrations ./migrations
