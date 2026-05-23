@@ -9,7 +9,6 @@ use axum::{
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::app_state::AppState;
-use crate::domain::api_key::ApiKeyClaims;
 use crate::services::api_key_service;
 
 pub fn app_router(state: AppState) -> Router {
@@ -70,10 +69,10 @@ async fn health() -> &'static str {
     "ok"
 }
 
-pub async fn api_key_middleware<B>(
+pub async fn api_key_middleware(
     State(state): State<AppState>,
-    mut req: Request<B>,
-    next: Next<B>,
+    mut req: Request,
+    next: Next,
 ) -> Result<Response, StatusCode> {
     let raw_key = extract_api_key(&req).ok_or(StatusCode::UNAUTHORIZED)?;
 
