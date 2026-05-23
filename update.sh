@@ -34,6 +34,13 @@ cd "$PLATFORM_DIR"
 docker compose up -d --build backend
 log "Backend rebuilt and restarted"
 
+# 3b. Add GITHUB_TOKEN to .env if not present
+if ! grep -q "^GITHUB_TOKEN=" "$PLATFORM_DIR/.env"; then
+    warn "GITHUB_TOKEN belum ada di .env"
+    warn "Tambahkan manual: echo 'GITHUB_TOKEN=ghp_xxx' >> $PLATFORM_DIR/.env"
+    warn "Lalu: docker compose restart backend"
+fi
+
 # 4. Regenerate management script
 info "Updating management script..."
 source "$REPO_DIR/install.sh"
