@@ -27,7 +27,7 @@ OPENCLAW_PORT=18789
 
 # ─── Runtime vars (filled by collect_config) ──────────────────────────────────
 DOMAIN=""; ADMIN_EMAIL=""; PG_PASS=""; OPENCLAW_TOKEN=""; ADMIN_API_KEY=""
-ANTHROPIC_API_KEY=""; OPENAI_API_KEY=""
+ANTHROPIC_API_KEY=""; OPENAI_API_KEY=""; GITHUB_TOKEN=""
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 log()     { echo -e "${GREEN}[✓]${NC} $1"; }
@@ -84,6 +84,7 @@ collect_config() {
   echo ""
   read -rp "Anthropic API key (Claude models, optional — Enter to skip): " ANTHROPIC_API_KEY
   read -rp "OpenAI API key (GPT models, optional — Enter to skip): " OPENAI_API_KEY
+  read -rp "GitHub Personal Access Token (untuk push ke repo, optional): " GITHUB_TOKEN
 
   echo ""
   info "Domain:         $DOMAIN"
@@ -186,6 +187,9 @@ ADMIN_API_KEY=${ADMIN_API_KEY}
 ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
 OPENAI_API_KEY=${OPENAI_API_KEY}
 NINEROUTER_PORT=4000
+
+# ── GitHub ────────────────────────────────────────────────────────────────────
+GITHUB_TOKEN=${GITHUB_TOKEN}
 
 # ── OpenClaw Gateway ──────────────────────────────────────────────────────────
 OPENCLAW_BASE_URL=http://host.docker.internal:${OPENCLAW_PORT}

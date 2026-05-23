@@ -22,7 +22,9 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 COPY --from=builder /app/target/release/backend .
 COPY --from=builder /app/migrations ./migrations
+COPY entrypoint.sh .
+RUN chmod +x entrypoint.sh
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
     CMD curl -f http://localhost:8080/health || exit 1
-CMD ["./backend"]
+ENTRYPOINT ["./entrypoint.sh"]
