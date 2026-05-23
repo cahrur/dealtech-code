@@ -468,7 +468,7 @@ install_nodejs_9router() {
   section "Installing Node.js and 9router"
   if ! command -v node &>/dev/null; then
     info "Installing Node.js 20..."
-    curl -fsSL https://deb.nodesource.com/setup_20.x | bash - 2>/dev/null
+    curl -fsSL https://deb.nodesource.com/setup_22.x | bash - 2>/dev/null
     apt-get install -y -qq nodejs
     log "Node.js installed: $(node --version)"
   else
