@@ -164,7 +164,7 @@ bash /srv/ai-platform/manage.sh
   1) Start 9router
   2) Stop 9router
   3) Status 9router
-  4) Setup OpenClaw (tampilkan path config)
+  4) Open 9router (Terminal UI)
   5) Start platform (docker compose up)
   6) Stop platform (docker compose down)
   7) Restart backend
