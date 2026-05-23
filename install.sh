@@ -317,7 +317,10 @@ ${DOMAIN} {
 
   reverse_proxy /api/* backend:8080
   reverse_proxy /health backend:8080
-  reverse_proxy /9router/* localhost:20128
+
+  handle_path /9router/* {
+    reverse_proxy localhost:20128
+  }
 
   log {
     output file /var/log/caddy/access.log

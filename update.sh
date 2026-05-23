@@ -43,7 +43,16 @@ log "Management script updated"
 # 5. Update Caddyfile — tambah 9router proxy jika belum ada
 info "Checking Caddyfile for 9router proxy..."
 if ! grep -q "9router" "$PLATFORM_DIR/Caddyfile"; then
-    sed -i 's|reverse_proxy /health backend:8080|reverse_proxy /health backend:8080\n  reverse_proxy /9router/* localhost:20128|' "$PLATFORM_DIR/Caddyfile"
+    python3 -c "
+content = open('$PLATFORM_DIR/Caddyfile').read()
+block = '''
+  handle_path /9router/* {
+    reverse_proxy localhost:20128
+  }
+'''
+content = content.replace('  log {', block + '  log {')
+open('$PLATFORM_DIR/Caddyfile', 'w').write(content)
+"
     cd "$PLATFORM_DIR" && docker compose exec caddy caddy reload --config /etc/caddy/Caddyfile 2>/dev/null \
         || docker compose restart caddy
     log "Caddyfile updated — 9router proxy added"
