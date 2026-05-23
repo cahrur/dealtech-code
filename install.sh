@@ -478,6 +478,23 @@ install_nodejs_9router() {
   command -v 9router &>/dev/null && log "9router installed" || warn "9router not found in PATH"
 }
 
+# ─── Install OpenClaw Gateway ─────────────────────────────────────────────────
+install_openclaw() {
+  section "Installing OpenClaw Gateway"
+  if command -v openclaw &>/dev/null; then
+    log "OpenClaw already installed"
+    return
+  fi
+  info "Installing OpenClaw via npm..."
+  npm install -g openclaw@latest --quiet 2>/dev/null
+  if command -v openclaw &>/dev/null; then
+    log "OpenClaw installed"
+    warn "Jalankan setup awal: openclaw onboard --install-daemon"
+  else
+    warn "OpenClaw install gagal — install manual: npm install -g openclaw@latest"
+  fi
+}
+
 # ─── Write 9router config ─────────────────────────────────────────────────────
 write_9router_config() {
   section "Writing 9router config"
@@ -575,6 +592,8 @@ show_menu() {
     echo "  7) Restart backend"
     echo "  8) View backend logs"
     echo "  9) View all logs"
+    echo "  b) OpenClaw — onboard (setup awal)"
+    echo "  c) OpenClaw — status"
     echo "  a) Admin Panel"
     echo "  0) Exit"
     echo ""
@@ -597,6 +616,11 @@ show_menu() {
       7) cd "$PLATFORM_DIR" && docker compose restart backend && log "Backend restarted" ;;
       8) cd "$PLATFORM_DIR" && docker compose logs -f backend ;;
       9) cd "$PLATFORM_DIR" && docker compose logs -f ;;
+      b|B) openclaw onboard --install-daemon ;;
+      c|C)
+        pgrep -f openclaw > /dev/null && log "OpenClaw running" || warn "OpenClaw not running"
+        ss -tlnp | grep 18789 && log "Port 18789 listening" || warn "Port 18789 not listening"
+        ;;
       a|A) admin_menu ;;
       0) break ;;
       *) warn "Invalid option" ;;
@@ -674,6 +698,7 @@ main() {
   collect_config
   install_deps
   install_nodejs_9router
+  install_openclaw
   create_dirs
   write_env
   write_compose
