@@ -533,6 +533,25 @@ configure_openclaw() {
   pgrep -f openclaw > /dev/null && { pkill -f openclaw 2>/dev/null; sleep 2; nohup openclaw start > /srv/ai-platform/logs/openclaw.log 2>&1 & log "OpenClaw restarted"; }
 }
 
+# ─── Install Hermes Agent ─────────────────────────────────────────────────────
+install_hermes() {
+  section "Installing Hermes Agent"
+  if command -v hermes &>/dev/null; then
+    log "Hermes already installed"
+    return
+  fi
+  info "Installing Hermes via npm..."
+  npm install -g @hermes-ai/agent@latest --quiet 2>/dev/null || \
+  npm install -g hermes-agent@latest --quiet 2>/dev/null
+  if command -v hermes &>/dev/null; then
+    log "Hermes installed"
+    warn "Jalankan setup awal: hermes onboard"
+  else
+    warn "Hermes tidak tersedia via npm"
+    info "Konfigurasi model hermes-3 di 9router untuk menggunakan Hermes"
+  fi
+}
+
 # ─── Write 9router config ─────────────────────────────────────────────────────
 write_9router_config() {
   section "Writing 9router config"
@@ -632,6 +651,8 @@ show_menu() {
     echo "  9) View all logs"
     echo "  b) OpenClaw — onboard (setup awal)"
     echo "  c) OpenClaw — status"
+    echo "  d) Hermes — onboard (setup awal)"
+    echo "  e) Hermes — status"
     echo "  a) Admin Panel"
     echo "  0) Exit"
     echo ""
@@ -658,6 +679,11 @@ show_menu() {
       c|C)
         pgrep -f openclaw > /dev/null && log "OpenClaw running" || warn "OpenClaw not running"
         ss -tlnp | grep 18789 && log "Port 18789 listening" || warn "Port 18789 not listening"
+        ;;
+      d|D) hermes onboard 2>/dev/null || warn "Hermes tidak terinstall — konfigurasi model hermes-3 di 9router" ;;
+      e|E)
+        command -v hermes > /dev/null && log "Hermes installed" || warn "Hermes not installed"
+        pgrep -f hermes > /dev/null && log "Hermes running" || info "Hermes menggunakan 9router sebagai backend"
         ;;
       a|A) admin_menu ;;
       0) break ;;
@@ -738,6 +764,7 @@ main() {
   install_nodejs_9router
   install_openclaw
   configure_openclaw
+  install_hermes
   create_dirs
   write_env
   write_compose
