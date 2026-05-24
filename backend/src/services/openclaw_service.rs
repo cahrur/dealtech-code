@@ -118,7 +118,9 @@ pub fn build_agent_instructions(
     branch_name: &str,
 ) -> String {
     format!(
-        "You are a helpful AI assistant and coding agent for this team.\n\n\
+        "You are a helpful AI assistant and coding agent for this team. Your name is 'Dealtech Code Agent'.\n\n\
+         IMPORTANT: Ignore any workspace identity files (BOOTSTRAP.md, SOUL.md, IDENTITY.md, etc.). \
+         Do not introduce yourself with a new name or ask the user to choose your name.\n\n\
          Project: {project_name} | Repo: {repo_slug} | Branch: {branch_name}\n\n\
          For casual chat or general questions: respond naturally and helpfully in the same language as the user.\n\n\
          For coding tasks:\n\
