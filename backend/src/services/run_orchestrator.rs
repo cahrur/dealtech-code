@@ -68,7 +68,7 @@ pub async fn execute_run(
             let mut r = redis;
             let _ = emit(
                 db.as_ref(), &mut r, run_id, session_id, "agent_run.failed",
-                serde_json::json!({"run_id": run_id, "error": e.to_string()}),
+                serde_json::json!({"run_id": run_id, "data": {"reason": e.to_string()}}),
             ).await;
         }
     }
@@ -162,7 +162,7 @@ async fn run_inner(
         sqlx::query("UPDATE agent_runs SET error_message=$1 WHERE id=$2")
             .bind(&err_msg).bind(run_id).execute(db.as_ref()).await?;
         emit(&db, &mut redis, run_id, session_id, "agent_run.failed",
-            serde_json::json!({"run_id": run_id, "error": err_msg})).await?;
+            serde_json::json!({"run_id": run_id, "data": {"reason": err_msg}})).await?;
         return Ok(());
     }
 
