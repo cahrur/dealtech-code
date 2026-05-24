@@ -90,6 +90,56 @@ pub async fn run_stream(
     Ok(())
 }
 
+pub async fn run_nonstream(config: &Config, input: &OpenClawRunInput) -> Result<String> {
+    let client = Client::new();
+    let body = serde_json::json!({
+        "model": input.model,
+        "stream": false,
+        "user": input.user_id,
+        "instructions": input.instructions,
+        "input": input.prompt,
+    });
+
+    let res = client
+        .post(format!("{}/v1/responses", config.openclaw_base_url))
+        .bearer_auth(&config.openclaw_gateway_token)
+        .header("x-openclaw-agent-id", &input.agent_id)
+        .header("x-openclaw-session-key", &input.session_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("OpenClaw non-stream request: {}", e)))?;
+
+    if !res.status().is_success() {
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        return Err(AppError::Internal(anyhow::anyhow!(
+            "OpenClaw non-stream error {}: {}",
+            status,
+            text
+        )));
+    }
+
+    let val: Value = res
+        .json()
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("OpenClaw non-stream decode: {}", e)))?;
+
+    let text = val
+        .get("output")
+        .and_then(|o| o.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|msg| msg.get("content"))
+        .and_then(|c| c.as_array())
+        .and_then(|parts| parts.first())
+        .and_then(|part| part.get("text"))
+        .and_then(|t| t.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    Ok(text)
+}
+
 pub async fn run_chat(config: &Config, input: OpenClawRunInput) -> anyhow::Result<String> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<OpenClawEvent>(100);
     let cfg = config.clone();
@@ -108,6 +158,10 @@ pub async fn run_chat(config: &Config, input: OpenClawRunInput) -> anyhow::Resul
                 .unwrap_or("");
             response.push_str(delta);
         }
+    }
+    if response.trim().is_empty() {
+        let fallback = run_nonstream(config, &input).await.unwrap_or_default();
+        return Ok(sanitize_user_facing_response(&fallback));
     }
     Ok(sanitize_user_facing_response(&response))
 }
@@ -151,7 +205,7 @@ pub fn sanitize_user_facing_response(raw: &str) -> String {
     ];
 
     if leak_markers.iter().any(|m| lowered.contains(m)) {
-        return "Siap, saya kerjakan task-nya langsung. Saya lanjutkan perubahan, commit, dan push memakai kredensial platform yang sudah dikonfigurasi.".to_string();
+        return "Halo! Siap bantu. Mau saya kerjakan apa dulu?".to_string();
     }
 
     text.to_string()

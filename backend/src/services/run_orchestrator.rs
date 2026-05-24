@@ -172,12 +172,37 @@ async fn run_inner(
 
     // If OpenClaw errored, mark run as failed instead of completed
     if let Ok(err_msg) = err_rx.try_recv() {
-        set_status(&db, run_id, "failed_agent").await?;
-        sqlx::query("UPDATE agent_runs SET error_message=$1 WHERE id=$2")
-            .bind(&err_msg).bind(run_id).execute(db.as_ref()).await?;
-        emit(&db, &mut redis, run_id, session_id, "agent_run.failed",
-            serde_json::json!({"run_id": run_id, "data": {"reason": err_msg}})).await?;
-        return Ok(());
+        tracing::warn!("OpenClaw stream failed, trying non-stream fallback: {}", err_msg);
+        let fallback_input = openclaw_service::OpenClawRunInput {
+            agent_id: run.openclaw_agent_id.clone(),
+            session_key: run.openclaw_session_key.clone(),
+            user_id: user_id.to_string(),
+            instructions: openclaw_service::build_agent_instructions(&project_slug, &project_slug, &branch_name),
+            prompt: run.prompt.clone(),
+            model: run.model.clone(),
+        };
+
+        match openclaw_service::run_nonstream(&config, &fallback_input).await {
+            Ok(text) => {
+                let safe = openclaw_service::sanitize_user_facing_response(&text);
+                if !safe.is_empty() {
+                    let _ = crate::services::session_service::add_message(
+                        db.as_ref(), session_id, "assistant", &safe
+                    ).await;
+                }
+                emit(&db, &mut redis, run_id, session_id, "agent_run.fallback_nonstream",
+                    serde_json::json!({"run_id": run_id})).await?;
+            }
+            Err(fallback_err) => {
+                set_status(&db, run_id, "failed_agent").await?;
+                let final_err = format!("{} | fallback failed: {}", err_msg, fallback_err);
+                sqlx::query("UPDATE agent_runs SET error_message=$1 WHERE id=$2")
+                    .bind(&final_err).bind(run_id).execute(db.as_ref()).await?;
+                emit(&db, &mut redis, run_id, session_id, "agent_run.failed",
+                    serde_json::json!({"run_id": run_id, "data": {"reason": final_err}})).await?;
+                return Ok(());
+            }
+        }
     }
 
     set_status(&db, run_id, "collecting_diff").await?;
