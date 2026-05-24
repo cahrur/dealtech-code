@@ -1,5 +1,6 @@
 use futures_util::StreamExt;
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
@@ -20,6 +21,12 @@ pub struct OpenClawRunInput {
 pub struct OpenClawEvent {
     pub event_type: String,
     pub payload: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteDecision {
+    pub intent: String,
+    pub reply: Option<String>,
 }
 
 pub async fn run_stream(
@@ -304,6 +311,48 @@ pub fn is_smalltalk_prompt(prompt: &str) -> bool {
     looks_like_smalltalk && !looks_like_coding
 }
 
+pub fn fallback_route_prompt(prompt: &str) -> RouteDecision {
+    if is_push_request(prompt) {
+        return RouteDecision {
+            intent: "retry_push".to_string(),
+            reply: None,
+        };
+    }
+    if is_smalltalk_prompt(prompt) {
+        return RouteDecision {
+            intent: "smalltalk".to_string(),
+            reply: Some(fallback_smalltalk_response(prompt)),
+        };
+    }
+    RouteDecision {
+        intent: "coding_task".to_string(),
+        reply: None,
+    }
+}
+
+pub async fn route_prompt(config: &Config, input: &OpenClawRunInput) -> Result<RouteDecision> {
+    let route_input = OpenClawRunInput {
+        agent_id: input.agent_id.clone(),
+        session_key: format!("{}:route", input.session_key),
+        user_id: input.user_id.clone(),
+        instructions: "You are an intent router for a coding assistant app. Return JSON only with shape {\"intent\":\"smalltalk|coding_task|retry_push\",\"reply\":\"optional short user-facing reply\"}. Choose retry_push only when user mainly asks to push/try push again without asking for new code changes. Choose smalltalk for greetings or casual clarification. Choose coding_task for anything that asks to create/edit/debug/write files or code. Do not include any text outside JSON.".to_string(),
+        prompt: format!("Route this user message: {}", input.prompt),
+        model: input.model.clone(),
+    };
+
+    let raw = run_nonstream(config, &route_input).await?;
+    let cleaned = raw
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim()
+        .to_string();
+
+    serde_json::from_str::<RouteDecision>(&cleaned)
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("route decode: {}", e)))
+}
+
 pub fn fallback_smalltalk_response(prompt: &str) -> String {
     let lowered = prompt.to_lowercase();
     if lowered.contains("hai") || lowered.contains("halo") || lowered.contains("hello") || lowered.contains("bro") {
@@ -315,6 +364,19 @@ pub fn fallback_smalltalk_response(prompt: &str) -> String {
     "Siap bantu. Kasih instruksi task coding yang mau dikerjakan, nanti saya proses.".to_string()
 }
 
+pub fn is_push_request(prompt: &str) -> bool {
+    let lowered = prompt.to_lowercase();
+    let asks_push = lowered.contains("push");
+    let asks_write = lowered.contains("buat")
+        || lowered.contains("bikin")
+        || lowered.contains("tulis")
+        || lowered.contains("ubah")
+        || lowered.contains("edit")
+        || lowered.contains("readme")
+        || lowered.contains("file");
+    asks_push && !asks_write
+}
+
 pub fn synthesize_task_summary(
     prompt: &str,
     changed_files: &[String],
@@ -322,7 +384,24 @@ pub fn synthesize_task_summary(
     branch_name: &str,
     pushed: bool,
     stream_failed: bool,
+    push_error: Option<&str>,
 ) -> String {
+    if is_push_request(prompt) && commit_sha.is_some() {
+        let short_sha = &commit_sha.unwrap()[..commit_sha.unwrap().len().min(7)];
+        if pushed {
+            return format!(
+                "Push berhasil. Commit `{}` di branch `{}` sudah terkirim ke remote.",
+                short_sha, branch_name
+            );
+        }
+        if let Some(err) = push_error {
+            return format!(
+                "Commit `{}` di branch `{}` sudah ada, tapi push gagal: {}",
+                short_sha, branch_name, err.trim()
+            );
+        }
+    }
+
     if changed_files.is_empty() {
         if stream_failed {
             return "Task belum berhasil dijalankan karena agent error sebelum ada perubahan file. Coba jalankan sekali lagi.".to_string();

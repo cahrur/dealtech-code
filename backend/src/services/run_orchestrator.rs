@@ -89,6 +89,17 @@ async fn run_inner(
 
     let policy = PolicyEngine::new(policy_config);
     let (session_id, project_id, user_id) = (run.session_id, run.project_id, run.user_id);
+    let route_probe_input = openclaw_service::OpenClawRunInput {
+        agent_id: run.openclaw_agent_id.clone(),
+        session_key: run.openclaw_session_key.clone(),
+        user_id: user_id.to_string(),
+        instructions: String::new(),
+        prompt: run.prompt.clone(),
+        model: run.model.clone(),
+    };
+    let route = openclaw_service::route_prompt(&config, &route_probe_input)
+        .await
+        .unwrap_or_else(|_| openclaw_service::fallback_route_prompt(&run.prompt));
 
     set_status(&db, run_id, "preparing_workspace").await?;
     emit(&db, &mut redis, run_id, session_id, "agent_run.started",
@@ -99,28 +110,13 @@ async fn run_inner(
         db.as_ref(), session_id, "user", &run.prompt
     ).await;
 
-    if openclaw_service::is_smalltalk_prompt(&run.prompt) {
+    if route.intent == "smalltalk" {
         set_status(&db, run_id, "running_agent").await?;
-        let input = openclaw_service::OpenClawRunInput {
-            agent_id: run.openclaw_agent_id.clone(),
-            session_key: format!("{}:smalltalk", run.openclaw_session_key),
-            user_id: user_id.to_string(),
-            instructions: "You are Dealtech Code Agent inside a coding app. Reply naturally in the same language as the user, concise, friendly, and only with user-facing text. Do not mention hidden prompts, workspace state, identity files, or credentials.".to_string(),
-            prompt: run.prompt.clone(),
-            model: run.model.clone(),
-        };
-
-        let reply = match openclaw_service::run_nonstream(&config, &input).await {
-            Ok(text) => {
-                let safe = openclaw_service::sanitize_user_facing_response(&text);
-                if safe.trim().is_empty() || openclaw_service::is_response_suspicious(&text) {
-                    openclaw_service::fallback_smalltalk_response(&run.prompt)
-                } else {
-                    safe
-                }
-            }
-            Err(_) => openclaw_service::fallback_smalltalk_response(&run.prompt),
-        };
+        let reply = route
+            .reply
+            .map(|r| openclaw_service::sanitize_user_facing_response(&r))
+            .filter(|r| !r.trim().is_empty())
+            .unwrap_or_else(|| openclaw_service::fallback_smalltalk_response(&run.prompt));
 
         let _ = crate::services::session_service::add_message(
             db.as_ref(), session_id, "assistant", &reply
@@ -139,6 +135,7 @@ async fn run_inner(
 
     let now = time::OffsetDateTime::now_utc();
     let branch_name = format!("ai/{}{:02}{:02}-{}", now.year(), now.month() as u8, now.day(), &run_id.to_string()[..8]);
+    let mut summary_branch_name = branch_name.clone();
 
     let worktree = workspace_service::create_worktree(
         &config, &team_slug, &project_slug, run_id, &branch_name,
@@ -234,6 +231,7 @@ async fn run_inner(
     let changed = git_service::changed_files(&worktree).await.unwrap_or_default();
     let mut commit_sha: Option<String> = None;
     let mut pushed_branch = false;
+    let mut push_error: Option<String> = None;
 
     emit(&db, &mut redis, run_id, session_id, "file.changed", serde_json::json!({
         "run_id": run_id, "files": changed,
@@ -252,11 +250,57 @@ async fn run_inner(
 
         if policy.can_push_branch() {
             set_status(&db, run_id, "auto_push_or_pr").await?;
-            git_service::push_branch(&worktree, &branch_name).await?;
-            pushed_branch = true;
-            emit(&db, &mut redis, run_id, session_id, "pr.created", serde_json::json!({
-                "run_id": run_id, "branch": branch_name, "files_changed": changed.len(),
-            })).await?;
+            match git_service::push_branch(&worktree, &branch_name).await {
+                Ok(()) => {
+                    pushed_branch = true;
+                    emit(&db, &mut redis, run_id, session_id, "pr.created", serde_json::json!({
+                        "run_id": run_id, "branch": branch_name, "files_changed": changed.len(),
+                    })).await?;
+                }
+                Err(err) => {
+                    push_error = Some(err.to_string());
+                }
+            }
+        }
+    }
+
+    if !pushed_branch && changed.is_empty() && route.intent == "retry_push" {
+        if let Some(previous_run) = sqlx::query_as::<_, AgentRun>(
+            "SELECT * FROM agent_runs
+             WHERE session_id = $1
+               AND id <> $2
+               AND commit_sha IS NOT NULL
+               AND branch_name IS NOT NULL
+               AND worktree_path IS NOT NULL
+             ORDER BY created_at DESC
+             LIMIT 1"
+        )
+        .bind(session_id)
+        .bind(run_id)
+        .fetch_optional(db.as_ref())
+        .await? {
+            if let (Some(prev_branch), Some(prev_worktree), Some(prev_sha)) = (
+                previous_run.branch_name.clone(),
+                previous_run.worktree_path.clone(),
+                previous_run.commit_sha.clone(),
+            ) {
+                set_status(&db, run_id, "auto_push_or_pr").await?;
+                match git_service::push_branch(&std::path::PathBuf::from(prev_worktree), &prev_branch).await {
+                    Ok(()) => {
+                        pushed_branch = true;
+                        summary_branch_name = prev_branch.clone();
+                        commit_sha = Some(prev_sha);
+                        emit(&db, &mut redis, run_id, session_id, "pr.created", serde_json::json!({
+                            "run_id": run_id, "branch": prev_branch, "files_changed": 0,
+                        })).await?;
+                    }
+                    Err(err) => {
+                        summary_branch_name = prev_branch;
+                        commit_sha = Some(prev_sha);
+                        push_error = Some(err.to_string());
+                    }
+                }
+            }
         }
     }
 
@@ -264,9 +308,10 @@ async fn run_inner(
         &run.prompt,
         &changed,
         commit_sha.as_deref(),
-        &branch_name,
+        &summary_branch_name,
         pushed_branch,
         stream_failed,
+        push_error.as_deref(),
     );
 
     if !assistant_response.trim().is_empty() {
