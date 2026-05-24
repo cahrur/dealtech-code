@@ -89,14 +89,14 @@ Lalu otomatis:
 7. Build dan start semua service
 8. Tulis `/srv/ai-platform/manage.sh`
 
-### Setelah instalasi:
+### Setelah instalasi (wajib):
 
-**1. Deploy backend** (repo sudah ada di VPS dari langkah clone):
+**1. Deploy backend (otomatis oleh installer):**
+Installer akan otomatis copy source dari `~/dealtech-code/backend` ke `/srv/ai-platform/app/backend/`, lalu build container backend.
+
+Jika source backend belum ada saat instalasi, jalankan manual:
 ```bash
 cp -r ~/dealtech-code/backend/* /srv/ai-platform/app/backend/
-```
-
-```bash
 cd /srv/ai-platform && docker compose up -d --build
 ```
 
@@ -105,20 +105,57 @@ cd /srv/ai-platform && docker compose up -d --build
 # Lihat: https://docs.openclaw.ai/install/docker
 ```
 
-**3. Konfigurasi 9router** — tambahkan AI provider keys via command 9router:
+**3. Onboard OpenClaw (setup awal):**
+```bash
+openclaw onboard --install-daemon
+bash /srv/ai-platform/manage.sh
+# pilih menu: b) OpenClaw - onboard (setup awal)
+```
+
+**4. Onboard Hermes (setup awal):**
+```bash
+hermes onboard
+bash /srv/ai-platform/manage.sh
+# pilih menu: d) Hermes - onboard (setup awal)
+```
+
+**5. Konfigurasi 9router** - isi API key provider di file:
+```bash
+nano /srv/ai-platform/9router/config.json
+```
+
+Contoh minimal:
+```json
+{
+  "providers": {
+    "anthropic": { "apiKey": "sk-ant-xxx" },
+    "openai": { "apiKey": "sk-proj-xxx" }
+  }
+}
+```
+
+Atau lihat helper CLI:
 ```bash
 9router --help
 ```
 
-**4. Start 9router:**
+**6. Start 9router:**
 ```bash
 bash /srv/ai-platform/manage.sh start
 ```
 
-**5. Verifikasi:**
+**7. Verifikasi status komponen:**
+```bash
+bash /srv/ai-platform/manage.sh status
+bash /srv/ai-platform/manage.sh
+# cek menu c) OpenClaw - status
+# cek menu e) Hermes - status
+```
+
+**8. Verifikasi endpoint platform:**
 ```bash
 curl https://yourdomain.com/health
-# → ok
+# -> ok
 ```
 
 ## Update
