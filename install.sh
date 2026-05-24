@@ -14,6 +14,7 @@ BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
 # ─── Platform directories ─────────────────────────────────────────────────────
 PLATFORM_DIR="/srv/ai-platform"
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_DIR="$PLATFORM_DIR/app"
 DATA_DIR="$PLATFORM_DIR/data"
 WORKSPACES_DIR="$PLATFORM_DIR/workspaces"
@@ -464,6 +465,13 @@ start_services() {
   fi
 
   log "Infrastructure services running"
+
+  # Copy backend source from repo
+  if [[ -d "$REPO_DIR/backend" ]]; then
+    info "Copying backend source from repo..."
+    cp -r "$REPO_DIR/backend/"* "$APP_DIR/backend/"
+    log "Backend source copied"
+  fi
 
   # Build and start backend
   if [[ -f "$APP_DIR/backend/Cargo.toml" ]]; then
