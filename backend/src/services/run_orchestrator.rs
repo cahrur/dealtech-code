@@ -162,9 +162,15 @@ async fn run_inner(
         .or_else(|| openclaw_service::fallback_plan_file_actions(&run.prompt));
 
     if let Some(plan) = planned_actions {
+        let mut applied_actions = Vec::new();
         for action in &plan.actions {
             if action.action_type == "write_file" {
                 let _ = file_action_service::write_file(&worktree, &action.path, &action.content).await?;
+                applied_actions.push(openclaw_service::AppliedFileAction {
+                    action_type: action.action_type.clone(),
+                    path: action.path.clone(),
+                    content: action.content.clone(),
+                });
             }
         }
 
@@ -209,9 +215,10 @@ async fn run_inner(
             }
         }
 
-        let reply = openclaw_service::synthesize_task_summary(
+        let reply = openclaw_service::synthesize_task_summary_with_plan(
             &run.prompt,
             &changed,
+            &applied_actions,
             commit_sha.as_deref(),
             &branch_name,
             pushed_branch,

@@ -44,6 +44,13 @@ pub struct FileAction {
     pub content: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct AppliedFileAction {
+    pub action_type: String,
+    pub path: String,
+    pub content: String,
+}
+
 pub async fn run_stream(
     config: &Config,
     input: OpenClawRunInput,
@@ -564,6 +571,28 @@ pub fn synthesize_task_summary(
     stream_failed: bool,
     push_error: Option<&str>,
 ) -> String {
+    synthesize_task_summary_with_plan(
+        prompt,
+        changed_files,
+        &[],
+        commit_sha,
+        branch_name,
+        pushed,
+        stream_failed,
+        push_error,
+    )
+}
+
+pub fn synthesize_task_summary_with_plan(
+    prompt: &str,
+    changed_files: &[String],
+    applied_actions: &[AppliedFileAction],
+    commit_sha: Option<&str>,
+    branch_name: &str,
+    pushed: bool,
+    stream_failed: bool,
+    push_error: Option<&str>,
+) -> String {
     if is_push_request(prompt) && commit_sha.is_some() {
         let short_sha = &commit_sha.unwrap()[..commit_sha.unwrap().len().min(7)];
         if pushed {
@@ -583,6 +612,17 @@ pub fn synthesize_task_summary(
     if changed_files.is_empty() {
         if stream_failed {
             return "Task belum berhasil dijalankan karena agent error sebelum ada perubahan file. Coba jalankan sekali lagi.".to_string();
+        }
+        if !applied_actions.is_empty() {
+            let paths = applied_actions
+                .iter()
+                .map(|action| action.path.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return format!(
+                "Saya sudah menerapkan instruksi ke file `{}`, tapi isinya sama seperti kondisi repo saat ini, jadi tidak ada diff baru untuk di-commit.",
+                paths
+            );
         }
         if is_write_request(prompt) {
             return format!(
@@ -707,5 +747,13 @@ mod tests {
         let plan = fallback_plan_file_actions(prompt).expect("plan should exist");
         assert_eq!(plan.actions[0].path, "docs/notes.txt");
         assert_eq!(plan.actions[0].content, "Halo tim");
+    }
+
+    #[test]
+    fn parses_readme_request_with_spaces_before_then_clause() {
+        let prompt = "tuliskan readme , isinya lorem ipsum , kemudian push ke github";
+        let plan = fallback_plan_file_actions(prompt).expect("plan should exist");
+        assert_eq!(plan.actions[0].path, "README.md");
+        assert_eq!(plan.actions[0].content, "lorem ipsum");
     }
 }
