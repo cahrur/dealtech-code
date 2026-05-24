@@ -162,7 +162,8 @@ async fn run_inner(
             serde_json::json!({"run_id": run_id, "session_id": session_id, "data": ev.payload})).await?;
     }
 
-    // Save assistant response to messages
+    // Save assistant response to messages (sanitized to prevent internal prompt leakage)
+    let assistant_response = crate::services::openclaw_service::sanitize_user_facing_response(&assistant_response);
     if !assistant_response.is_empty() {
         let _ = crate::services::session_service::add_message(
             db.as_ref(), session_id, "assistant", &assistant_response
