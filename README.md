@@ -39,6 +39,7 @@ Git Worktree Disposable → branch → test → commit → PR
 - **Realtime streaming** — WebSocket event stream ke mobile
 - **Token tracking** — usage per API key per model
 - **Model selection** — ganti model Claude/GPT via 9router
+- **Dual AI Mode** — pilih **OpenClaw Agent** (coding + git + PR) atau **Hermes Chat** (percakapan langsung, non-streaming)
 - **Git integration** — clone, branch, worktree, diff, push, PR
 - **Policy engine** — allow/deny command, auto_safe vs auto_trusted
 - **Admin panel** — kelola API key, lihat audit log, usage stats
@@ -302,6 +303,10 @@ POST /api/projects/:project_id/sessions  { "title": "Fix auth bug" }
 GET  /api/projects/:project_id/sessions
 GET  /api/sessions/:id
 GET  /api/sessions/:id/messages
+
+# Chat langsung (non-streaming) — OpenClaw Agent atau Hermes Chat
+POST /api/sessions/:id/chat
+{ "prompt": "...", "mode": "openclaw" }   # mode: "openclaw" | "hermes"
 ```
 
 ### Agent Runs
