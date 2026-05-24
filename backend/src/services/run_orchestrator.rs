@@ -139,13 +139,26 @@ async fn run_inner(
     let mut assistant_response = String::new();
 
     while let Some(ev) = rx.recv().await {
-        // Collect assistant delta for message history
-        if ev.event_type == "assistant.delta" {
-            if let Some(delta) = ev.payload.get("delta").and_then(|d| d.as_str()) {
+        tracing::info!(event_type = %ev.event_type, "OpenClaw event");
+
+        // Map OpenClaw event types to our own
+        let mapped_type = match ev.event_type.as_str() {
+            "response.output_text.delta" | "content_block_delta" => "assistant.delta",
+            other => other,
+        };
+
+        // Collect assistant delta — try multiple field paths
+        if mapped_type == "assistant.delta" {
+            let delta = ev.payload.get("delta").and_then(|d| d.as_str())
+                .or_else(|| ev.payload.get("text").and_then(|d| d.as_str()))
+                .or_else(|| ev.payload.get("delta").and_then(|d| d.get("text")).and_then(|t| t.as_str()))
+                .unwrap_or("");
+            if !delta.is_empty() {
                 assistant_response.push_str(delta);
             }
         }
-        emit(&db, &mut redis, run_id, session_id, &ev.event_type,
+
+        emit(&db, &mut redis, run_id, session_id, mapped_type,
             serde_json::json!({"run_id": run_id, "session_id": session_id, "data": ev.payload})).await?;
     }
 
