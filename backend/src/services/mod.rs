@@ -1,6 +1,7 @@
 pub mod api_key_service;
 pub mod audit_service;
 pub mod container_service;
+pub mod file_action_service;
 pub mod git_service;
 pub mod openclaw_service;
 pub mod policy_engine;

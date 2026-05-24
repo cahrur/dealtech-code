@@ -8,7 +8,7 @@ use crate::config::Config;
 use crate::domain::agent_run::{AgentRun, CreateRunRequest};
 use crate::domain::policy::PolicyConfig;
 use crate::services::{
-    audit_service, git_service, openclaw_service, policy_engine::PolicyEngine,
+    audit_service, file_action_service, git_service, openclaw_service, policy_engine::PolicyEngine,
     realtime_service, workspace_service,
 };
 
@@ -147,6 +147,89 @@ async fn run_inner(
 
     set_status(&db, run_id, "running_agent").await?;
 
+    let planner_input = openclaw_service::OpenClawRunInput {
+        agent_id: run.openclaw_agent_id.clone(),
+        session_key: format!("{}:planner", run.openclaw_session_key),
+        user_id: user_id.to_string(),
+        instructions: openclaw_service::build_agent_instructions(&project_slug, &project_slug, &branch_name),
+        prompt: run.prompt.clone(),
+        model: run.model.clone(),
+    };
+    let planned_actions = openclaw_service::plan_file_actions(&config, &planner_input)
+        .await
+        .ok()
+        .filter(|plan| !plan.actions.is_empty())
+        .or_else(|| openclaw_service::fallback_plan_file_actions(&run.prompt));
+
+    if let Some(plan) = planned_actions {
+        for action in &plan.actions {
+            if action.action_type == "write_file" {
+                let _ = file_action_service::write_file(&worktree, &action.path, &action.content).await?;
+            }
+        }
+
+        set_status(&db, run_id, "collecting_diff").await?;
+        let diff = git_service::get_diff(&worktree).await.unwrap_or_default();
+        let changed = git_service::changed_files(&worktree).await.unwrap_or_default();
+        let mut commit_sha: Option<String> = None;
+        let mut pushed_branch = false;
+        let mut push_error: Option<String> = None;
+
+        emit(&db, &mut redis, run_id, session_id, "file.changed", serde_json::json!({
+            "run_id": run_id, "files": &changed,
+            "diff_preview": &diff[..diff.len().min(500)],
+        })).await?;
+
+        if policy.can_commit() && !changed.is_empty() {
+            set_status(&db, run_id, "auto_commit").await?;
+            let msg = plan.commit_message
+                .clone()
+                .filter(|m| !m.trim().is_empty())
+                .unwrap_or_else(|| format!("feat: AI agent run {}", &run_id.to_string()[..8]));
+            let sha = git_service::commit(&worktree, &msg).await?;
+            commit_sha = Some(sha.clone());
+            sqlx::query("UPDATE agent_runs SET commit_sha=$1 WHERE id=$2")
+                .bind(&sha).bind(run_id).execute(db.as_ref()).await?;
+            emit(&db, &mut redis, run_id, session_id, "git.committed",
+                serde_json::json!({"run_id": run_id, "sha": sha})).await?;
+
+            if policy.can_push_branch() {
+                set_status(&db, run_id, "auto_push_or_pr").await?;
+                match git_service::push_branch(&worktree, &branch_name).await {
+                    Ok(()) => {
+                        pushed_branch = true;
+                        emit(&db, &mut redis, run_id, session_id, "pr.created", serde_json::json!({
+                            "run_id": run_id, "branch": &branch_name, "files_changed": changed.len(),
+                        })).await?;
+                    }
+                    Err(err) => {
+                        push_error = Some(err.to_string());
+                    }
+                }
+            }
+        }
+
+        let reply = openclaw_service::synthesize_task_summary(
+            &run.prompt,
+            &changed,
+            commit_sha.as_deref(),
+            &branch_name,
+            pushed_branch,
+            false,
+            push_error.as_deref(),
+        );
+        let _ = crate::services::session_service::add_message(
+            db.as_ref(), session_id, "assistant", &reply
+        ).await;
+
+        set_status(&db, run_id, "completed").await?;
+        sqlx::query("UPDATE agent_runs SET finished_at=NOW() WHERE id=$1")
+            .bind(run_id).execute(db.as_ref()).await?;
+        emit(&db, &mut redis, run_id, session_id, "agent_run.completed",
+            serde_json::json!({"run_id": run_id, "files_changed": changed.len()})).await?;
+        return Ok(());
+    }
+
     let instructions = openclaw_service::build_agent_instructions(&project_slug, &project_slug, &branch_name);
     let (tx, mut rx) = mpsc::channel::<openclaw_service::OpenClawEvent>(100);
     let input = openclaw_service::OpenClawRunInput {
@@ -234,7 +317,7 @@ async fn run_inner(
     let mut push_error: Option<String> = None;
 
     emit(&db, &mut redis, run_id, session_id, "file.changed", serde_json::json!({
-        "run_id": run_id, "files": changed,
+        "run_id": run_id, "files": &changed,
         "diff_preview": &diff[..diff.len().min(500)],
     })).await?;
 
@@ -254,7 +337,7 @@ async fn run_inner(
                 Ok(()) => {
                     pushed_branch = true;
                     emit(&db, &mut redis, run_id, session_id, "pr.created", serde_json::json!({
-                        "run_id": run_id, "branch": branch_name, "files_changed": changed.len(),
+                        "run_id": run_id, "branch": &branch_name, "files_changed": changed.len(),
                     })).await?;
                 }
                 Err(err) => {
@@ -304,7 +387,7 @@ async fn run_inner(
         }
     }
 
-    assistant_response = openclaw_service::synthesize_task_summary(
+    let synthesized_response = openclaw_service::synthesize_task_summary(
         &run.prompt,
         &changed,
         commit_sha.as_deref(),
@@ -313,6 +396,17 @@ async fn run_inner(
         stream_failed,
         push_error.as_deref(),
     );
+
+    if changed.is_empty()
+        && !stream_failed
+        && !openclaw_service::is_write_request(&run.prompt)
+        && !openclaw_service::is_push_request(&run.prompt)
+        && !assistant_response.trim().is_empty()
+    {
+        assistant_response = assistant_response.trim().to_string();
+    } else {
+        assistant_response = synthesized_response;
+    }
 
     if !assistant_response.trim().is_empty() {
         let _ = crate::services::session_service::add_message(

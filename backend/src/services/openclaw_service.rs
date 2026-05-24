@@ -29,6 +29,21 @@ pub struct RouteDecision {
     pub reply: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileActionPlan {
+    pub actions: Vec<FileAction>,
+    pub commit_message: Option<String>,
+    pub reply: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileAction {
+    #[serde(rename = "type")]
+    pub action_type: String,
+    pub path: String,
+    pub content: String,
+}
+
 pub async fn run_stream(
     config: &Config,
     input: OpenClawRunInput,
@@ -353,6 +368,150 @@ pub async fn route_prompt(config: &Config, input: &OpenClawRunInput) -> Result<R
         .map_err(|e| AppError::Internal(anyhow::anyhow!("route decode: {}", e)))
 }
 
+pub async fn plan_file_actions(config: &Config, input: &OpenClawRunInput) -> Result<FileActionPlan> {
+    let planner_input = OpenClawRunInput {
+        agent_id: input.agent_id.clone(),
+        session_key: format!("{}:plan", input.session_key),
+        user_id: input.user_id.clone(),
+        instructions: "You are a file-action planner for a coding assistant app. Return JSON only with shape {\"actions\":[{\"type\":\"write_file\",\"path\":\"relative/path\",\"content\":\"full file content\"}],\"commit_message\":\"optional commit message\",\"reply\":\"optional short user-facing note\"}. Only produce write_file actions when the user intent is clear and specific enough to know exact file path and exact content. Prefer README.md if user asks for readme/readme.md. Do not include markdown fences or extra text.".to_string(),
+        prompt: format!("Plan file actions for this user request: {}", input.prompt),
+        model: input.model.clone(),
+    };
+
+    let raw = run_nonstream(config, &planner_input).await?;
+    let cleaned = raw
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim()
+        .to_string();
+
+    serde_json::from_str::<FileActionPlan>(&cleaned)
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("plan decode: {}", e)))
+}
+
+pub fn fallback_plan_file_actions(prompt: &str) -> Option<FileActionPlan> {
+    let path = extract_target_file_path(prompt)?;
+
+    let content = extract_requested_file_content(prompt)?;
+    let commit_message = Some(default_commit_message_for_path(&path));
+
+    Some(FileActionPlan {
+        actions: vec![FileAction {
+            action_type: "write_file".to_string(),
+            path,
+            content,
+        }],
+        commit_message,
+        reply: None,
+    })
+}
+
+fn extract_target_file_path(prompt: &str) -> Option<String> {
+    let lowered = prompt.to_lowercase();
+    if lowered.contains("readme.md") || lowered.contains("readme") {
+        return Some("README.md".to_string());
+    }
+
+    if let Some(idx) = lowered.find("file ") {
+        let raw = prompt.get(idx + 5..)?.trim();
+        let candidate = raw
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_matches(|c: char| matches!(c, ',' | '.' | ':' | ';' | '"' | '\'' | '`'));
+        if looks_like_file_path(candidate) {
+            return Some(candidate.to_string());
+        }
+    }
+
+    None
+}
+
+fn looks_like_file_path(candidate: &str) -> bool {
+    if candidate.is_empty() {
+        return false;
+    }
+    candidate.contains('/')
+        || candidate.contains('\\')
+        || candidate.contains('.')
+}
+
+fn default_commit_message_for_path(path: &str) -> String {
+    if path.eq_ignore_ascii_case("README.md") {
+        "docs: update README".to_string()
+    } else {
+        format!("feat: update {}", path)
+    }
+}
+
+fn extract_requested_file_content(prompt: &str) -> Option<String> {
+    if let Some(quoted) = extract_first_quoted_text(prompt) {
+        let trimmed = quoted.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    let lowered = prompt.to_lowercase();
+    let markers = ["isinya", "isi", "berisi", "content"];
+    for marker in markers {
+        if let Some(start) = lowered.find(marker) {
+            let content_start = start + marker.len();
+            let slice = prompt.get(content_start..)?.trim_start_matches([' ', ':', '-', '=']).trim();
+            let extracted = trim_instruction_tail(slice);
+            if !extracted.is_empty() {
+                return Some(extracted.to_string());
+            }
+        }
+    }
+
+    None
+}
+
+fn extract_first_quoted_text(text: &str) -> Option<&str> {
+    let quote_pairs = [('\"', '\"'), ('\'', '\''), ('“', '”')];
+    for (open, close) in quote_pairs {
+        if let Some(start) = text.find(open) {
+            let rest = text.get(start + open.len_utf8()..)?;
+            if let Some(end) = rest.find(close) {
+                return rest.get(..end);
+            }
+        }
+    }
+    None
+}
+
+fn trim_instruction_tail(text: &str) -> &str {
+    let lowered = text.to_lowercase();
+    let stops = [
+        ", kemudian",
+        ". kemudian",
+        " kemudian ",
+        ", lalu",
+        ". lalu",
+        " lalu ",
+        ", terus",
+        ". terus",
+        " terus ",
+        ", setelah itu",
+        ". setelah itu",
+        " setelah itu ",
+        " lalu push",
+        " kemudian push",
+        " dan push",
+    ];
+
+    let mut end = text.len();
+    for stop in stops {
+        if let Some(idx) = lowered.find(stop) {
+            end = end.min(idx);
+        }
+    }
+    text[..end].trim().trim_matches('.').trim()
+}
+
 pub fn fallback_smalltalk_response(prompt: &str) -> String {
     let lowered = prompt.to_lowercase();
     if lowered.contains("hai") || lowered.contains("halo") || lowered.contains("hello") || lowered.contains("bro") {
@@ -375,6 +534,25 @@ pub fn is_push_request(prompt: &str) -> bool {
         || lowered.contains("readme")
         || lowered.contains("file");
     asks_push && !asks_write
+}
+
+pub fn is_write_request(prompt: &str) -> bool {
+    let lowered = prompt.to_lowercase();
+    [
+        "buat",
+        "bikin",
+        "tulis",
+        "ubah",
+        "edit",
+        "readme",
+        "readme.md",
+        "file",
+        "isi",
+        "isinya",
+        "berisi",
+    ]
+    .iter()
+    .any(|marker| lowered.contains(marker))
 }
 
 pub fn synthesize_task_summary(
@@ -406,6 +584,12 @@ pub fn synthesize_task_summary(
         if stream_failed {
             return "Task belum berhasil dijalankan karena agent error sebelum ada perubahan file. Coba jalankan sekali lagi.".to_string();
         }
+        if is_write_request(prompt) {
+            return format!(
+                "Saya belum bisa mengeksekusi perubahan file dari instruksi: \"{}\". Tolong sebut file target dan isi akhirnya dengan lebih spesifik.",
+                prompt.trim()
+            );
+        }
         return format!(
             "Task diproses, tapi belum ada perubahan file untuk instruksi: \"{}\".",
             prompt.trim()
@@ -425,6 +609,12 @@ pub fn synthesize_task_summary(
     }
     if pushed {
         response.push_str(&format!(" Branch `{}` sudah saya push.", branch_name));
+    } else if let Some(err) = push_error {
+        response.push_str(&format!(
+            " Push ke branch `{}` gagal: {}",
+            branch_name,
+            err.trim()
+        ));
     } else {
         response.push_str(&format!(" Branch kerja: `{}`.", branch_name));
     }
@@ -481,4 +671,41 @@ pub fn build_agent_instructions(
          - If a command is blocked, choose a safe alternative\n\
          - After coding tasks, briefly summarize what was done"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fallback_plan_file_actions, is_push_request, is_write_request};
+
+    #[test]
+    fn parses_readme_request_with_quotes() {
+        let prompt = r#"buatkan readme.md, isinya "Test AI", kemudian commit dan push"#;
+        let plan = fallback_plan_file_actions(prompt).expect("plan should exist");
+        assert_eq!(plan.actions.len(), 1);
+        assert_eq!(plan.actions[0].path, "README.md");
+        assert_eq!(plan.actions[0].content, "Test AI");
+    }
+
+    #[test]
+    fn parses_readme_request_without_quotes() {
+        let prompt = "buatkan file readme. isinya lorem ipsum, kemudian push ke github";
+        let plan = fallback_plan_file_actions(prompt).expect("plan should exist");
+        assert_eq!(plan.actions[0].path, "README.md");
+        assert_eq!(plan.actions[0].content, "lorem ipsum");
+    }
+
+    #[test]
+    fn distinguishes_push_retry_from_write_task() {
+        assert!(is_push_request("coba push lagi"));
+        assert!(!is_push_request("buatkan readme lalu push"));
+        assert!(is_write_request("buatkan readme lalu push"));
+    }
+
+    #[test]
+    fn parses_generic_file_request() {
+        let prompt = r#"buatkan file docs/notes.txt isinya "Halo tim""#;
+        let plan = fallback_plan_file_actions(prompt).expect("plan should exist");
+        assert_eq!(plan.actions[0].path, "docs/notes.txt");
+        assert_eq!(plan.actions[0].content, "Halo tim");
+    }
 }
