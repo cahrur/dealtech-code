@@ -46,7 +46,7 @@ pub async fn execute_run(
     repo_url: String,
     policy_config: PolicyConfig,
 ) {
-    if let Err(e) = run_inner(db.clone(), redis, config, run_id, team_slug, project_slug, repo_url, policy_config).await {
+    if let Err(e) = run_inner(db.clone(), redis.clone(), config, run_id, team_slug, project_slug, repo_url, policy_config).await {
         tracing::error!(run_id = %run_id, error = %e, "Agent run failed");
         let _ = sqlx::query(
             "UPDATE agent_runs SET status='failed_agent', finished_at=NOW(), error_message=$1 WHERE id=$2"
@@ -55,6 +55,22 @@ pub async fn execute_run(
         .bind(run_id)
         .execute(db.as_ref())
         .await;
+        // Emit failure event so the Android app receives a terminal signal
+        let session_id_opt = sqlx::query_scalar::<_, uuid::Uuid>(
+            "SELECT session_id FROM agent_runs WHERE id = $1"
+        )
+        .bind(run_id)
+        .fetch_optional(db.as_ref())
+        .await
+        .ok()
+        .flatten();
+        if let Some(session_id) = session_id_opt {
+            let mut r = redis;
+            let _ = emit(
+                db.as_ref(), &mut r, run_id, session_id, "agent_run.failed",
+                serde_json::json!({"run_id": run_id, "error": e.to_string()}),
+            ).await;
+        }
     }
 }
 
@@ -219,6 +235,7 @@ async fn emit(
     mut payload: serde_json::Value,
 ) -> anyhow::Result<()> {
     let seq = realtime_service::save_event(db, run_id, session_id, event_type, payload.clone()).await?;
+    payload["type"] = serde_json::json!(event_type);
     payload["seq"] = serde_json::json!(seq);
     payload["session_id"] = serde_json::json!(session_id);
     realtime_service::publish_event(redis, session_id, &payload).await?;

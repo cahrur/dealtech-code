@@ -75,12 +75,11 @@ pub async fn get_events_after(
     Ok(rows
         .into_iter()
         .map(|r| {
-            serde_json::json!({
-                "seq": r.seq,
-                "type": r.event_type,
-                "payload": r.payload,
-                "created_at": r.created_at,
-            })
+            // Use same shape as real-time events: top-level "type" + "data" key
+            let mut event = r.payload.clone();
+            event["type"] = serde_json::json!(r.event_type);
+            event["seq"] = serde_json::json!(r.seq);
+            event
         })
         .collect())
 }
