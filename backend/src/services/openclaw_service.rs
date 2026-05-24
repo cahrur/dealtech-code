@@ -148,7 +148,13 @@ pub async fn run_chat(config: &Config, input: OpenClawRunInput) -> anyhow::Resul
         let _ = run_stream(&cfg, inp, tx).await;
     });
     let mut response = String::new();
+    let mut final_done_text = String::new();
     while let Some(ev) = rx.recv().await {
+        if ev.event_type == "response.output_text.done" {
+            if let Some(t) = ev.payload.get("text").and_then(|v| v.as_str()) {
+                final_done_text = t.to_string();
+            }
+        }
         let is_delta = matches!(ev.event_type.as_str(),
             "assistant.delta" | "response.output_text.delta" | "content_block_delta");
         if is_delta {
@@ -159,11 +165,12 @@ pub async fn run_chat(config: &Config, input: OpenClawRunInput) -> anyhow::Resul
             response.push_str(delta);
         }
     }
-    if response.trim().is_empty() {
+    let chosen = if !final_done_text.trim().is_empty() { final_done_text } else { response };
+    if chosen.trim().is_empty() {
         let fallback = run_nonstream(config, &input).await.unwrap_or_default();
         return Ok(sanitize_user_facing_response(&fallback));
     }
-    Ok(sanitize_user_facing_response(&response))
+    Ok(sanitize_user_facing_response(&chosen))
 }
 
 pub fn sanitize_user_facing_response(raw: &str) -> String {

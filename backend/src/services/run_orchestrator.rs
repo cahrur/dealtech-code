@@ -137,6 +137,7 @@ async fn run_inner(
     });
 
     let mut assistant_response = String::new();
+    let mut final_done_text = String::new();
 
     while let Some(ev) = rx.recv().await {
         tracing::info!(event_type = %ev.event_type, "OpenClaw event");
@@ -148,6 +149,12 @@ async fn run_inner(
         };
 
         // Collect assistant delta — try multiple field paths
+        if ev.event_type == "response.output_text.done" {
+            if let Some(t) = ev.payload.get("text").and_then(|v| v.as_str()) {
+                final_done_text = t.to_string();
+            }
+        }
+
         if mapped_type == "assistant.delta" {
             let delta = ev.payload.get("delta").and_then(|d| d.as_str())
                 .or_else(|| ev.payload.get("text").and_then(|d| d.as_str()))
@@ -163,7 +170,8 @@ async fn run_inner(
     }
 
     // Save assistant response to messages (sanitized to prevent internal prompt leakage)
-    let assistant_response = crate::services::openclaw_service::sanitize_user_facing_response(&assistant_response);
+    let preferred = if !final_done_text.trim().is_empty() { final_done_text } else { assistant_response };
+    let assistant_response = crate::services::openclaw_service::sanitize_user_facing_response(&preferred);
     if !assistant_response.is_empty() {
         let _ = crate::services::session_service::add_message(
             db.as_ref(), session_id, "assistant", &assistant_response
