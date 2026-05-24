@@ -155,11 +155,16 @@ async fn run_inner(
         prompt: run.prompt.clone(),
         model: run.model.clone(),
     };
-    let planned_actions = openclaw_service::plan_file_actions(&config, &planner_input)
-        .await
-        .ok()
-        .filter(|plan| !plan.actions.is_empty())
-        .or_else(|| openclaw_service::fallback_plan_file_actions(&run.prompt));
+    let planned_actions = if let Some(local_plan) =
+        openclaw_service::fallback_plan_file_actions(&run.prompt)
+    {
+        Some(local_plan)
+    } else {
+        openclaw_service::plan_file_actions(&config, &planner_input)
+            .await
+            .ok()
+            .filter(|plan| !plan.actions.is_empty())
+    };
 
     if let Some(plan) = planned_actions {
         let mut applied_actions = Vec::new();
