@@ -260,16 +260,14 @@ async fn run_inner(
         }
     }
 
-    if assistant_response.trim().is_empty() {
-        assistant_response = openclaw_service::synthesize_task_summary(
-            &run.prompt,
-            &changed,
-            commit_sha.as_deref(),
-            &branch_name,
-            pushed_branch,
-            stream_failed,
-        );
-    }
+    assistant_response = openclaw_service::synthesize_task_summary(
+        &run.prompt,
+        &changed,
+        commit_sha.as_deref(),
+        &branch_name,
+        pushed_branch,
+        stream_failed,
+    );
 
     if !assistant_response.trim().is_empty() {
         let _ = crate::services::session_service::add_message(

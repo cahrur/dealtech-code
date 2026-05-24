@@ -54,13 +54,16 @@ pub async fn commit(worktree_path: &PathBuf, message: &str) -> Result<String> {
 }
 
 pub async fn push_branch(worktree_path: &PathBuf, branch_name: &str) -> Result<()> {
-    let status = Command::new("git")
+    let out = Command::new("git")
         .args(["-C", worktree_path.to_str().unwrap(), "push", "origin", branch_name])
-        .status()
+        .output()
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("git push: {}", e)))?;
-    if !status.success() {
-        return Err(AppError::Internal(anyhow::anyhow!("git push failed")));
+    if !out.status.success() {
+        return Err(AppError::Internal(anyhow::anyhow!(
+            "git push failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )));
     }
     Ok(())
 }
