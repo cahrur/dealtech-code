@@ -39,6 +39,8 @@ pub fn app_router(state: AppState) -> Router {
             get(super::session_routes::get))
         .route("/api/sessions/:session_id/messages",
             get(super::session_routes::messages))
+        .route("/api/sessions/:session_id/chat",
+            post(super::session_routes::chat))
         .route("/api/sessions/:session_id/agent-runs",
             post(super::run_routes::create))
         .route("/api/agent-runs/:run_id",

@@ -28,3 +28,9 @@ pub struct Message {
 pub struct CreateSessionRequest {
     pub title: Option<String>,
 }
+
+#[derive(Debug, Deserialize)]
+pub struct ChatRequest {
+    pub prompt: String,
+    pub mode: Option<String>,  // "openclaw" | "hermes"
+}

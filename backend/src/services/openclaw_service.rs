@@ -90,6 +90,28 @@ pub async fn run_stream(
     Ok(())
 }
 
+pub async fn run_chat(config: &Config, input: OpenClawRunInput) -> anyhow::Result<String> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<OpenClawEvent>(100);
+    let cfg = config.clone();
+    let inp = input.clone();
+    tokio::spawn(async move {
+        let _ = run_stream(&cfg, inp, tx).await;
+    });
+    let mut response = String::new();
+    while let Some(ev) = rx.recv().await {
+        let is_delta = matches!(ev.event_type.as_str(),
+            "assistant.delta" | "response.output_text.delta" | "content_block_delta");
+        if is_delta {
+            let delta = ev.payload.get("delta").and_then(|d| d.as_str())
+                .or_else(|| ev.payload.get("text").and_then(|d| d.as_str()))
+                .or_else(|| ev.payload.get("delta").and_then(|d| d.get("text")).and_then(|t| t.as_str()))
+                .unwrap_or("");
+            response.push_str(delta);
+        }
+    }
+    Ok(response)
+}
+
 pub fn build_agent_instructions(
     project_name: &str,
     repo_slug: &str,
