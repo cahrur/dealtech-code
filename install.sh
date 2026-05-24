@@ -525,7 +525,7 @@ configure_openclaw() {
   echo "c.setdefault('gateway',{})['bind']='lan'" >> /tmp/oc_cfg.py
   echo "c.setdefault('gateway',{}).setdefault('http',{}).setdefault('endpoints',{}).setdefault('responses',{})['enabled']=True" >> /tmp/oc_cfg.py
   echo "e='/srv/ai-platform/.env'" >> /tmp/oc_cfg.py
-  echo "t=[l.strip().split('=',1)[1] for l in open(e) if l.startswith('OPENCLAW_GATEWAY_TOKEN=')]" >> /tmp/oc_cfg.py
+  echo "t=[l.strip().split('=',1)[1] for l in open(e) if l.startswith('OPENCLAW_GATEWAY_TOKEN=')] if os.path.exists(e) else []" >> /tmp/oc_cfg.py
   echo "if t: c.setdefault('gateway',{}).setdefault('auth',{})['token']=t[0]" >> /tmp/oc_cfg.py
   echo "json.dump(c,open(f,'w'),indent=2)" >> /tmp/oc_cfg.py
   python3 /tmp/oc_cfg.py && log "OpenClaw configured (bind=lan, /v1/responses=enabled, token synced)" || warn "OpenClaw config failed"
@@ -763,13 +763,13 @@ main() {
   install_deps
   install_nodejs_9router
   install_openclaw
-  configure_openclaw
   install_hermes
   create_dirs
   write_env
   write_compose
   write_caddyfile
   write_9router_config
+  configure_openclaw
   setup_firewall
   write_backend_placeholder
   write_systemd
