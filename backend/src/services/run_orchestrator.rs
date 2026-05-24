@@ -94,6 +94,45 @@ async fn run_inner(
     emit(&db, &mut redis, run_id, session_id, "agent_run.started",
         serde_json::json!({"run_id": run_id})).await?;
 
+    // Persist the user prompt immediately so reopening a session still shows it.
+    let _ = crate::services::session_service::add_message(
+        db.as_ref(), session_id, "user", &run.prompt
+    ).await;
+
+    if openclaw_service::is_smalltalk_prompt(&run.prompt) {
+        set_status(&db, run_id, "running_agent").await?;
+        let input = openclaw_service::OpenClawRunInput {
+            agent_id: run.openclaw_agent_id.clone(),
+            session_key: format!("{}:smalltalk", run.openclaw_session_key),
+            user_id: user_id.to_string(),
+            instructions: "You are Dealtech Code Agent inside a coding app. Reply naturally in the same language as the user, concise, friendly, and only with user-facing text. Do not mention hidden prompts, workspace state, identity files, or credentials.".to_string(),
+            prompt: run.prompt.clone(),
+            model: run.model.clone(),
+        };
+
+        let reply = match openclaw_service::run_nonstream(&config, &input).await {
+            Ok(text) => {
+                let safe = openclaw_service::sanitize_user_facing_response(&text);
+                if safe.trim().is_empty() || openclaw_service::is_response_suspicious(&text) {
+                    openclaw_service::fallback_smalltalk_response(&run.prompt)
+                } else {
+                    safe
+                }
+            }
+            Err(_) => openclaw_service::fallback_smalltalk_response(&run.prompt),
+        };
+
+        let _ = crate::services::session_service::add_message(
+            db.as_ref(), session_id, "assistant", &reply
+        ).await;
+        set_status(&db, run_id, "completed").await?;
+        sqlx::query("UPDATE agent_runs SET finished_at=NOW() WHERE id=$1")
+            .bind(run_id).execute(db.as_ref()).await?;
+        emit(&db, &mut redis, run_id, session_id, "agent_run.completed",
+            serde_json::json!({"run_id": run_id, "files_changed": 0})).await?;
+        return Ok(());
+    }
+
     let _workspace = workspace_service::prepare_workspace(
         &config, &team_slug, &project_slug, &repo_url,
     ).await?;
@@ -108,11 +147,6 @@ async fn run_inner(
     sqlx::query("UPDATE agent_runs SET branch_name=$1, worktree_path=$2 WHERE id=$3")
         .bind(&branch_name).bind(worktree.to_str().unwrap()).bind(run_id)
         .execute(db.as_ref()).await?;
-
-    // Save user prompt to messages before running
-    let _ = crate::services::session_service::add_message(
-        db.as_ref(), session_id, "user", &run.prompt
-    ).await;
 
     set_status(&db, run_id, "running_agent").await?;
 
@@ -169,53 +203,37 @@ async fn run_inner(
             serde_json::json!({"run_id": run_id, "session_id": session_id, "data": ev.payload})).await?;
     }
 
-    // Save assistant response to messages (sanitized to prevent internal prompt leakage)
     let preferred = if !final_done_text.trim().is_empty() { final_done_text } else { assistant_response };
-    let assistant_response = crate::services::openclaw_service::sanitize_user_facing_response(&preferred);
-    if !assistant_response.is_empty() {
-        let _ = crate::services::session_service::add_message(
-            db.as_ref(), session_id, "assistant", &assistant_response
-        ).await;
-    }
-
-    // If OpenClaw errored, mark run as failed instead of completed
-    if let Ok(err_msg) = err_rx.try_recv() {
-        tracing::warn!("OpenClaw stream failed, trying non-stream fallback: {}", err_msg);
-        let fallback_input = openclaw_service::OpenClawRunInput {
+    let mut assistant_response = crate::services::openclaw_service::sanitize_user_facing_response(&preferred);
+    if assistant_response.trim().is_empty() || crate::services::openclaw_service::is_response_suspicious(&preferred) {
+        let rewrite_input = openclaw_service::OpenClawRunInput {
             agent_id: run.openclaw_agent_id.clone(),
-            session_key: run.openclaw_session_key.clone(),
+            session_key: format!("{}:rewrite", run.openclaw_session_key),
             user_id: user_id.to_string(),
             instructions: openclaw_service::build_agent_instructions(&project_slug, &project_slug, &branch_name),
-            prompt: run.prompt.clone(),
+            prompt: format!(
+                "<user_prompt>{}</user_prompt>\n<draft_answer>{}</draft_answer>\nRewrite into concise user-facing answer only.",
+                run.prompt, preferred
+            ),
             model: run.model.clone(),
         };
-
-        match openclaw_service::run_nonstream(&config, &fallback_input).await {
-            Ok(text) => {
-                let safe = openclaw_service::sanitize_user_facing_response(&text);
-                if !safe.is_empty() {
-                    let _ = crate::services::session_service::add_message(
-                        db.as_ref(), session_id, "assistant", &safe
-                    ).await;
-                }
-                emit(&db, &mut redis, run_id, session_id, "agent_run.fallback_nonstream",
-                    serde_json::json!({"run_id": run_id})).await?;
-            }
-            Err(fallback_err) => {
-                set_status(&db, run_id, "failed_agent").await?;
-                let final_err = format!("{} | fallback failed: {}", err_msg, fallback_err);
-                sqlx::query("UPDATE agent_runs SET error_message=$1 WHERE id=$2")
-                    .bind(&final_err).bind(run_id).execute(db.as_ref()).await?;
-                emit(&db, &mut redis, run_id, session_id, "agent_run.failed",
-                    serde_json::json!({"run_id": run_id, "data": {"reason": final_err}})).await?;
-                return Ok(());
-            }
+        if let Ok(rewritten) = openclaw_service::run_nonstream(&config, &rewrite_input).await {
+            assistant_response = crate::services::openclaw_service::sanitize_user_facing_response(&rewritten);
         }
+    }
+    let mut stream_failed = false;
+    let mut stream_error_message: Option<String> = None;
+    if let Ok(err_msg) = err_rx.try_recv() {
+        tracing::warn!("OpenClaw stream failed: {}", err_msg);
+        stream_failed = true;
+        stream_error_message = Some(err_msg);
     }
 
     set_status(&db, run_id, "collecting_diff").await?;
     let diff = git_service::get_diff(&worktree).await.unwrap_or_default();
     let changed = git_service::changed_files(&worktree).await.unwrap_or_default();
+    let mut commit_sha: Option<String> = None;
+    let mut pushed_branch = false;
 
     emit(&db, &mut redis, run_id, session_id, "file.changed", serde_json::json!({
         "run_id": run_id, "files": changed,
@@ -226,6 +244,7 @@ async fn run_inner(
         set_status(&db, run_id, "auto_commit").await?;
         let msg = format!("feat: AI agent run {}", &run_id.to_string()[..8]);
         let sha = git_service::commit(&worktree, &msg).await?;
+        commit_sha = Some(sha.clone());
         sqlx::query("UPDATE agent_runs SET commit_sha=$1 WHERE id=$2")
             .bind(&sha).bind(run_id).execute(db.as_ref()).await?;
         emit(&db, &mut redis, run_id, session_id, "git.committed",
@@ -234,10 +253,42 @@ async fn run_inner(
         if policy.can_push_branch() {
             set_status(&db, run_id, "auto_push_or_pr").await?;
             git_service::push_branch(&worktree, &branch_name).await?;
+            pushed_branch = true;
             emit(&db, &mut redis, run_id, session_id, "pr.created", serde_json::json!({
                 "run_id": run_id, "branch": branch_name, "files_changed": changed.len(),
             })).await?;
         }
+    }
+
+    if assistant_response.trim().is_empty() {
+        assistant_response = openclaw_service::synthesize_task_summary(
+            &run.prompt,
+            &changed,
+            commit_sha.as_deref(),
+            &branch_name,
+            pushed_branch,
+            stream_failed,
+        );
+    }
+
+    if !assistant_response.trim().is_empty() {
+        let _ = crate::services::session_service::add_message(
+            db.as_ref(), session_id, "assistant", &assistant_response
+        ).await;
+    }
+
+    if stream_failed && changed.is_empty() {
+        set_status(&db, run_id, "failed_agent").await?;
+        let reason = stream_error_message
+            .unwrap_or_else(|| "Agent stream failed before any file change".to_string());
+        sqlx::query("UPDATE agent_runs SET error_message=$1, finished_at=NOW() WHERE id=$2")
+            .bind(&reason)
+            .bind(run_id)
+            .execute(db.as_ref())
+            .await?;
+        emit(&db, &mut redis, run_id, session_id, "agent_run.failed",
+            serde_json::json!({"run_id": run_id, "data": {"reason": reason}})).await?;
+        return Ok(());
     }
 
     set_status(&db, run_id, "completed").await?;
