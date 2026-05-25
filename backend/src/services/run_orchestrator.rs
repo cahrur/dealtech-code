@@ -152,16 +152,17 @@ async fn run_inner(
         model: run.model.clone(),
     };
 
-    let agent_reply = match openclaw_service::run_chat(&config, input).await {
-        Ok(r) => r,
+    let agent_reply = match openclaw_service::run_agent_full(&config, &input).await {
+        Ok(r) => {
+            tracing::info!(reply_len = r.reply.len(), actions = r.actions.len(), reply_preview = %&r.reply[..r.reply.len().min(200)], "OpenClaw reply");
+            r.reply
+        }
         Err(e) => {
             tracing::error!("OpenClaw call failed: {:#}", e);
             let reply = "Agent tidak bisa diproses saat ini. Silakan coba lagi.".to_string();
             return finish_with_reply(db.as_ref(), &mut redis, run_id, session_id, &reply, true).await;
         }
     };
-
-    tracing::info!(reply_len = agent_reply.len(), reply_preview = %&agent_reply[..agent_reply.len().min(200)], "OpenClaw reply");
 
     set_status(&db, run_id, "collecting_diff").await?;
     let diff = git_service::get_diff(&worktree).await.unwrap_or_default();
