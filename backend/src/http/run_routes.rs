@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::app_state::AppState;
 use crate::domain::agent_run::{AgentRun, CreateRunRequest};
-use crate::domain::policy::PolicyConfig;
+use crate::domain::policy::{PolicyConfig};
 use crate::error::{AppError, Result};
 use crate::services::{project_service, realtime_service, run_orchestrator, session_service};
 
@@ -28,6 +28,21 @@ pub async fn create(
         &state.db, session_id, session.project_id, user_id, req, &project.openclaw_agent_id,
     ).await.map_err(AppError::Internal)?;
 
+    // Load policy dari DB; fallback ke default jika belum dikonfigurasi
+    let policy_config = {
+        let row = sqlx::query_scalar::<_, serde_json::Value>(
+            "SELECT policy FROM project_policies WHERE project_id = $1"
+        )
+        .bind(session.project_id)
+        .fetch_optional(&state.db)
+        .await
+        .unwrap_or(None);
+        match row {
+            Some(val) => serde_json::from_value::<PolicyConfig>(val).unwrap_or_default(),
+            None => PolicyConfig::default(),
+        }
+    };
+
     let db = Arc::new(state.db.clone());
     let redis = state.redis.clone();
     let config = state.config.clone();
@@ -39,7 +54,7 @@ pub async fn create(
         run_orchestrator::execute_run(
             db, redis, config, run_id,
             "default".to_string(), project_slug, repo_url,
-            PolicyConfig::default(),
+            policy_config,
         ).await;
     });
 
