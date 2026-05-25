@@ -58,6 +58,21 @@ async fn process_queued(
             })
             .unwrap_or_default();
 
+            // Mark as processing immediately to prevent duplicate pickup on next poll
+            let updated = sqlx::query_scalar::<_, i64>(
+                "UPDATE agent_runs SET status='processing' WHERE id=$1 AND status='queued' RETURNING 1"
+            )
+            .bind(run.id)
+            .fetch_optional(db.as_ref())
+            .await
+            .ok()
+            .flatten();
+
+            if updated.is_none() {
+                // Another worker already picked this up
+                continue;
+            }
+
             let db2 = db.clone();
             let redis2 = redis.clone();
             let cfg2 = config.clone();
