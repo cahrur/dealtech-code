@@ -65,14 +65,9 @@ pub struct AgentResponse {
 pub fn build_full_agent_instructions(
     repo_url: &str,
     branch_name: &str,
-    file_list: &str,
+    worktree_path: &str,
     git_status: &str,
 ) -> String {
-    let files_section = if file_list.trim().is_empty() {
-        "  (workspace kosong - belum ada file)".to_string()
-    } else {
-        file_list.to_string()
-    };
     let status_section = if git_status.trim().is_empty() {
         "  (tidak ada perubahan)".to_string()
     } else {
@@ -83,33 +78,21 @@ pub fn build_full_agent_instructions(
 
 Repository: {repo_url}
 Branch aktif: {branch_name}
-
-File di workspace saat ini:
-{files_section}
+Worktree path (direktori kerja lokal): {worktree_path}
 
 Git status:
 {status_section}
 
-Kamu HARUS merespons dengan JSON object berikut (tanpa markdown fence, tanpa teks lain):
-{{
-  "reply": "pesan untuk user dalam bahasa yang sama dengan user",
-  "actions": [
-    {{"type": "write_file", "path": "path/to/file", "content": "isi file lengkap"}}
-  ],
-  "commit_message": "feat: deskripsi perubahan"
-}}
-
-Aturan penting:
-- "reply" wajib diisi - jelaskan apa yang kamu lakukan, atau kenapa tidak bisa dilakukan
-- "actions" boleh kosong [] jika tidak ada perubahan file
+Cara kerja:
+- Gunakan tools kamu (read, write, edit, exec) untuk membaca dan menulis file LANGSUNG ke worktree path di atas
+- Jangan kembalikan isi file sebagai teks — tulis langsung ke filesystem
+- Setelah selesai, balas dengan penjelasan singkat apa yang sudah kamu lakukan
 - Gunakan riwayat percakapan untuk memahami konteks (misal "buat yang lebih bagus" merujuk ke pekerjaan sebelumnya)
-- Jika repo tidak bisa diakses atau ada masalah, jelaskan dengan jelas di "reply"
-- Jika permintaan tidak jelas, minta klarifikasi di "reply" dengan actions kosong
-- Tulis isi file LENGKAP di "content" - jangan parsial
-- Kembalikan HANYA JSON object, tanpa markdown, tanpa penjelasan di luar JSON"#,
+- Jika repo tidak bisa diakses atau ada masalah, jelaskan dengan jelas
+- Jika permintaan tidak jelas, minta klarifikasi"#,
         repo_url = repo_url,
         branch_name = branch_name,
-        files_section = files_section,
+        worktree_path = worktree_path,
         status_section = status_section,
     )
 }
@@ -118,6 +101,7 @@ Aturan penting:
 /// Falls back to plain-reply AgentResponse if OpenClaw returns non-JSON.
 pub async fn run_agent_full(config: &Config, input: &OpenClawRunInput) -> Result<AgentResponse> {
     let raw = run_nonstream(config, input).await?;
+    tracing::info!(session_key = %input.session_key, raw_len = raw.len(), raw_preview = %&raw[..raw.len().min(500)], "OpenClaw raw response");
     let cleaned = raw
         .trim()
         .trim_start_matches("```json")
@@ -125,8 +109,10 @@ pub async fn run_agent_full(config: &Config, input: &OpenClawRunInput) -> Result
         .trim_end_matches("```")
         .trim();
     if let Ok(resp) = serde_json::from_str::<AgentResponse>(cleaned) {
+        tracing::info!(reply_len = resp.reply.len(), actions = resp.actions.len(), "OpenClaw parsed AgentResponse");
         return Ok(resp);
     }
+    tracing::warn!(cleaned_preview = %&cleaned[..cleaned.len().min(300)], "OpenClaw response not valid JSON, falling back to plain reply");
     // Not JSON — treat as plain reply with no file actions
     let reply = sanitize_user_facing_response(&raw);
     let reply = if reply.trim().is_empty() {

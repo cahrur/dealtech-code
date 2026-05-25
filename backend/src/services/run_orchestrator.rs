@@ -133,14 +133,14 @@ async fn run_inner(
 
     set_status(&db, run_id, "running_agent").await?;
 
-    // Build workspace context so OpenClaw knows what files exist and git state
-    let file_list = openclaw_service::build_worktree_context(&worktree).await;
+    // Build instructions: tell OpenClaw the worktree path so it can use its own tools
     let git_status = git_service::get_status(&worktree).await.unwrap_or_default();
+    let worktree_str = worktree.to_string_lossy().to_string();
     let instructions = openclaw_service::build_full_agent_instructions(
-        &repo_url, &branch_name, &file_list, &git_status,
+        &repo_url, &branch_name, &worktree_str, &git_status,
     );
 
-    // Single OpenClaw call with full context + same session key (preserves chat history)
+    // Single OpenClaw call — streaming, OpenClaw writes files directly via its own tools
     let input = openclaw_service::OpenClawRunInput {
         agent_id: run.openclaw_agent_id.clone(),
         session_key: run.openclaw_session_key.clone(),
@@ -150,7 +150,7 @@ async fn run_inner(
         model: run.model.clone(),
     };
 
-    let agent_response = match openclaw_service::run_agent_full(&config, &input).await {
+    let agent_reply = match openclaw_service::run_chat(&config, input).await {
         Ok(r) => r,
         Err(e) => {
             tracing::error!("OpenClaw call failed: {:#}", e);
@@ -159,15 +159,7 @@ async fn run_inner(
         }
     };
 
-    // Execute file actions returned by OpenClaw
-    for action in &agent_response.actions {
-        if action.action_type == "write_file" {
-            match file_action_service::write_file(&worktree, &action.path, &action.content).await {
-                Ok(_) => tracing::info!(path = %action.path, "Wrote file"),
-                Err(e) => tracing::warn!(path = %action.path, error = %e, "Failed to write file"),
-            }
-        }
-    }
+    tracing::info!(reply_len = agent_reply.len(), reply_preview = %&agent_reply[..agent_reply.len().min(200)], "OpenClaw reply");
 
     set_status(&db, run_id, "collecting_diff").await?;
     let diff = git_service::get_diff(&worktree).await.unwrap_or_default();
@@ -186,9 +178,7 @@ async fn run_inner(
 
     if policy.can_commit() && !changed.is_empty() {
         set_status(&db, run_id, "auto_commit").await?;
-        let msg = agent_response.commit_message.clone()
-            .filter(|m| !m.trim().is_empty())
-            .unwrap_or_else(|| format!("feat: AI agent run {}", &run_id.to_string()[..8]));
+        let msg = format!("feat: AI agent run {}", &run_id.to_string()[..8]);
         match git_service::commit(&worktree, &msg).await {
             Ok(sha) => {
                 commit_sha = Some(sha.clone());
@@ -218,7 +208,7 @@ async fn run_inner(
     }
 
     // Build final reply: OpenClaw's reply augmented with git status
-    let mut final_reply = agent_response.reply.clone();
+    let mut final_reply = agent_reply.clone();
     if final_reply.trim().is_empty() {
         final_reply = if changed.is_empty() {
             "Tidak ada perubahan file.".to_string()
