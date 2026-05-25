@@ -39,6 +39,25 @@ async fn process_queued(
         .await?;
 
         if let Some(p) = proj {
+            // Load policy from DB; fall back to defaults if project has no policy row yet
+            #[derive(sqlx::FromRow)]
+            struct PolicyRow { auto_mode: String, policy: serde_json::Value }
+
+            let policy_config = sqlx::query_as::<_, PolicyRow>(
+                "SELECT auto_mode, policy FROM project_policies WHERE project_id = $1",
+            )
+            .bind(run.project_id)
+            .fetch_optional(db.as_ref())
+            .await
+            .ok()
+            .flatten()
+            .and_then(|row| {
+                let mut cfg: PolicyConfig = serde_json::from_value(row.policy).ok()?;
+                cfg.auto_mode = row.auto_mode;
+                Some(cfg)
+            })
+            .unwrap_or_default();
+
             let db2 = db.clone();
             let redis2 = redis.clone();
             let cfg2 = config.clone();
@@ -47,7 +66,7 @@ async fn process_queued(
                 run_orchestrator::execute_run(
                     db2, redis2, cfg2, run_id,
                     "default".to_string(), p.slug, p.repo_url,
-                    PolicyConfig::default(),
+                    policy_config,
                 ).await;
             });
         }

@@ -713,6 +713,121 @@ pub fn build_agent_instructions(
     )
 }
 
+// ---------------------------------------------------------------------------
+// File action extraction from agent text response
+// ---------------------------------------------------------------------------
+
+/// Parse the assistant's text response for code blocks that look like file
+/// writes. Supports two common patterns:
+///   1. A line before the fence that looks like a file path (e.g. `**src/main.rs**:`)
+///   2. The first line inside the fence is a comment containing a file path
+///      (e.g. `// src/main.rs` in Rust, `# utils.py` in Python)
+pub fn extract_file_actions_from_response(response: &str) -> Vec<FileAction> {
+    let mut actions: Vec<FileAction> = Vec::new();
+    let lines: Vec<&str> = response.lines().collect();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let trimmed = lines[i].trim();
+
+        // Detect opening code fence
+        if trimmed.starts_with("```") {
+            let lang = trimmed.trim_start_matches('`').trim().to_string();
+
+            // Look back for a file path hint on the nearest non-empty previous line
+            let path_hint = (0..i)
+                .rev()
+                .find(|&j| !lines[j].trim().is_empty())
+                .and_then(|j| extract_path_from_hint(lines[j]));
+
+            // Collect code block content until closing fence
+            let mut code_lines: Vec<&str> = Vec::new();
+            i += 1;
+
+            // Check if first line inside block is a path comment
+            let inline_path = if i < lines.len() {
+                extract_path_from_comment(lines[i], &lang)
+            } else {
+                None
+            };
+            if inline_path.is_some() {
+                i += 1; // skip the comment line — it's metadata, not code
+            }
+
+            while i < lines.len() {
+                let cl = lines[i].trim();
+                // Closing fence: ``` with nothing after (or just whitespace)
+                if cl.starts_with("```") && cl.trim_start_matches('`').trim().is_empty() {
+                    i += 1;
+                    break;
+                }
+                code_lines.push(lines[i]);
+                i += 1;
+            }
+
+            let content = code_lines.join("\n");
+            let path = inline_path.or(path_hint);
+
+            if let Some(p) = path {
+                if looks_like_file_path(&p)
+                    && !content.trim().is_empty()
+                    && !actions.iter().any(|a: &FileAction| a.path == p)
+                {
+                    actions.push(FileAction {
+                        action_type: "write_file".to_string(),
+                        path: p,
+                        content,
+                    });
+                }
+            }
+            continue;
+        }
+        i += 1;
+    }
+    actions
+}
+
+/// Extract a file path from a hint line that precedes a code fence.
+/// Handles patterns like: `**src/main.rs**`, `src/main.rs:`, `` `src/main.rs` ``
+fn extract_path_from_hint(line: &str) -> Option<String> {
+    let cleaned = line
+        .trim()
+        .trim_start_matches("**").trim_end_matches("**")
+        .trim_start_matches('`').trim_end_matches('`')
+        .trim_end_matches(':')
+        .trim();
+    if looks_like_file_path(cleaned) {
+        Some(cleaned.to_string())
+    } else {
+        None
+    }
+}
+
+/// Extract a file path from a comment on the first line inside a code fence.
+/// e.g. `// src/main.rs` (Rust/JS), `# utils.py` (Python), `-- schema.sql` (SQL)
+fn extract_path_from_comment(line: &str, lang: &str) -> Option<String> {
+    let trimmed = line.trim();
+    let prefixes: &[&str] = match lang {
+        "sql" => &["--"],
+        "python" | "py" | "yaml" | "yml" | "toml" | "sh" | "bash" | "shell" => &["#"],
+        "html" | "xml" => &["<!--"],
+        _ => &["//", "#", "--"],
+    };
+    for prefix in prefixes {
+        if trimmed.starts_with(prefix) {
+            let after = trimmed[prefix.len()..]
+                .trim()
+                .trim_end_matches("-->")
+                .trim_end_matches("*/")
+                .trim();
+            if looks_like_file_path(after) {
+                return Some(after.to_string());
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::{fallback_plan_file_actions, is_push_request, is_write_request};

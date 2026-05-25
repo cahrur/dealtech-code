@@ -321,6 +321,23 @@ async fn run_inner(
         stream_error_message = Some(err_msg);
     }
 
+    // Core fix: OpenClaw returns text, not direct file writes.
+    // Parse the response for code blocks with file paths and apply them to the worktree.
+    if !stream_failed {
+        let extracted = openclaw_service::extract_file_actions_from_response(&preferred);
+        if !extracted.is_empty() {
+            tracing::info!(count = extracted.len(), "Applying file actions extracted from agent response");
+            for action in &extracted {
+                if action.action_type == "write_file" {
+                    match file_action_service::write_file(&worktree, &action.path, &action.content).await {
+                        Ok(_) => tracing::info!(path = %action.path, "Wrote file from agent response"),
+                        Err(e) => tracing::warn!(path = %action.path, error = %e, "Failed to write file from agent response"),
+                    }
+                }
+            }
+        }
+    }
+
     set_status(&db, run_id, "collecting_diff").await?;
     let diff = git_service::get_diff(&worktree).await.unwrap_or_default();
     let changed = git_service::changed_files(&worktree).await.unwrap_or_default();

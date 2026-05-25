@@ -69,14 +69,25 @@ pub async fn push_branch(worktree_path: &PathBuf, branch_name: &str) -> Result<(
 }
 
 pub async fn changed_files(worktree_path: &PathBuf) -> Result<Vec<String>> {
+    // Use --porcelain so we also catch untracked (new) files, not just modified ones
     let output = Command::new("git")
-        .args(["-C", worktree_path.to_str().unwrap(), "diff", "--name-only", "HEAD"])
+        .args(["-C", worktree_path.to_str().unwrap(), "status", "--porcelain"])
         .output()
         .await
-        .map_err(|e| AppError::Internal(anyhow::anyhow!("git diff --name-only: {}", e)))?;
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("git status --porcelain: {}", e)))?;
     Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
+        .filter(|l| l.len() > 3)
+        .map(|l| {
+            // porcelain format: "XY path" (2 status chars + 1 space = 3-char prefix)
+            // For renames: "R  old -> new" — take the destination path
+            let path = l[3..].trim();
+            if let Some(pos) = path.find(" -> ") {
+                path[pos + 4..].trim().to_string()
+            } else {
+                path.to_string()
+            }
+        })
         .filter(|l| !l.is_empty())
-        .map(|l| l.to_string())
         .collect())
 }
