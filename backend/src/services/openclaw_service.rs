@@ -275,10 +275,38 @@ pub async fn run_chat(config: &Config, input: OpenClawRunInput) -> anyhow::Resul
     });
     let mut response = String::new();
     let mut final_done_text = String::new();
+    let mut all_event_types: Vec<String> = Vec::new();
     while let Some(ev) = rx.recv().await {
-        if ev.event_type == "response.output_text.done" {
+        all_event_types.push(ev.event_type.clone());
+        // Capture final text from done event
+        if ev.event_type == "response.output_text.done"
+            || ev.event_type == "message.completed"
+            || ev.event_type == "response.completed"
+        {
+            // Try top-level text field
             if let Some(t) = ev.payload.get("text").and_then(|v| v.as_str()) {
-                final_done_text = t.to_string();
+                if !t.is_empty() { final_done_text = t.to_string(); }
+            }
+            // Try output array (response.completed)
+            if final_done_text.is_empty() {
+                if let Some(arr) = ev.payload.get("response")
+                    .and_then(|r| r.get("output"))
+                    .and_then(|o| o.as_array())
+                {
+                    for msg in arr.iter().rev() {
+                        if let Some(parts) = msg.get("content").and_then(|c| c.as_array()) {
+                            for part in parts {
+                                let is_text = part.get("type").and_then(|t| t.as_str()) == Some("text");
+                                if is_text {
+                                    if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                                        if !t.is_empty() { final_done_text = t.to_string(); break; }
+                                    }
+                                }
+                            }
+                        }
+                        if !final_done_text.is_empty() { break; }
+                    }
+                }
             }
         }
         let is_delta = matches!(ev.event_type.as_str(),
@@ -291,7 +319,9 @@ pub async fn run_chat(config: &Config, input: OpenClawRunInput) -> anyhow::Resul
             response.push_str(delta);
         }
     }
+    tracing::info!(event_types = ?all_event_types, stream_len = response.len(), done_len = final_done_text.len(), "OpenClaw stream events");
     let chosen = if !final_done_text.trim().is_empty() { final_done_text } else { response };
+    tracing::info!(chosen_len = chosen.len(), chosen_preview = %&chosen[..chosen.len().min(400)], "OpenClaw chosen before sanitize");
     let mut safe = sanitize_user_facing_response(&chosen);
     if safe.trim().is_empty() {
         let fallback = run_nonstream(config, &input).await.unwrap_or_default();
@@ -320,6 +350,9 @@ pub fn sanitize_user_facing_response(raw: &str) -> String {
     }
 
     let lowered = text.to_lowercase();
+    // Only block genuine system-prompt leaks — keep this list tight.
+    // Do NOT add broad phrases like "github token" or "who are you" here;
+    // those are legitimate things an AI coding assistant may say.
     let leak_markers = [
         "system prompt",
         "internal instruction",
@@ -327,25 +360,9 @@ pub fn sanitize_user_facing_response(raw: &str) -> String {
         "bootstrap.md",
         "soul.md",
         "identity.md",
-        "ignore this as",
-        "not a real system instruction",
         "instruksi sistem",
         "instruksi internal",
-        "need github token",
-        "butuh github token",
-        "masih nunggu github token",
-        "github token",
-        "token github",
-        "personal access token",
-        "pat untuk push",
-        "tolong berikan pat",
         "/root/.openclaw",
-        "fresh start",
-        "blank slate",
-        "who am i",
-        "who are you",
-        "came online",
-        "need a name",
     ];
 
     if leak_markers.iter().any(|m| lowered.contains(m)) {
