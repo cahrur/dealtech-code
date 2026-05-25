@@ -65,7 +65,7 @@ async fn process_queued(
             tokio::spawn(async move {
                 run_orchestrator::execute_run(
                     db2, redis2, cfg2, run_id,
-                    "default".to_string(), p.slug, p.repo_url,
+                    run.user_id.to_string(), p.slug, p.repo_url,
                     policy_config,
                 ).await;
             });
