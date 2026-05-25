@@ -714,6 +714,67 @@ pub fn build_agent_instructions(
 }
 
 // ---------------------------------------------------------------------------
+// Worktree context builder
+// ---------------------------------------------------------------------------
+
+/// Read files from the worktree and return a compact context string so
+/// OpenClaw knows what files exist and their current content.
+pub async fn build_worktree_context(worktree: &std::path::PathBuf) -> String {
+    const MAX_FILE_BYTES: usize = 6_000;
+    const MAX_TOTAL_BYTES: usize = 24_000;
+    const MAX_FILES: usize = 30;
+
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    collect_worktree_files(worktree, worktree, &mut files, 0);
+    files.sort();
+    files.truncate(MAX_FILES);
+
+    let mut context = String::new();
+    for path in &files {
+        if context.len() >= MAX_TOTAL_BYTES {
+            break;
+        }
+        let rel = path.strip_prefix(worktree).unwrap_or(path);
+        let rel_str = rel.to_string_lossy();
+        match tokio::fs::read_to_string(path).await {
+            Ok(content) if content.len() <= MAX_FILE_BYTES => {
+                context.push_str(&format!("### {}\n```\n{}\n```\n\n", rel_str, content.trim()));
+            }
+            Ok(content) => {
+                context.push_str(&format!("### {} ({} bytes — too large to inline)\n\n", rel_str, content.len()));
+            }
+            Err(_) => {} // binary or unreadable
+        }
+    }
+    context
+}
+
+fn collect_worktree_files(
+    base: &std::path::Path,
+    dir: &std::path::Path,
+    out: &mut Vec<std::path::PathBuf>,
+    depth: usize,
+) {
+    if depth > 4 { return; }
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let n = name.to_string_lossy();
+        if n.starts_with('.') || n == "target" || n == "node_modules"
+            || n == "vendor" || n.ends_with(".lock") || n == "dist" || n == "build"
+        {
+            continue;
+        }
+        if path.is_dir() {
+            collect_worktree_files(base, &path, out, depth + 1);
+        } else if path.is_file() {
+            out.push(path);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // File action extraction from agent text response
 // ---------------------------------------------------------------------------
 

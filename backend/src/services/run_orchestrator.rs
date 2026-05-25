@@ -1,7 +1,6 @@
 use redis::aio::ConnectionManager;
 use sqlx::PgPool;
 use std::sync::Arc;
-use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::config::Config;
@@ -242,96 +241,47 @@ async fn run_inner(
         return Ok(());
     }
 
+    // Inject existing worktree files as context so OpenClaw can reason about the codebase
+    let worktree_context = openclaw_service::build_worktree_context(&worktree).await;
     let instructions = openclaw_service::build_agent_instructions(&project_slug, &project_slug, &branch_name);
-    let (tx, mut rx) = mpsc::channel::<openclaw_service::OpenClawEvent>(100);
+    let enriched_prompt = if worktree_context.is_empty() {
+        run.prompt.clone()
+    } else {
+        format!("{prompt}\n\n---\nCurrent workspace files:\n{ctx}",
+            prompt = run.prompt, ctx = worktree_context)
+    };
+
     let input = openclaw_service::OpenClawRunInput {
         agent_id: run.openclaw_agent_id.clone(),
         session_key: run.openclaw_session_key.clone(),
         user_id: user_id.to_string(),
         instructions,
-        prompt: run.prompt.clone(),
+        prompt: enriched_prompt,
         model: run.model.clone(),
     };
 
-    let (err_tx, mut err_rx) = tokio::sync::oneshot::channel::<String>();
-    let cfg = config.clone();
-    tokio::spawn(async move {
-        if let Err(e) = openclaw_service::run_stream(&cfg, input, tx).await {
-            tracing::error!("OpenClaw stream error: {}", e);
-            let _ = err_tx.send(e.to_string());
-        }
-    });
-
-    let mut assistant_response = String::new();
-    let mut final_done_text = String::new();
-
-    while let Some(ev) = rx.recv().await {
-        tracing::info!(event_type = %ev.event_type, "OpenClaw event");
-
-        // Map OpenClaw event types to our own
-        let mapped_type = match ev.event_type.as_str() {
-            "response.output_text.delta" | "content_block_delta" => "assistant.delta",
-            other => other,
+    // Non-streaming: wait for full response, then extract file actions
+    let (preferred, stream_failed, stream_error_message) =
+        match openclaw_service::run_nonstream(&config, &input).await {
+            Ok(raw) => (raw, false, None::<String>),
+            Err(e) => {
+                tracing::error!("OpenClaw call failed: {}", e);
+                (String::new(), true, Some(e.to_string()))
+            }
         };
 
-        // Collect assistant delta — try multiple field paths
-        if ev.event_type == "response.output_text.done" {
-            if let Some(t) = ev.payload.get("text").and_then(|v| v.as_str()) {
-                final_done_text = t.to_string();
-            }
-        }
+    let mut assistant_response = openclaw_service::sanitize_user_facing_response(&preferred);
 
-        if mapped_type == "assistant.delta" {
-            let delta = ev.payload.get("delta").and_then(|d| d.as_str())
-                .or_else(|| ev.payload.get("text").and_then(|d| d.as_str()))
-                .or_else(|| ev.payload.get("delta").and_then(|d| d.get("text")).and_then(|t| t.as_str()))
-                .unwrap_or("");
-            if !delta.is_empty() {
-                assistant_response.push_str(delta);
-            }
-        }
-
-        emit(&db, &mut redis, run_id, session_id, mapped_type,
-            serde_json::json!({"run_id": run_id, "session_id": session_id, "data": ev.payload})).await?;
-    }
-
-    let preferred = if !final_done_text.trim().is_empty() { final_done_text } else { assistant_response };
-    let mut assistant_response = crate::services::openclaw_service::sanitize_user_facing_response(&preferred);
-    if assistant_response.trim().is_empty() || crate::services::openclaw_service::is_response_suspicious(&preferred) {
-        let rewrite_input = openclaw_service::OpenClawRunInput {
-            agent_id: run.openclaw_agent_id.clone(),
-            session_key: format!("{}:rewrite", run.openclaw_session_key),
-            user_id: user_id.to_string(),
-            instructions: openclaw_service::build_agent_instructions(&project_slug, &project_slug, &branch_name),
-            prompt: format!(
-                "<user_prompt>{}</user_prompt>\n<draft_answer>{}</draft_answer>\nRewrite into concise user-facing answer only.",
-                run.prompt, preferred
-            ),
-            model: run.model.clone(),
-        };
-        if let Ok(rewritten) = openclaw_service::run_nonstream(&config, &rewrite_input).await {
-            assistant_response = crate::services::openclaw_service::sanitize_user_facing_response(&rewritten);
-        }
-    }
-    let mut stream_failed = false;
-    let mut stream_error_message: Option<String> = None;
-    if let Ok(err_msg) = err_rx.try_recv() {
-        tracing::warn!("OpenClaw stream failed: {}", err_msg);
-        stream_failed = true;
-        stream_error_message = Some(err_msg);
-    }
-
-    // Core fix: OpenClaw returns text, not direct file writes.
-    // Parse the response for code blocks with file paths and apply them to the worktree.
+    // Extract and apply file actions from the response to the worktree
     if !stream_failed {
         let extracted = openclaw_service::extract_file_actions_from_response(&preferred);
         if !extracted.is_empty() {
-            tracing::info!(count = extracted.len(), "Applying file actions extracted from agent response");
+            tracing::info!(count = extracted.len(), "Applying file actions from agent response");
             for action in &extracted {
                 if action.action_type == "write_file" {
                     match file_action_service::write_file(&worktree, &action.path, &action.content).await {
-                        Ok(_) => tracing::info!(path = %action.path, "Wrote file from agent response"),
-                        Err(e) => tracing::warn!(path = %action.path, error = %e, "Failed to write file from agent response"),
+                        Ok(_) => tracing::info!(path = %action.path, "Wrote file"),
+                        Err(e) => tracing::warn!(path = %action.path, error = %e, "Failed to write file"),
                     }
                 }
             }
