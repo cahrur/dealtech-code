@@ -22,7 +22,9 @@ pub async fn create_run(
     let run_id = Uuid::new_v4();
     let auto_mode = req.auto_mode.unwrap_or_else(|| "auto_trusted".to_string());
     let model = req.model.clone().unwrap_or_default();
-    let session_key = format!("project_{}:session_{}", project_id, session_id);
+    // Use run_id (not session_id) so each run gets its own isolated OpenClaw session.
+    // Sharing session_id caused OpenClaw to see stale system prompts from previous runs.
+    let session_key = format!("project_{}:run_{}", project_id, run_id);
     let run = sqlx::query_as::<_, AgentRun>(
         "INSERT INTO agent_runs
          (id, session_id, project_id, user_id, prompt, status, auto_mode, openclaw_agent_id, openclaw_session_key, model)
