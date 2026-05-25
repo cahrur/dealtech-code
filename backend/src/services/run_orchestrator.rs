@@ -265,8 +265,8 @@ async fn run_inner(
         match openclaw_service::run_nonstream(&config, &input).await {
             Ok(raw) => (raw, false, None::<String>),
             Err(e) => {
-                tracing::error!("OpenClaw call failed: {}", e);
-                (String::new(), true, Some(e.to_string()))
+                tracing::error!("OpenClaw call failed: {:#?}", e);
+                (String::new(), true, Some(format!("{:#}", e)))
             }
         };
 

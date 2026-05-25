@@ -63,7 +63,6 @@ pub async fn run_stream(
         "user": input.user_id,
         "instructions": input.instructions,
         "input": input.prompt,
-        "x_model": input.model,
     });
 
     let res = client
@@ -71,6 +70,7 @@ pub async fn run_stream(
         .bearer_auth(&config.openclaw_gateway_token)
         .header("x-openclaw-agent-id", &input.agent_id)
         .header("x-openclaw-session-key", &input.session_key)
+        .header("x-openclaw-model", &input.model)
         .json(&body)
         .send()
         .await
@@ -128,7 +128,6 @@ pub async fn run_nonstream(config: &Config, input: &OpenClawRunInput) -> Result<
         "user": input.user_id,
         "instructions": input.instructions,
         "input": input.prompt,
-        "x_model": input.model,
     });
 
     let res = client
@@ -136,6 +135,7 @@ pub async fn run_nonstream(config: &Config, input: &OpenClawRunInput) -> Result<
         .bearer_auth(&config.openclaw_gateway_token)
         .header("x-openclaw-agent-id", &input.agent_id)
         .header("x-openclaw-session-key", &input.session_key)
+        .header("x-openclaw-model", &input.model)
         .json(&body)
         .send()
         .await
