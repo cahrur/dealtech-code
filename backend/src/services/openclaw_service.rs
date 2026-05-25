@@ -338,47 +338,59 @@ pub async fn run_chat(config: &Config, input: OpenClawRunInput) -> anyhow::Resul
 }
 
 /// Strip prompt-injection payloads from user input before sending to OpenClaw.
-/// Removes XML-tag-wrapped injection blocks and known injection header lines.
+/// Injection blocks are always prepended before the real user message.
+/// Strategy: find the last injection line, take everything after it as the real prompt.
 pub fn sanitize_user_prompt(prompt: &str) -> String {
-    let mut text = prompt.to_string();
+    let injection_start_markers = [
+        "# CRITICAL: CHUNKED WRITE PROTOCOL",
+        "# CRITICAL:",
+        "## ABSOLUTE LIMITS",
+        "## MANDATORY CHUNKED",
+    ];
 
-    // Remove XML-style injection blocks like <CHUNKED WRITE PROTOCOL>...</CHUNKED WRITE PROTOCOL>
-    // Loop in case there are multiple blocks
-    loop {
-        // Find an opening tag that looks like <ALL CAPS ...>
-        let open_start = text.find('<');
-        if open_start.is_none() { break; }
-        let os = open_start.unwrap();
-        let after_open = &text[os + 1..];
-        // Find the closing >
-        if let Some(tag_end) = after_open.find('>') {
-            let tag_name = &after_open[..tag_end];
-            // Only strip if tag name is ALL CAPS (injection marker)
-            let is_injection_tag = tag_name.len() > 3
-                && tag_name.chars().all(|c| c.is_uppercase() || c == ' ' || c == '_' || c == '-');
-            if is_injection_tag {
-                let close_tag = format!("</{}>", tag_name);
-                if let Some(close_pos) = text.find(&close_tag) {
-                    let end = close_pos + close_tag.len();
-                    text = format!("{}{}", &text[..os], &text[end..]);
-                    continue;
-                }
-            }
-        }
-        break;
+    // Fast path: no injection present
+    if !injection_start_markers.iter().any(|m| prompt.contains(m)) {
+        return prompt.trim().to_string();
     }
 
-    // Remove lines that are known injection header patterns
-    let injection_prefixes = [
+    // Lines that belong to the injection block
+    let injection_line_prefixes = [
         "# CRITICAL:", "## ABSOLUTE", "## MANDATORY", "## EXAMPLES",
-        "## WHY THIS", "REMEMBER:", "## CORRECT", "## WRONG",
+        "## WHY THIS", "## CORRECT", "## WRONG", "REMEMBER:",
+        "WRONG:", "CORRECT:", "- Operation ", "- **MAXIMUM",
+        "- **RECOMMENDED", "- **NEVER", "- Use surgical",
+        "- NEVER rewrite", "- Split large", "- Generate in",
+        "- Write each", "- Use append", "- FIRST:", "- THEN:",
+        "- REPEAT:", "### For NEW", "### For EDIT", "### For LARGE",
     ];
-    let cleaned: Vec<&str> = text
-        .lines()
+
+    let lines: Vec<&str> = prompt.lines().collect();
+
+    // Find the index of the last line that belongs to the injection block
+    let mut last_injection_idx: Option<usize> = None;
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim();
+        if injection_line_prefixes.iter().any(|p| t.starts_with(p)) {
+            last_injection_idx = Some(i);
+        }
+    }
+
+    if let Some(idx) = last_injection_idx {
+        // Real user message is everything after the injection block
+        let rest = lines[idx + 1..].join("\n");
+        let cleaned = rest.trim().to_string();
+        if !cleaned.is_empty() {
+            return cleaned;
+        }
+    }
+
+    // Fallback: strip individual injection lines
+    let cleaned: Vec<&str> = lines.iter()
         .filter(|l| {
             let t = l.trim();
-            !injection_prefixes.iter().any(|p| t.starts_with(p))
+            !injection_line_prefixes.iter().any(|p| t.starts_with(p))
         })
+        .copied()
         .collect();
 
     cleaned.join("\n").trim().to_string()
