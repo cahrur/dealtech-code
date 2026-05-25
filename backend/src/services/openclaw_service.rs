@@ -351,12 +351,11 @@ pub fn sanitize_user_facing_response(raw: &str) -> String {
 
     let lowered = text.to_lowercase();
     // Only block genuine system-prompt leaks — keep this list tight.
-    // Do NOT add broad phrases like "github token" or "who are you" here;
-    // those are legitimate things an AI coding assistant may say.
+    // Do NOT add broad phrases like "prompt injection" here;
+    // OpenClaw legitimately says that phrase when rejecting injections.
     let leak_markers = [
         "system prompt",
         "internal instruction",
-        "prompt injection",
         "bootstrap.md",
         "soul.md",
         "identity.md",
