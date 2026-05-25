@@ -232,18 +232,37 @@ pub async fn run_nonstream(config: &Config, input: &OpenClawRunInput) -> Result<
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("OpenClaw non-stream decode: {}", e)))?;
 
+    // Find the last assistant message with text content.
+    // When OpenClaw uses tools the output array is:
+    //   [tool_use, tool_result, ..., assistant_text]
+    // so we must scan all items, not just arr.first().
     let text = val
         .get("output")
         .and_then(|o| o.as_array())
-        .and_then(|arr| arr.first())
-        .and_then(|msg| msg.get("content"))
-        .and_then(|c| c.as_array())
-        .and_then(|parts| parts.first())
-        .and_then(|part| part.get("text"))
-        .and_then(|t| t.as_str())
+        .and_then(|arr| {
+            arr.iter().rev().find_map(|msg| {
+                msg.get("content")
+                    .and_then(|c| c.as_array())
+                    .and_then(|parts| {
+                        parts.iter().find_map(|part| {
+                            let is_text = part
+                                .get("type")
+                                .and_then(|t| t.as_str())
+                                .map(|t| t == "text")
+                                .unwrap_or(false);
+                            if is_text {
+                                part.get("text").and_then(|t| t.as_str())
+                            } else {
+                                None
+                            }
+                        })
+                    })
+            })
+        })
         .unwrap_or_default()
         .to_string();
 
+    tracing::info!(text_len = text.len(), text_preview = %&text[..text.len().min(200)], "OpenClaw nonstream text");
     Ok(text)
 }
 
