@@ -21,7 +21,7 @@ pub async fn create_run(
 ) -> anyhow::Result<AgentRun> {
     let run_id = Uuid::new_v4();
     let auto_mode = req.auto_mode.unwrap_or_else(|| "auto_trusted".to_string());
-    let model = req.model.clone().unwrap_or_else(|| "claude-sonnet-4-6".to_string());
+    let model = req.model.clone().unwrap_or_default();
     let session_key = format!("project_{}:session_{}", project_id, session_id);
     let run = sqlx::query_as::<_, AgentRun>(
         "INSERT INTO agent_runs
