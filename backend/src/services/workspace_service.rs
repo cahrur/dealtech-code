@@ -80,7 +80,32 @@ pub async fn create_worktree(
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("mkdir worktree parent: {}", e)))?;
 
-    let status = Command::new("git")
+    // First, try to delete any existing branch with same name (from failed runs)
+    tracing::debug!(
+        workspace = %workspace_path.display(),
+        branch = %branch_name,
+        "Cleaning up any existing branch before worktree creation"
+    );
+    let _ = Command::new("git")
+        .args(["-C", workspace_path.to_str().unwrap(), "branch", "-D", branch_name])
+        .status()
+        .await;
+
+    // Also remove any stale worktree entry
+    let _ = Command::new("git")
+        .args(["-C", workspace_path.to_str().unwrap(), "worktree", "prune"])
+        .status()
+        .await;
+
+    tracing::info!(
+        workspace = %workspace_path.display(),
+        worktree = %worktree_path.display(),
+        branch = %branch_name,
+        run_id = %run_id,
+        "Creating worktree"
+    );
+
+    let output = Command::new("git")
         .args([
             "-C",
             workspace_path.to_str().unwrap(),
@@ -90,12 +115,23 @@ pub async fn create_worktree(
             "-b",
             branch_name,
         ])
-        .status()
+        .output()
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("git worktree add: {}", e)))?;
 
-    if !status.success() {
-        return Err(AppError::Internal(anyhow::anyhow!("git worktree add failed")));
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tracing::error!(
+            workspace = %workspace_path.display(),
+            branch = %branch_name,
+            stderr = %stderr,
+            "git worktree add failed"
+        );
+        return Err(AppError::Internal(anyhow::anyhow!(
+            "git worktree add failed for branch {}: {}",
+            branch_name,
+            stderr.trim()
+        )));
     }
     Ok(worktree_path)
 }
