@@ -80,20 +80,26 @@ pub async fn create_worktree(
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("mkdir worktree parent: {}", e)))?;
 
-    // First, try to delete any existing branch with same name (from failed runs)
+    // First, force-remove any existing worktree at the target path (from failed runs)
     tracing::debug!(
         workspace = %workspace_path.display(),
         branch = %branch_name,
-        "Cleaning up any existing branch before worktree creation"
+        "Cleaning up any existing worktree/branch before worktree creation"
     );
     let _ = Command::new("git")
-        .args(["-C", workspace_path.to_str().unwrap(), "branch", "-D", branch_name])
+        .args(["-C", workspace_path.to_str().unwrap(), "worktree", "remove", "--force", worktree_path.to_str().unwrap()])
         .status()
         .await;
 
-    // Also remove any stale worktree entry
+    // Prune stale worktree entries
     let _ = Command::new("git")
         .args(["-C", workspace_path.to_str().unwrap(), "worktree", "prune"])
+        .status()
+        .await;
+
+    // Now safe to delete the branch
+    let _ = Command::new("git")
+        .args(["-C", workspace_path.to_str().unwrap(), "branch", "-D", branch_name])
         .status()
         .await;
 
