@@ -51,6 +51,96 @@ pub struct AppliedFileAction {
     pub content: String,
 }
 
+/// Structured response from a single full-context agent call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentResponse {
+    pub reply: String,
+    #[serde(default)]
+    pub actions: Vec<FileAction>,
+    pub commit_message: Option<String>,
+}
+
+/// Build system instructions that include full workspace context.
+/// OpenClaw uses these to understand the repo state and return structured JSON.
+pub fn build_full_agent_instructions(
+    repo_url: &str,
+    branch_name: &str,
+    file_list: &str,
+    git_status: &str,
+) -> String {
+    let files_section = if file_list.trim().is_empty() {
+        "  (workspace kosong - belum ada file)".to_string()
+    } else {
+        file_list.to_string()
+    };
+    let status_section = if git_status.trim().is_empty() {
+        "  (tidak ada perubahan)".to_string()
+    } else {
+        git_status.to_string()
+    };
+    format!(
+        r#"Kamu adalah AI coding agent yang bekerja pada sebuah git repository.
+
+Repository: {repo_url}
+Branch aktif: {branch_name}
+
+File di workspace saat ini:
+{files_section}
+
+Git status:
+{status_section}
+
+Kamu HARUS merespons dengan JSON object berikut (tanpa markdown fence, tanpa teks lain):
+{{
+  "reply": "pesan untuk user dalam bahasa yang sama dengan user",
+  "actions": [
+    {{"type": "write_file", "path": "path/to/file", "content": "isi file lengkap"}}
+  ],
+  "commit_message": "feat: deskripsi perubahan"
+}}
+
+Aturan penting:
+- "reply" wajib diisi - jelaskan apa yang kamu lakukan, atau kenapa tidak bisa dilakukan
+- "actions" boleh kosong [] jika tidak ada perubahan file
+- Gunakan riwayat percakapan untuk memahami konteks (misal "buat yang lebih bagus" merujuk ke pekerjaan sebelumnya)
+- Jika repo tidak bisa diakses atau ada masalah, jelaskan dengan jelas di "reply"
+- Jika permintaan tidak jelas, minta klarifikasi di "reply" dengan actions kosong
+- Tulis isi file LENGKAP di "content" - jangan parsial
+- Kembalikan HANYA JSON object, tanpa markdown, tanpa penjelasan di luar JSON"#,
+        repo_url = repo_url,
+        branch_name = branch_name,
+        files_section = files_section,
+        status_section = status_section,
+    )
+}
+
+/// Single full-context agent call. Returns structured AgentResponse.
+/// Falls back to plain-reply AgentResponse if OpenClaw returns non-JSON.
+pub async fn run_agent_full(config: &Config, input: &OpenClawRunInput) -> Result<AgentResponse> {
+    let raw = run_nonstream(config, input).await?;
+    let cleaned = raw
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+    if let Ok(resp) = serde_json::from_str::<AgentResponse>(cleaned) {
+        return Ok(resp);
+    }
+    // Not JSON — treat as plain reply with no file actions
+    let reply = sanitize_user_facing_response(&raw);
+    let reply = if reply.trim().is_empty() {
+        "Selesai diproses.".to_string()
+    } else {
+        reply
+    };
+    Ok(AgentResponse {
+        reply,
+        actions: vec![],
+        commit_message: None,
+    })
+}
+
 pub async fn run_stream(
     config: &Config,
     input: OpenClawRunInput,

@@ -88,202 +88,83 @@ async fn run_inner(
 
     let policy = PolicyEngine::new(policy_config);
     let (session_id, project_id, user_id) = (run.session_id, run.project_id, run.user_id);
-    let route_probe_input = openclaw_service::OpenClawRunInput {
-        agent_id: run.openclaw_agent_id.clone(),
-        session_key: run.openclaw_session_key.clone(),
-        user_id: user_id.to_string(),
-        instructions: String::new(),
-        prompt: run.prompt.clone(),
-        model: run.model.clone(),
-    };
-    let route = openclaw_service::route_prompt(&config, &route_probe_input)
-        .await
-        .unwrap_or_else(|_| openclaw_service::fallback_route_prompt(&run.prompt));
+
+    // Persist user message immediately so reopening a session still shows it
+    let _ = crate::services::session_service::add_message(
+        db.as_ref(), session_id, "user", &run.prompt,
+    ).await;
 
     set_status(&db, run_id, "preparing_workspace").await?;
     emit(&db, &mut redis, run_id, session_id, "agent_run.started",
         serde_json::json!({"run_id": run_id})).await?;
 
-    // Persist the user prompt immediately so reopening a session still shows it.
-    let _ = crate::services::session_service::add_message(
-        db.as_ref(), session_id, "user", &run.prompt
-    ).await;
-
-    if route.intent == "smalltalk" {
-        set_status(&db, run_id, "running_agent").await?;
-        let reply = route
-            .reply
-            .map(|r| openclaw_service::sanitize_user_facing_response(&r))
-            .filter(|r| !r.trim().is_empty())
-            .unwrap_or_else(|| openclaw_service::fallback_smalltalk_response(&run.prompt));
-
-        let _ = crate::services::session_service::add_message(
-            db.as_ref(), session_id, "assistant", &reply
-        ).await;
-        set_status(&db, run_id, "completed").await?;
-        sqlx::query("UPDATE agent_runs SET finished_at=NOW() WHERE id=$1")
-            .bind(run_id).execute(db.as_ref()).await?;
-        emit(&db, &mut redis, run_id, session_id, "agent_run.completed",
-            serde_json::json!({"run_id": run_id, "files_changed": 0})).await?;
-        return Ok(());
+    // Prepare workspace — graceful error: tell user instead of crashing
+    if let Err(e) = workspace_service::prepare_workspace(
+        &config, &team_slug, &project_slug, &repo_url,
+    ).await {
+        let reply = format!(
+            "Tidak bisa mengakses repository `{}`. Pastikan URL repo benar dan credentials sudah dikonfigurasi.\n\nDetail: {}",
+            repo_url, e
+        );
+        return finish_with_reply(db.as_ref(), &mut redis, run_id, session_id, &reply, false).await;
     }
 
-    let _workspace = workspace_service::prepare_workspace(
-        &config, &team_slug, &project_slug, &repo_url,
-    ).await?;
-
     let now = time::OffsetDateTime::now_utc();
-    let branch_name = format!("ai/{}{:02}{:02}-{}", now.year(), now.month() as u8, now.day(), &run_id.to_string()[..8]);
-    let mut summary_branch_name = branch_name.clone();
+    let branch_name = format!(
+        "ai/{}{:02}{:02}-{}",
+        now.year(), now.month() as u8, now.day(),
+        &run_id.to_string()[..8]
+    );
 
-    let worktree = workspace_service::create_worktree(
+    // Create worktree — graceful error
+    let worktree = match workspace_service::create_worktree(
         &config, &team_slug, &project_slug, run_id, &branch_name,
-    ).await?;
+    ).await {
+        Ok(w) => w,
+        Err(e) => {
+            let reply = format!("Gagal membuat branch kerja `{}`. Detail: {}", branch_name, e);
+            return finish_with_reply(db.as_ref(), &mut redis, run_id, session_id, &reply, false).await;
+        }
+    };
 
     sqlx::query("UPDATE agent_runs SET branch_name=$1, worktree_path=$2 WHERE id=$3")
-        .bind(&branch_name).bind(worktree.to_str().unwrap()).bind(run_id)
+        .bind(&branch_name).bind(worktree.to_str().unwrap_or("")).bind(run_id)
         .execute(db.as_ref()).await?;
 
     set_status(&db, run_id, "running_agent").await?;
 
-    let planner_input = openclaw_service::OpenClawRunInput {
-        agent_id: run.openclaw_agent_id.clone(),
-        session_key: format!("{}:planner", run.openclaw_session_key),
-        user_id: user_id.to_string(),
-        instructions: openclaw_service::build_agent_instructions(&project_slug, &project_slug, &branch_name),
-        prompt: run.prompt.clone(),
-        model: run.model.clone(),
-    };
-    let planned_actions = if let Some(local_plan) =
-        openclaw_service::fallback_plan_file_actions(&run.prompt)
-    {
-        Some(local_plan)
-    } else {
-        openclaw_service::plan_file_actions(&config, &planner_input)
-            .await
-            .ok()
-            .filter(|plan| !plan.actions.is_empty())
-    };
+    // Build workspace context so OpenClaw knows what files exist and git state
+    let file_list = openclaw_service::build_worktree_context(&worktree).await;
+    let git_status = git_service::get_status(&worktree).await.unwrap_or_default();
+    let instructions = openclaw_service::build_full_agent_instructions(
+        &repo_url, &branch_name, &file_list, &git_status,
+    );
 
-    if let Some(plan) = planned_actions {
-        let mut applied_actions = Vec::new();
-        for action in &plan.actions {
-            if action.action_type == "write_file" {
-                let _ = file_action_service::write_file(&worktree, &action.path, &action.content).await?;
-                applied_actions.push(openclaw_service::AppliedFileAction {
-                    action_type: action.action_type.clone(),
-                    path: action.path.clone(),
-                    content: action.content.clone(),
-                });
-            }
-        }
-
-        set_status(&db, run_id, "collecting_diff").await?;
-        let diff = git_service::get_diff(&worktree).await.unwrap_or_default();
-        let changed = git_service::changed_files(&worktree).await.unwrap_or_default();
-        let mut commit_sha: Option<String> = None;
-        let mut pushed_branch = false;
-        let mut push_error: Option<String> = None;
-
-        emit(&db, &mut redis, run_id, session_id, "file.changed", serde_json::json!({
-            "run_id": run_id, "files": &changed,
-            "diff_preview": &diff[..diff.len().min(500)],
-        })).await?;
-
-        if policy.can_commit() && !changed.is_empty() {
-            set_status(&db, run_id, "auto_commit").await?;
-            let msg = plan.commit_message
-                .clone()
-                .filter(|m| !m.trim().is_empty())
-                .unwrap_or_else(|| format!("feat: AI agent run {}", &run_id.to_string()[..8]));
-            let sha = git_service::commit(&worktree, &msg).await?;
-            commit_sha = Some(sha.clone());
-            sqlx::query("UPDATE agent_runs SET commit_sha=$1 WHERE id=$2")
-                .bind(&sha).bind(run_id).execute(db.as_ref()).await?;
-            emit(&db, &mut redis, run_id, session_id, "git.committed",
-                serde_json::json!({"run_id": run_id, "sha": sha})).await?;
-
-            if policy.can_push_branch() {
-                set_status(&db, run_id, "auto_push_or_pr").await?;
-                match git_service::push_branch(&worktree, &branch_name).await {
-                    Ok(()) => {
-                        pushed_branch = true;
-                        emit(&db, &mut redis, run_id, session_id, "pr.created", serde_json::json!({
-                            "run_id": run_id, "branch": &branch_name, "files_changed": changed.len(),
-                        })).await?;
-                    }
-                    Err(err) => {
-                        push_error = Some(err.to_string());
-                    }
-                }
-            }
-        }
-
-        let reply = openclaw_service::synthesize_task_summary_with_plan(
-            &run.prompt,
-            &changed,
-            &applied_actions,
-            commit_sha.as_deref(),
-            &branch_name,
-            pushed_branch,
-            false,
-            push_error.as_deref(),
-        );
-        let _ = crate::services::session_service::add_message(
-            db.as_ref(), session_id, "assistant", &reply
-        ).await;
-
-        set_status(&db, run_id, "completed").await?;
-        sqlx::query("UPDATE agent_runs SET finished_at=NOW() WHERE id=$1")
-            .bind(run_id).execute(db.as_ref()).await?;
-        emit(&db, &mut redis, run_id, session_id, "agent_run.completed",
-            serde_json::json!({"run_id": run_id, "files_changed": changed.len()})).await?;
-        return Ok(());
-    }
-
-    // Inject existing worktree files as context so OpenClaw can reason about the codebase
-    let worktree_context = openclaw_service::build_worktree_context(&worktree).await;
-    let instructions = openclaw_service::build_agent_instructions(&project_slug, &project_slug, &branch_name);
-    let enriched_prompt = if worktree_context.is_empty() {
-        run.prompt.clone()
-    } else {
-        format!("{prompt}\n\n---\nCurrent workspace files:\n{ctx}",
-            prompt = run.prompt, ctx = worktree_context)
-    };
-
+    // Single OpenClaw call with full context + same session key (preserves chat history)
     let input = openclaw_service::OpenClawRunInput {
         agent_id: run.openclaw_agent_id.clone(),
         session_key: run.openclaw_session_key.clone(),
         user_id: user_id.to_string(),
         instructions,
-        prompt: enriched_prompt,
+        prompt: run.prompt.clone(),
         model: run.model.clone(),
     };
 
-    // Non-streaming: wait for full response, then extract file actions
-    let (preferred, stream_failed, stream_error_message) =
-        match openclaw_service::run_nonstream(&config, &input).await {
-            Ok(raw) => (raw, false, None::<String>),
-            Err(e) => {
-                tracing::error!("OpenClaw call failed: {:#?}", e);
-                (String::new(), true, Some(format!("{:#}", e)))
-            }
-        };
+    let agent_response = match openclaw_service::run_agent_full(&config, &input).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("OpenClaw call failed: {:#}", e);
+            let reply = "Agent tidak bisa diproses saat ini. Silakan coba lagi.".to_string();
+            return finish_with_reply(db.as_ref(), &mut redis, run_id, session_id, &reply, true).await;
+        }
+    };
 
-    let mut assistant_response = openclaw_service::sanitize_user_facing_response(&preferred);
-
-    // Extract and apply file actions from the response to the worktree
-    if !stream_failed {
-        let extracted = openclaw_service::extract_file_actions_from_response(&preferred);
-        if !extracted.is_empty() {
-            tracing::info!(count = extracted.len(), "Applying file actions from agent response");
-            for action in &extracted {
-                if action.action_type == "write_file" {
-                    match file_action_service::write_file(&worktree, &action.path, &action.content).await {
-                        Ok(_) => tracing::info!(path = %action.path, "Wrote file"),
-                        Err(e) => tracing::warn!(path = %action.path, error = %e, "Failed to write file"),
-                    }
-                }
+    // Execute file actions returned by OpenClaw
+    for action in &agent_response.actions {
+        if action.action_type == "write_file" {
+            match file_action_service::write_file(&worktree, &action.path, &action.content).await {
+                Ok(_) => tracing::info!(path = %action.path, "Wrote file"),
+                Err(e) => tracing::warn!(path = %action.path, error = %e, "Failed to write file"),
             }
         }
     }
@@ -291,121 +172,69 @@ async fn run_inner(
     set_status(&db, run_id, "collecting_diff").await?;
     let diff = git_service::get_diff(&worktree).await.unwrap_or_default();
     let changed = git_service::changed_files(&worktree).await.unwrap_or_default();
+
+    if !changed.is_empty() {
+        emit(&db, &mut redis, run_id, session_id, "file.changed", serde_json::json!({
+            "run_id": run_id, "files": &changed,
+            "diff_preview": &diff[..diff.len().min(500)],
+        })).await?;
+    }
+
     let mut commit_sha: Option<String> = None;
     let mut pushed_branch = false;
     let mut push_error: Option<String> = None;
 
-    emit(&db, &mut redis, run_id, session_id, "file.changed", serde_json::json!({
-        "run_id": run_id, "files": &changed,
-        "diff_preview": &diff[..diff.len().min(500)],
-    })).await?;
-
     if policy.can_commit() && !changed.is_empty() {
         set_status(&db, run_id, "auto_commit").await?;
-        let msg = format!("feat: AI agent run {}", &run_id.to_string()[..8]);
-        let sha = git_service::commit(&worktree, &msg).await?;
-        commit_sha = Some(sha.clone());
-        sqlx::query("UPDATE agent_runs SET commit_sha=$1 WHERE id=$2")
-            .bind(&sha).bind(run_id).execute(db.as_ref()).await?;
-        emit(&db, &mut redis, run_id, session_id, "git.committed",
-            serde_json::json!({"run_id": run_id, "sha": sha})).await?;
+        let msg = agent_response.commit_message.clone()
+            .filter(|m| !m.trim().is_empty())
+            .unwrap_or_else(|| format!("feat: AI agent run {}", &run_id.to_string()[..8]));
+        match git_service::commit(&worktree, &msg).await {
+            Ok(sha) => {
+                commit_sha = Some(sha.clone());
+                sqlx::query("UPDATE agent_runs SET commit_sha=$1 WHERE id=$2")
+                    .bind(&sha).bind(run_id).execute(db.as_ref()).await?;
+                emit(&db, &mut redis, run_id, session_id, "git.committed",
+                    serde_json::json!({"run_id": run_id, "sha": sha})).await?;
 
-        if policy.can_push_branch() {
-            set_status(&db, run_id, "auto_push_or_pr").await?;
-            match git_service::push_branch(&worktree, &branch_name).await {
-                Ok(()) => {
-                    pushed_branch = true;
-                    emit(&db, &mut redis, run_id, session_id, "pr.created", serde_json::json!({
-                        "run_id": run_id, "branch": &branch_name, "files_changed": changed.len(),
-                    })).await?;
+                if policy.can_push_branch() {
+                    set_status(&db, run_id, "auto_push_or_pr").await?;
+                    match git_service::push_branch(&worktree, &branch_name).await {
+                        Ok(()) => {
+                            pushed_branch = true;
+                            emit(&db, &mut redis, run_id, session_id, "pr.created", serde_json::json!({
+                                "run_id": run_id, "branch": &branch_name, "files_changed": changed.len(),
+                            })).await?;
+                        }
+                        Err(e) => { push_error = Some(e.to_string()); }
+                    }
                 }
-                Err(err) => {
-                    push_error = Some(err.to_string());
-                }
+            }
+            Err(e) => {
+                tracing::warn!("git commit failed: {}", e);
+                push_error = Some(format!("Commit gagal: {}", e));
             }
         }
     }
 
-    if !pushed_branch && changed.is_empty() && route.intent == "retry_push" {
-        if let Some(previous_run) = sqlx::query_as::<_, AgentRun>(
-            "SELECT * FROM agent_runs
-             WHERE session_id = $1
-               AND id <> $2
-               AND commit_sha IS NOT NULL
-               AND branch_name IS NOT NULL
-               AND worktree_path IS NOT NULL
-             ORDER BY created_at DESC
-             LIMIT 1"
-        )
-        .bind(session_id)
-        .bind(run_id)
-        .fetch_optional(db.as_ref())
-        .await? {
-            if let (Some(prev_branch), Some(prev_worktree), Some(prev_sha)) = (
-                previous_run.branch_name.clone(),
-                previous_run.worktree_path.clone(),
-                previous_run.commit_sha.clone(),
-            ) {
-                set_status(&db, run_id, "auto_push_or_pr").await?;
-                match git_service::push_branch(&std::path::PathBuf::from(prev_worktree), &prev_branch).await {
-                    Ok(()) => {
-                        pushed_branch = true;
-                        summary_branch_name = prev_branch.clone();
-                        commit_sha = Some(prev_sha);
-                        emit(&db, &mut redis, run_id, session_id, "pr.created", serde_json::json!({
-                            "run_id": run_id, "branch": prev_branch, "files_changed": 0,
-                        })).await?;
-                    }
-                    Err(err) => {
-                        summary_branch_name = prev_branch;
-                        commit_sha = Some(prev_sha);
-                        push_error = Some(err.to_string());
-                    }
-                }
-            }
-        }
+    // Build final reply: OpenClaw's reply augmented with git status
+    let mut final_reply = agent_response.reply.clone();
+    if final_reply.trim().is_empty() {
+        final_reply = if changed.is_empty() {
+            "Tidak ada perubahan file.".to_string()
+        } else {
+            format!("Selesai. {} file diubah.", changed.len())
+        };
+    }
+    if pushed_branch {
+        final_reply.push_str(&format!("\n\n✅ Push ke branch `{}` berhasil.", branch_name));
+    } else if let Some(ref err) = push_error {
+        final_reply.push_str(&format!("\n\n⚠️ {}", err));
     }
 
-    let synthesized_response = openclaw_service::synthesize_task_summary(
-        &run.prompt,
-        &changed,
-        commit_sha.as_deref(),
-        &summary_branch_name,
-        pushed_branch,
-        stream_failed,
-        push_error.as_deref(),
-    );
-
-    if changed.is_empty()
-        && !stream_failed
-        && !openclaw_service::is_write_request(&run.prompt)
-        && !openclaw_service::is_push_request(&run.prompt)
-        && !assistant_response.trim().is_empty()
-    {
-        assistant_response = assistant_response.trim().to_string();
-    } else {
-        assistant_response = synthesized_response;
-    }
-
-    if !assistant_response.trim().is_empty() {
-        let _ = crate::services::session_service::add_message(
-            db.as_ref(), session_id, "assistant", &assistant_response
-        ).await;
-    }
-
-    if stream_failed && changed.is_empty() {
-        set_status(&db, run_id, "failed_agent").await?;
-        let reason = stream_error_message
-            .unwrap_or_else(|| "Agent stream failed before any file change".to_string());
-        sqlx::query("UPDATE agent_runs SET error_message=$1, finished_at=NOW() WHERE id=$2")
-            .bind(&reason)
-            .bind(run_id)
-            .execute(db.as_ref())
-            .await?;
-        emit(&db, &mut redis, run_id, session_id, "agent_run.failed",
-            serde_json::json!({"run_id": run_id, "data": {"reason": reason}})).await?;
-        return Ok(());
-    }
+    let _ = crate::services::session_service::add_message(
+        db.as_ref(), session_id, "assistant", &final_reply,
+    ).await;
 
     set_status(&db, run_id, "completed").await?;
     sqlx::query("UPDATE agent_runs SET finished_at=NOW() WHERE id=$1")
@@ -417,16 +246,31 @@ async fn run_inner(
         "agent_run.completed",
         serde_json::json!({"branch": branch_name, "files": changed})).await?;
 
-    // Record usage — token counts updated when OpenClaw returns usage in SSE
     let _ = crate::services::usage_service::record(
-        db.as_ref(),
-        Some(user_id), // user_id == api_key_id in this system
-        Some(run_id),
-        &run.model,
-        0,
-        0,
+        db.as_ref(), Some(user_id), Some(run_id), &run.model, 0, 0,
     ).await;
 
+    Ok(())
+}
+
+/// Complete a run with a user-facing reply, skipping all git operations.
+/// Used for workspace errors and OpenClaw call failures.
+async fn finish_with_reply(
+    db: &PgPool,
+    redis: &mut ConnectionManager,
+    run_id: Uuid,
+    session_id: Uuid,
+    reply: &str,
+    is_failure: bool,
+) -> anyhow::Result<()> {
+    let _ = crate::services::session_service::add_message(db, session_id, "assistant", reply).await;
+    let status = if is_failure { "failed_agent" } else { "completed" };
+    set_status(db, run_id, status).await?;
+    sqlx::query("UPDATE agent_runs SET finished_at=NOW() WHERE id=$1")
+        .bind(run_id).execute(db).await?;
+    let event = if is_failure { "agent_run.failed" } else { "agent_run.completed" };
+    emit(db, redis, run_id, session_id, event,
+        serde_json::json!({"run_id": run_id, "files_changed": 0})).await?;
     Ok(())
 }
 
