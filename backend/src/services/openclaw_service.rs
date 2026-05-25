@@ -58,11 +58,12 @@ pub async fn run_stream(
 ) -> Result<()> {
     let client = Client::new();
     let body = serde_json::json!({
-        "model": input.model,
+        "model": "openclaw",
         "stream": true,
         "user": input.user_id,
         "instructions": input.instructions,
         "input": input.prompt,
+        "x_model": input.model,
     });
 
     let res = client
@@ -122,11 +123,12 @@ pub async fn run_stream(
 pub async fn run_nonstream(config: &Config, input: &OpenClawRunInput) -> Result<String> {
     let client = Client::new();
     let body = serde_json::json!({
-        "model": input.model,
+        "model": "openclaw",
         "stream": false,
         "user": input.user_id,
         "instructions": input.instructions,
         "input": input.prompt,
+        "x_model": input.model,
     });
 
     let res = client
