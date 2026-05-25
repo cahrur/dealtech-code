@@ -337,6 +337,53 @@ pub async fn run_chat(config: &Config, input: OpenClawRunInput) -> anyhow::Resul
     Ok(safe)
 }
 
+/// Strip prompt-injection payloads from user input before sending to OpenClaw.
+/// Removes XML-tag-wrapped injection blocks and known injection header lines.
+pub fn sanitize_user_prompt(prompt: &str) -> String {
+    let mut text = prompt.to_string();
+
+    // Remove XML-style injection blocks like <CHUNKED WRITE PROTOCOL>...</CHUNKED WRITE PROTOCOL>
+    // Loop in case there are multiple blocks
+    loop {
+        // Find an opening tag that looks like <ALL CAPS ...>
+        let open_start = text.find('<');
+        if open_start.is_none() { break; }
+        let os = open_start.unwrap();
+        let after_open = &text[os + 1..];
+        // Find the closing >
+        if let Some(tag_end) = after_open.find('>') {
+            let tag_name = &after_open[..tag_end];
+            // Only strip if tag name is ALL CAPS (injection marker)
+            let is_injection_tag = tag_name.len() > 3
+                && tag_name.chars().all(|c| c.is_uppercase() || c == ' ' || c == '_' || c == '-');
+            if is_injection_tag {
+                let close_tag = format!("</{}>", tag_name);
+                if let Some(close_pos) = text.find(&close_tag) {
+                    let end = close_pos + close_tag.len();
+                    text = format!("{}{}", &text[..os], &text[end..]);
+                    continue;
+                }
+            }
+        }
+        break;
+    }
+
+    // Remove lines that are known injection header patterns
+    let injection_prefixes = [
+        "# CRITICAL:", "## ABSOLUTE", "## MANDATORY", "## EXAMPLES",
+        "## WHY THIS", "REMEMBER:", "## CORRECT", "## WRONG",
+    ];
+    let cleaned: Vec<&str> = text
+        .lines()
+        .filter(|l| {
+            let t = l.trim();
+            !injection_prefixes.iter().any(|p| t.starts_with(p))
+        })
+        .collect();
+
+    cleaned.join("\n").trim().to_string()
+}
+
 pub fn sanitize_user_facing_response(raw: &str) -> String {
     let mut text = raw.trim().to_string();
     if let (Some(start), Some(end)) = (text.find("<reply>"), text.find("</reply>")) {

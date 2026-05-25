@@ -146,7 +146,7 @@ async fn run_inner(
         session_key: run.openclaw_session_key.clone(),
         user_id: user_id.to_string(),
         instructions,
-        prompt: run.prompt.clone(),
+        prompt: openclaw_service::sanitize_user_prompt(&run.prompt),
         model: run.model.clone(),
     };
 
