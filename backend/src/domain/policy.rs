@@ -66,9 +66,9 @@ impl Default for PolicyConfig {
                 ],
             },
             git: GitPolicy {
-                auto_commit: true,
-                auto_push_branch: true,
-                auto_create_pr: true,
+                auto_commit: false,
+                auto_push_branch: false,
+                auto_create_pr: false,
                 auto_merge: false,
             },
         }
