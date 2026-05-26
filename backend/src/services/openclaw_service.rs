@@ -52,6 +52,34 @@ pub struct AppliedFileAction {
     pub content: String,
 }
 
+/// Token usage from OpenClaw response
+#[derive(Debug, Clone, Default)]
+pub struct TokenUsage {
+    pub input_tokens: i32,
+    pub output_tokens: i32,
+}
+
+impl TokenUsage {
+    /// Estimate cost in USD based on model name
+    pub fn cost_usd(&self, model: &str) -> f64 {
+        let (input_price, output_price) = if model.contains("opus") {
+            (0.000015, 0.000075)
+        } else if model.contains("sonnet") {
+            (0.000003, 0.000015)
+        } else if model.contains("haiku") {
+            (0.00000025, 0.00000125)
+        } else if model.contains("gpt-4o") {
+            (0.0000025, 0.00001)
+        } else if model.contains("gpt-4") {
+            (0.00001, 0.00003)
+        } else {
+            // Default: Claude Sonnet pricing
+            (0.000003, 0.000015)
+        };
+        (self.input_tokens as f64) * input_price + (self.output_tokens as f64) * output_price
+    }
+}
+
 /// Structured response from a single full-context agent call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentResponse {
@@ -59,6 +87,8 @@ pub struct AgentResponse {
     #[serde(default)]
     pub actions: Vec<FileAction>,
     pub commit_message: Option<String>,
+    #[serde(skip)]
+    pub usage: TokenUsage,
 }
 
 /// Build system instructions that include full workspace context.
@@ -110,7 +140,7 @@ Cara kerja:
 /// Single full-context agent call. Returns structured AgentResponse.
 /// Falls back to plain-reply AgentResponse if OpenClaw returns non-JSON.
 pub async fn run_agent_full(config: &Config, input: &OpenClawRunInput) -> Result<AgentResponse> {
-    let raw = run_nonstream(config, input).await?;
+    let (raw, usage) = run_nonstream(config, input).await?;
     tracing::info!(session_key = %input.session_key, raw_len = raw.len(), raw_preview = %&raw[..raw.len().min(500)], "OpenClaw raw response");
     let cleaned = raw
         .trim()
@@ -118,12 +148,12 @@ pub async fn run_agent_full(config: &Config, input: &OpenClawRunInput) -> Result
         .trim_start_matches("```")
         .trim_end_matches("```")
         .trim();
-    if let Ok(resp) = serde_json::from_str::<AgentResponse>(cleaned) {
-        tracing::info!(reply_len = resp.reply.len(), actions = resp.actions.len(), "OpenClaw parsed AgentResponse");
+    if let Ok(mut resp) = serde_json::from_str::<AgentResponse>(cleaned) {
+        tracing::info!(reply_len = resp.reply.len(), actions = resp.actions.len(), input_tokens = usage.input_tokens, output_tokens = usage.output_tokens, "OpenClaw parsed AgentResponse");
+        resp.usage = usage;
         return Ok(resp);
     }
     tracing::warn!(cleaned_preview = %&cleaned[..cleaned.len().min(300)], "OpenClaw response not valid JSON, falling back to plain reply");
-    // Not JSON — treat as plain reply with no file actions
     let reply = sanitize_user_facing_response(&raw);
     let reply = if reply.trim().is_empty() {
         "Selesai diproses.".to_string()
@@ -134,6 +164,7 @@ pub async fn run_agent_full(config: &Config, input: &OpenClawRunInput) -> Result
         reply,
         actions: vec![],
         commit_message: None,
+        usage,
     })
 }
 
@@ -205,7 +236,7 @@ pub async fn run_stream(
     Ok(())
 }
 
-pub async fn run_nonstream(config: &Config, input: &OpenClawRunInput) -> Result<String> {
+pub async fn run_nonstream(config: &Config, input: &OpenClawRunInput) -> Result<(String, TokenUsage)> {
     let max_retries = config.openclaw_max_retries;
     let mut attempt = 0u32;
 
@@ -246,7 +277,7 @@ pub async fn run_nonstream(config: &Config, input: &OpenClawRunInput) -> Result<
     }
 }
 
-async fn run_nonstream_inner(config: &Config, input: &OpenClawRunInput) -> Result<String> {
+async fn run_nonstream_inner(config: &Config, input: &OpenClawRunInput) -> Result<(String, TokenUsage)> {
     let client = Client::new();
     // Build input: array of message items if history exists, plain string otherwise
     let input_val = if input.history.is_empty() {
@@ -322,8 +353,18 @@ async fn run_nonstream_inner(config: &Config, input: &OpenClawRunInput) -> Resul
         .unwrap_or_default()
         .to_string();
 
-    tracing::info!(text_len = text.len(), text_preview = %&text[..text.len().min(200)], "OpenClaw nonstream text");
-    Ok(text)
+    // Extract token usage from response root
+    let input_tokens = val.get("usage")
+        .and_then(|u| u.get("input_tokens").or_else(|| u.get("prompt_tokens")))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0) as i32;
+    let output_tokens = val.get("usage")
+        .and_then(|u| u.get("output_tokens").or_else(|| u.get("completion_tokens")))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0) as i32;
+
+    tracing::info!(text_len = text.len(), input_tokens, output_tokens, "OpenClaw nonstream text");
+    Ok((text, TokenUsage { input_tokens, output_tokens }))
 }
 
 pub async fn run_chat(config: &Config, input: OpenClawRunInput) -> anyhow::Result<String> {
@@ -384,7 +425,7 @@ pub async fn run_chat(config: &Config, input: OpenClawRunInput) -> anyhow::Resul
     tracing::info!(chosen_len = chosen.len(), chosen_preview = %&chosen[..chosen.len().min(400)], "OpenClaw chosen before sanitize");
     let mut safe = sanitize_user_facing_response(&chosen);
     if safe.trim().is_empty() {
-        let fallback = run_nonstream(config, &input).await.unwrap_or_default();
+        let fallback = run_nonstream(config, &input).await.map(|(s, _)| s).unwrap_or_default();
         safe = sanitize_user_facing_response(&fallback);
     }
     if safe.trim().is_empty() {
@@ -607,7 +648,7 @@ pub async fn route_prompt(config: &Config, input: &OpenClawRunInput) -> Result<R
         history: vec![],
     };
 
-    let raw = run_nonstream(config, &route_input).await?;
+    let (raw, _usage) = run_nonstream(config, &route_input).await?;
     let cleaned = raw
         .trim()
         .trim_start_matches("```json")
@@ -631,7 +672,7 @@ pub async fn plan_file_actions(config: &Config, input: &OpenClawRunInput) -> Res
         history: vec![],
     };
 
-    let raw = run_nonstream(config, &planner_input).await?;
+    let (raw, _usage) = run_nonstream(config, &planner_input).await?;
     let cleaned = raw
         .trim()
         .trim_start_matches("```json")
@@ -932,7 +973,7 @@ pub async fn rewrite_user_facing(
         model: input.model.clone(),
         history: vec![],
     };
-    run_nonstream(config, &rewrite_input).await
+    run_nonstream(config, &rewrite_input).await.map(|(s, _)| s)
 }
 
 pub fn build_agent_instructions(

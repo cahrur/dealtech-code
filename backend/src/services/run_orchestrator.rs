@@ -215,13 +215,13 @@ async fn run_inner(
         history,
     };
 
-    let agent_reply = match tokio::time::timeout(
+    let agent_response = match tokio::time::timeout(
         tokio::time::Duration::from_secs(600),
         openclaw_service::run_agent_full(&config, &input),
     ).await {
         Ok(Ok(r)) => {
-            tracing::info!(reply_len = r.reply.len(), actions = r.actions.len(), reply_preview = %&r.reply[..r.reply.len().min(200)], "OpenClaw reply");
-            r.reply
+            tracing::info!(reply_len = r.reply.len(), actions = r.actions.len(), input_tokens = r.usage.input_tokens, output_tokens = r.usage.output_tokens, reply_preview = %&r.reply[..r.reply.len().min(200)], "OpenClaw reply");
+            r
         }
         Ok(Err(e)) => {
             tracing::error!("OpenClaw call failed: {:#}", e);
@@ -236,6 +236,7 @@ async fn run_inner(
             return finish_with_reply(db.as_ref(), &mut redis, run_id, session_id, reply, true).await;
         }
     };
+    let agent_reply = agent_response.reply.clone();
 
     set_status(&db, run_id, "collecting_diff").await?;
     let diff = git_service::get_diff(&worktree).await.unwrap_or_default();
@@ -302,10 +303,17 @@ async fn run_inner(
         db.as_ref(), session_id, "assistant", &final_reply,
     ).await;
 
-    // Cost tracking: estimate tokens from reply length
-    let tokens_output = (agent_reply.len() as i32) / 4; // rough estimate: 4 chars per token
-    let tokens_input = (run.prompt.len() as i32) / 4;
-    let cost_usd = (tokens_input as f64) * 0.000003 + (tokens_output as f64) * 0.000015;
+    // Cost tracking: use real token usage from OpenClaw response
+    let tokens_input = agent_response.usage.input_tokens;
+    let tokens_output = agent_response.usage.output_tokens;
+    // Fallback to char estimate if OpenClaw didn't return usage
+    let (tokens_input, tokens_output) = if tokens_input == 0 && tokens_output == 0 {
+        tracing::warn!("No token usage from OpenClaw, falling back to char estimate");
+        ((run.prompt.len() as i32) / 4, (agent_reply.len() as i32) / 4)
+    } else {
+        (tokens_input, tokens_output)
+    };
+    let cost_usd = agent_response.usage.cost_usd(&run.model);
 
     // Diff stat: get git diff --stat for completed run
     let diff_stat_output = if commit_sha.is_some() {
