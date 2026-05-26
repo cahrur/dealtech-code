@@ -290,6 +290,7 @@ async fn cmd_help(client: &Client, config: &Config, db: &PgPool, tg_user: &Teleg
         /start — Mulai\n\
         /projects — Lihat daftar project\n\
         /project <slug> — Pilih project aktif\n\
+        /newproject <nama> <repo_url> — Buat project baru\n\
         /status — Lihat status saat ini\n\
         /help — Tampilkan bantuan ini{admin_section}\n\n\
         Kirim pesan biasa untuk memulai coding dengan AI agent.",
