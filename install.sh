@@ -220,6 +220,13 @@ APP_ENV=production
 APP_PORT=8080
 LOG_LEVEL=info
 
+# ── Performance & Limits ──────────────────────────────────────────────────────
+# MAX_CONCURRENT_RUNS: max run bersamaan. Rekomendasi: 3 untuk 4GB RAM, 5 untuk 8GB+
+MAX_CONCURRENT_RUNS=${MAX_CONCURRENT_RUNS:-3}
+USER_RATE_LIMIT_PER_MINUTE=${USER_RATE_LIMIT_PER_MINUTE:-10}
+GRACEFUL_SHUTDOWN=true
+OPENCLAW_MAX_RETRIES=3
+
 # ── Platform paths (mounted into container) ───────────────────────────────────
 WORKSPACES_PATH=/srv/ai-platform/workspaces
 WORKTREES_PATH=/srv/ai-platform/worktrees
@@ -765,6 +772,12 @@ print_summary() {
   echo "        docker exec ai-platform-postgres-1 psql -U postgres -d aicode -c \\""
   echo "        INSERT INTO telegram_users (telegram_id, user_id, name)"
   echo "        VALUES (<telegram_id>, '<user_id_dari_DB>', '<nama>');\\""
+  echo ""
+  echo "  6. Setup Swap (WAJIB untuk VPS RAM <= 4GB):"
+  echo "     fallocate -l 2G /swapfile"
+  echo "     chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile"
+  echo "     echo '/swapfile none swap sw 0 0' >> /etc/fstab"
+  echo "     # Verifikasi: free -h"
   echo ""
   echo "  6. Verify health:"
   echo "     curl https://$DOMAIN/health"

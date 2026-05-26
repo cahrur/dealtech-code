@@ -2,6 +2,23 @@
 
 Platform AI coding agent yang memungkinkan tim developer berkolaborasi dengan AI untuk mengerjakan proyek coding langsung di repository GitHub. Kirim prompt dari Android app atau Telegram, agent AI bekerja otomatis — edit file, jalankan test, commit, dan push ke branch.
 
+## Spesifikasi Server yang Direkomendasikan
+
+| Komponen | Minimum | Rekomendasi |
+|----------|---------|-------------|
+| RAM | 4 GB | 8 GB+ |
+| CPU | 2 core | 4 core |
+| Disk | 20 GB | 50 GB+ |
+| OS | Ubuntu 20.04+ | Ubuntu 22.04 |
+
+> **Penting untuk RAM 4 GB:** Wajib setup swap 2 GB sebagai safety net:
+> ```bash
+> fallocate -l 2G /swapfile
+> chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
+> echo '/swapfile none swap sw 0 0' >> /etc/fstab
+> ```
+> Set `MAX_CONCURRENT_RUNS=3` untuk RAM 4 GB (default). Naikkan ke 5 untuk RAM 8 GB+.
+
 ## Fitur Utama
 
 - **AI Agent Coding via Chat** — kirim prompt coding dari API, Android app, atau Telegram bot
