@@ -1,13 +1,42 @@
 # Dealtech Code — AI Coding Agent Platform
 
-Platform internal untuk tim developer. Kirim prompt coding dari Android, agent AI bekerja otomatis di container Docker terisolasi per user — edit file, jalankan test, commit, dan buat PR.
+Platform AI coding agent yang memungkinkan tim developer berkolaborasi dengan AI untuk mengerjakan proyek coding langsung di repository GitHub. Kirim prompt dari Android app atau Telegram, agent AI bekerja otomatis — edit file, jalankan test, commit, dan push ke branch.
+
+## Fitur Utama
+
+- **AI Agent Coding via Chat** — kirim prompt coding dari API, Android app, atau Telegram bot
+- **1 Branch per Session** — setiap coding session punya branch persistent yang di-reuse antar run
+- **Worktree Ephemeral per Run** — setiap run menggunakan git worktree terpisah, cleanup otomatis setelah selesai
+- **Run Timeout** — setiap run dibatasi 10 menit (configurable), auto-cancel jika melebihi batas
+- **Stuck Run Recovery** — worker otomatis reset run yang stuck setiap 60 detik
+- **Concurrency Guard per Session** — hanya 1 run aktif per session, mencegah konflik
+- **Max Concurrent Runs Semaphore** — batasi total run paralel dengan `MAX_CONCURRENT_RUNS`
+- **OpenClaw Retry dengan Exponential Backoff** — retry otomatis saat OpenClaw gagal (max `OPENCLAW_MAX_RETRIES`)
+- **Rate Limiting per User** — batasi request per menit dengan `USER_RATE_LIMIT_PER_MINUTE`
+- **Run Duration Metrics Logging** — setiap run dicatat durasi eksekusinya
+- **Graceful Shutdown** — handle SIGTERM/SIGINT dengan baik, tunggu run selesai sebelum shutdown
+- **Redis Pub/Sub** — instant run pickup tanpa polling, worker langsung proses run baru
+- **Telegram Bot** — whitelist-based, auto-route ke project, command lengkap
+- **Realtime WebSocket** — streaming event ke Android app (token stream, file changed, commit, PR)
+- **Auto Commit & Push** — agent otomatis commit dan push ke branch sesuai policy
+- **Policy Engine** — kontrol apa yang boleh dilakukan agent (commit, push, install deps)
+- **Multi-Project** — kelola banyak project dalam satu platform
+- **GitHub Integration** — clone private repo, push branch, create repo baru via API
+- **Usage Tracking** — catat penggunaan token per user per model
+- **API Key Auth** — autentikasi via API key (hash SHA-256, plain text tidak tersimpan)
+- **Per-user Docker Container** — isolasi runtime per API key
 
 ## Arsitektur
 
 ```
-Android App (Kotlin)
-    ↓  HTTPS + WebSocket
-Rust Backend (Axum)
+Android App / Telegram Bot
+    ↓  HTTPS + WebSocket / Long Polling
+Rust Backend (Axum + Tokio)
+    ├── HTTP API (REST + WebSocket)
+    ├── Telegram Bot (long polling)
+    ├── Agent Run Worker (Redis pub/sub)
+    ├── Stuck Run Recovery Worker
+    └── Cleanup Worker
     ↓  Private HTTP/SSE
 OpenClaw Gateway
     ↓  9router
@@ -15,468 +44,176 @@ AI Provider (Claude / GPT / dll)
     ↓  Sandbox
 Docker Container (1 per API key)
     ↓
-Git Worktree Disposable → branch → test → commit → PR
+Git Worktree → branch → edit → test → commit → push
 ```
 
-## Tech Stack
+### Komponen Utama
 
-| Layer | Teknologi |
-|---|---|
-| Mobile | Kotlin + Jetpack Compose + OkHttp WebSocket |
-| Backend | Rust + Axum + Tokio + SQLx |
-| Database | PostgreSQL 16 |
-| Cache / Queue | Redis 7 |
-| Agent Runtime | OpenClaw Gateway |
-| AI Router | 9router (multi-provider) |
-| Reverse Proxy | Caddy (auto TLS) |
-| Container | Docker |
+| Komponen | Teknologi | Fungsi |
+|---|---|---|
+| Backend | Rust + Axum + Tokio + SQLx | HTTP API, WebSocket, worker, Telegram bot |
+| Database | PostgreSQL 16 | Data persistence (users, projects, sessions, runs) |
+| Cache/Queue | Redis 7 | Pub/sub untuk instant run pickup, caching |
+| Agent Runtime | OpenClaw Gateway | Eksekusi AI agent di sandbox |
+| AI Router | 9router | Multi-provider routing (Anthropic, OpenAI, dll) |
+| Reverse Proxy | Caddy | Auto TLS, routing |
+| Container | Docker | Isolasi per user |
 
-## Fitur
+## Cara Kerja
 
-- **API Key Auth** — tidak ada registrasi, koneksi pakai `ak_xxx`
-- **Per-user Docker container** — setiap API key punya container terisolasi
-- **Auto Mode** — agent jalan otomatis: edit → test → commit → PR
-- **Realtime streaming** — WebSocket event stream ke mobile
-- **Token tracking** — usage per API key per model
-- **Model selection** — ganti model Claude/GPT via 9router
-- **Dual AI Mode** — pilih **OpenClaw Agent** (coding + git + PR) atau **Hermes Chat** (percakapan langsung, non-streaming)
-- **Git integration** — clone, branch, worktree, diff, push, PR
-- **Policy engine** — allow/deny command, auto_safe vs auto_trusted
-- **Admin panel** — kelola API key, lihat audit log, usage stats
-
-## Prerequisites
-
-- Ubuntu 22.04+ atau Debian 12+ (VPS)
-- Minimum: 4 vCPU, 8 GB RAM, 100 GB NVMe
-- Domain dengan DNS mengarah ke VPS
-- OpenClaw Gateway (lihat [docs.openclaw.ai](https://docs.openclaw.ai))
-- API key AI provider (Anthropic, OpenAI, dll)
-
-## Instalasi
-
-### Single command deploy:
-
-```bash
-git clone https://github.com/cahrur/dealtech-code.git
-```
-
-```bash
-cd dealtech-code
-```
-
-```bash
-sudo bash install.sh
-```
-
-> **Penting:** Jalankan setiap perintah **satu per satu**. Script installer bersifat interaktif — akan menanyakan domain, email, dan konfigurasi lainnya.
-
-Installer akan menanyakan:
-- Domain (contoh: `ai.mudahdeal.com`)
-- Admin email (untuk TLS cert)
-- Postgres password (atau auto-generate)
-- OpenClaw Gateway token (atau auto-generate)
-- Admin API key (atau auto-generate dengan prefix `ak_`)
-- Anthropic API key (opsional)
-- OpenAI API key (opsional)
-
-Lalu otomatis:
-1. Install Docker, Node.js, 9router
-2. Generate semua config + secrets
-3. Setup UFW firewall (hanya port 22, 80, 443)
-4. Setup Caddy dengan auto TLS
-5. Setup systemd service (auto-start on reboot)
-6. Setup daily Postgres backup cron
-7. Build dan start semua service
-8. Tulis `/srv/ai-platform/manage.sh`
-
-### Setelah instalasi (wajib):
-
-**1. Deploy backend (otomatis oleh installer):**
-Installer akan otomatis copy source dari `~/dealtech-code/backend` ke `/srv/ai-platform/app/backend/`, lalu build container backend.
-
-Jika source backend belum ada saat instalasi, jalankan manual:
-```bash
-cp -r ~/dealtech-code/backend/* /srv/ai-platform/app/backend/
-cd /srv/ai-platform && docker compose up -d --build
-```
-
-**2. Install OpenClaw Gateway** (bind ke `127.0.0.1:18789`):
-```bash
-# Lihat: https://docs.openclaw.ai/install/docker
-```
-
-**3. Onboard OpenClaw (setup awal):**
-```bash
-openclaw onboard --install-daemon
-bash /srv/ai-platform/manage.sh
-# pilih menu: b) OpenClaw - onboard (setup awal)
-```
-
-**4. Onboard Hermes (setup awal):**
-```bash
-hermes onboard
-bash /srv/ai-platform/manage.sh
-# pilih menu: d) Hermes - onboard (setup awal)
-```
-
-**5. Konfigurasi 9router** - isi API key provider di file:
-```bash
-nano /srv/ai-platform/9router/config.json
-```
-
-Contoh minimal:
-```json
-{
-  "providers": {
-    "anthropic": { "apiKey": "sk-ant-xxx" },
-    "openai": { "apiKey": "sk-proj-xxx" }
-  }
-}
-```
-
-Atau lihat helper CLI:
-```bash
-9router --help
-```
-
-**6. Start 9router:**
-```bash
-bash /srv/ai-platform/manage.sh start
-```
-
-**7. Verifikasi status komponen:**
-```bash
-bash /srv/ai-platform/manage.sh status
-bash /srv/ai-platform/manage.sh
-# cek menu c) OpenClaw - status
-# cek menu e) Hermes - status
-```
-
-**8. Verifikasi endpoint platform:**
-```bash
-curl https://yourdomain.com/health
-# -> ok
-```
-
-## Update
-
-Setiap ada perubahan code, jalankan di VPS:
-
-```bash
-cd ~/dealtech-code
-sudo bash update.sh
-```
-
-Script `update.sh` otomatis:
-1. Pull latest code dari GitHub
-2. Copy backend source ke `/srv/ai-platform/app/backend/`
-3. Rebuild dan restart backend container
-4. Update `manage.sh`
-5. Update Caddyfile (tambah proxy baru jika ada)
+1. **User kirim prompt** — via Android app (REST API), Telegram bot, atau WebSocket
+2. **Backend buat run** — insert ke DB dengan status `queued`, publish ke Redis channel
+3. **Worker pickup** — agent run worker terima notifikasi via Redis pub/sub
+4. **Prepare workspace** — clone/fetch repo, buat git worktree dari session branch
+5. **Jalankan agent** — kirim prompt + context ke OpenClaw Gateway via SSE
+6. **Agent bekerja** — AI edit file, jalankan command di worktree
+7. **Collect hasil** — ambil diff, list changed files
+8. **Auto commit & push** — sesuai policy, commit perubahan dan push ke branch
+9. **Kirim reply** — balas ke user via API response, WebSocket event, atau Telegram message
+10. **Cleanup** — hapus worktree (branch tetap ada untuk session berikutnya)
 
 ## Konfigurasi
 
-Semua config di `/srv/ai-platform/.env` (chmod 600):
+Semua config via environment variable di `/srv/ai-platform/.env`:
 
-```env
-DOMAIN=ai.mudahdeal.com
-ADMIN_EMAIL=admin@mudahdeal.com
+| Variable | Default | Keterangan |
+|---|---|---|
+| `APP_PORT` | `8080` | Port HTTP server |
+| `APP_ENV` | `development` | Environment (development/production) |
+| `LOG_LEVEL` | `info` | Level logging |
+| `DB_HOST` | `localhost` | PostgreSQL host |
+| `DB_PORT` | `5432` | PostgreSQL port |
+| `DB_NAME` | `aicode` | Nama database |
+| `DB_USER` | `postgres` | Database user |
+| `DB_PASSWORD` | (required) | Database password |
+| `REDIS_HOST` | `localhost` | Redis host |
+| `REDIS_PORT` | `6379` | Redis port |
+| `ADMIN_API_KEY` | (optional) | API key admin untuk bootstrap |
+| `GITHUB_TOKEN` | (optional) | GitHub PAT untuk clone/push private repo |
+| `OPENCLAW_BASE_URL` | `http://127.0.0.1:18789` | URL OpenClaw Gateway |
+| `OPENCLAW_GATEWAY_TOKEN` | (required) | Token autentikasi OpenClaw |
+| `WORKSPACES_PATH` | `/srv/ai-platform/workspaces` | Path penyimpanan repo clone |
+| `WORKTREES_PATH` | `/srv/ai-platform/worktrees` | Path worktree ephemeral |
+| `LOGS_PATH` | `/srv/ai-platform/logs` | Path log files |
+| `GRACEFUL_SHUTDOWN` | `true` | Aktifkan graceful shutdown |
+| `MAX_CONCURRENT_RUNS` | `5` | Maksimal run paralel |
+| `OPENCLAW_MAX_RETRIES` | `3` | Retry OpenClaw call |
+| `USER_RATE_LIMIT_PER_MINUTE` | `10` | Max request per user per menit |
+| `TELEGRAM_BOT_TOKEN` | (empty) | Token bot Telegram dari @BotFather |
+| `TELEGRAM_ENABLED` | `false` | Aktifkan Telegram bot |
 
-DB_HOST=postgres
-DB_PORT=5432
-DB_NAME=aicode
-DB_USER=postgres
-DB_PASSWORD=<auto-generated>
+## Telegram Bot
 
-REDIS_HOST=redis
-REDIS_PORT=6379
+### Setup
 
-ADMIN_API_KEY=ak_<auto-generated>
+1. Buat bot baru di Telegram via [@BotFather](https://t.me/BotFather)
+2. Dapatkan token bot
+3. Tambahkan ke environment:
+   ```bash
+   echo "TELEGRAM_BOT_TOKEN=123456:ABC-DEF" >> /srv/ai-platform/.env
+   echo "TELEGRAM_ENABLED=true" >> /srv/ai-platform/.env
+   ```
+4. Restart backend:
+   ```bash
+   cd /srv/ai-platform && docker compose up -d --no-deps backend
+   ```
 
-ANTHROPIC_API_KEY=sk-ant-xxx
-OPENAI_API_KEY=sk-xxx
-NINEROUTER_PORT=4000
+### Whitelist
 
-OPENCLAW_BASE_URL=http://host.docker.internal:18789
-OPENCLAW_GATEWAY_TOKEN=<auto-generated>
+Bot menggunakan sistem whitelist. Hanya user yang terdaftar di tabel `telegram_users` yang bisa menggunakan bot. User pertama yang ditambahkan otomatis menjadi admin.
 
-APP_ENV=production
-APP_PORT=8080
-LOG_LEVEL=info
-```
+### Command
 
-## GitHub Integration
-
-### Setup Token
-
-1. GitHub → Settings → Developer settings → Personal access tokens → Tokens (classic)
-2. Generate new token → scope: **`repo`** (full control of private repositories)
-3. Tambah ke `.env` di VPS:
-
-```bash
-echo "GITHUB_TOKEN=ghp_xxx" >> /srv/ai-platform/.env
-docker compose restart backend
-```
-
-> Untuk tim/organisasi: buat GitHub account khusus (bot account), invite ke org dengan akses repo yang dibutuhkan, lalu generate token dari account tersebut.
-
-### Buat Project + Create Repo GitHub Baru
-
-```json
-POST /api/projects
-{
-  "name": "My Project",
-  "openclaw_agent_id": "default",
-  "description": "Deskripsi project",
-  "create_github_repo": true,
-  "github_org": "nama-organisasi",
-  "github_private": true
-}
-```
-
-`repo_url` akan otomatis diisi dari repo yang baru dibuat.
-
-### Buat Project dari Repo yang Sudah Ada (termasuk private)
-
-```json
-POST /api/projects
-{
-  "name": "Existing Project",
-  "repo_url": "https://github.com/org/repo.git",
-  "openclaw_agent_id": "default"
-}
-```
-
-Token GitHub otomatis dipakai untuk clone private repo dan push branch hasil kerja agent.
-
-## Management Menu
-
-```bash
-bash /srv/ai-platform/manage.sh
-```
-
-```
-╔══════════════════════════════════════╗
-║     AI Platform Management Menu      ║
-╚══════════════════════════════════════╝
-  1) Start 9router
-  2) Stop 9router
-  3) Status 9router
-  4) Open 9router (Web UI URL)
-  5) Start platform (docker compose up)
-  6) Stop platform (docker compose down)
-  7) Restart backend
-  8) View backend logs
-  9) View all logs
-  a) Admin Panel
-  0) Exit
-```
-
-**Admin Panel** (opsi `a`) — kelola API key via terminal tanpa web:
-- List semua API key
-- Buat API key baru (otomatis spawn Docker container untuk user)
-- Revoke API key (otomatis destroy container)
-- Lihat usage stats per key
-
-Direct commands:
-```bash
-bash /srv/ai-platform/manage.sh start    # start 9router
-bash /srv/ai-platform/manage.sh stop     # stop 9router
-bash /srv/ai-platform/manage.sh status   # cek status
-bash /srv/ai-platform/manage.sh logs     # tail backend logs
-```
-
-## URLs
-
-Semua URL menggunakan domain yang dikonfigurasi saat instalasi.
-
-| URL | Keterangan |
+| Command | Keterangan |
 |---|---|
-| `https://domain/health` | Health check backend |
-| `https://domain/api/*` | REST API endpoints |
-| `wss://domain/ws` | WebSocket realtime |
-| `https://domain/9router/` | 9router Web UI (manajemen AI provider) |
+| `/start` | Mulai, tampilkan project aktif |
+| `/projects` | Lihat daftar project yang bisa diakses |
+| `/project <slug>` | Pilih project aktif |
+| `/status` | Tampilkan status saat ini |
+| `/help` | Tampilkan bantuan |
+| `/adduser <telegram_id> <nama>` | (Admin) Tambah user ke whitelist |
+| `/removeuser <telegram_id>` | (Admin) Hapus user dari whitelist |
 
-> **Catatan:** Port 9router (`20128`) tidak dibuka ke publik — diakses via Caddy proxy di path `/9router/`.
+### Penggunaan
 
-## API Reference
+1. Admin tambahkan user: `/adduser 123456789 Nama`
+2. User pilih project: `/project my-api`
+3. Kirim pesan biasa untuk memulai coding: "Tambahkan endpoint health check"
+4. Bot akan memproses dan mengirim hasil (termasuk diff dan status push)
+
+Session otomatis dibuat per hari per user per project. Pesan dalam hari yang sama akan reuse session yang sama.
+
+## API
 
 ### Autentikasi
 
-Semua endpoint protected memerlukan:
+Semua endpoint protected memerlukan header:
 ```
 X-API-Key: ak_your_key_here
 ```
-atau `Authorization: Bearer ak_your_key_here`
 
-### API Key Management (Admin only)
+### Endpoint Utama
 
-```bash
-# Buat API key → otomatis spawn Docker container untuk user
-POST /api/apikeys
-{ "name": "Mobile App", "role": "developer", "expires_at": null }
-# Response berisi plain-text key — tampil SEKALI saja
-
-GET  /api/apikeys              # list semua key
-POST /api/apikeys/:id/revoke   # revoke → otomatis destroy container
-```
-
-### Projects
-
-```bash
-POST  /api/projects  { "name": "Main API", "repo_url": "https://github.com/company/repo.git", "openclaw_agent_id": "main-api" }
-GET   /api/projects
-GET   /api/projects/:id
-PATCH /api/projects/:id
-GET   /api/projects/:id/policy
-PATCH /api/projects/:id/policy
-GET   /api/projects/:id/audit-logs
-```
-
-### Sessions
-
-```bash
-POST /api/projects/:project_id/sessions  { "title": "Fix auth bug" }
-GET  /api/projects/:project_id/sessions
-GET  /api/sessions/:id
-GET  /api/sessions/:id/messages
-
-# Chat langsung (non-streaming) — OpenClaw Agent atau Hermes Chat
-POST /api/sessions/:id/chat
-{ "prompt": "...", "mode": "openclaw" }   # mode: "openclaw" | "hermes"
-```
-
-### Agent Runs
-
-```bash
-POST /api/sessions/:session_id/agent-runs
-{ "prompt": "Tambahkan health check endpoint", "auto_mode": "auto_trusted", "model": "claude-sonnet-4-6" }
-
-GET  /api/agent-runs/:id
-POST /api/agent-runs/:id/cancel
-GET  /api/agent-runs/:id/diff
-GET  /api/agent-runs/:id/events?after_seq=123
-```
-
-### Usage Tracking
-
-```bash
-GET /api/usage              # summary untuk API key saat ini
-GET /api/usage/logs?limit=50
-```
-
-### WebSocket
-
-```
-WS /ws?api_key=ak_your_key_here
-```
-
-Subscribe ke session:
-```json
-{ "type": "subscribe_session", "session_id": "uuid", "after_seq": 0 }
-```
-
-| Event | Keterangan |
-|---|---|
-| `agent_run.started` | Run dimulai |
-| `assistant.delta` | Token stream dari agent |
-| `terminal.output` | stdout/stderr command |
-| `file.changed` | File diubah, diff tersedia |
-| `git.committed` | Commit berhasil dibuat |
-| `pr.created` | PR dibuat |
-| `agent_run.completed` | Run selesai sukses |
-| `agent_run.failed` | Run gagal |
-| `policy.blocked` | Command diblok policy |
-
-## Auto Mode Policy
-
-Update via `PATCH /api/projects/:id/policy`:
-
-```json
-{
-  "policy": {
-    "auto_mode": "auto_trusted",
-    "limits": { "max_run_minutes": 30, "max_retries": 3, "max_changed_files": 30 },
-    "git": { "auto_commit": true, "auto_push_branch": true, "auto_create_pr": true, "auto_merge": false },
-    "network": { "default": "none", "allowed_hosts": ["registry.npmjs.org", "pypi.org", "crates.io"] }
-  }
-}
-```
-
-| Mode | Edit | Commit | Push | Install deps |
-|---|---|---|---|---|
-| `auto_safe` | ✅ | ❌ | ❌ | ❌ |
-| `auto_trusted` | ✅ | ✅ | ✅ | ✅ (allowlist) |
-| `auto_full` | ✅ | ✅ | ✅ | ✅ |
-
-## Android App Integration
-
-```kotlin
-// Header di setiap request
-.header("X-API-Key", "ak_your_key")
-
-// WebSocket
-val ws = OkHttpClient().newWebSocket(
-    Request.Builder().url("wss://ai.company.com/ws?api_key=ak_your_key").build(),
-    object : WebSocketListener() {
-        override fun onOpen(ws: WebSocket, response: Response) {
-            ws.send("""{"type":"subscribe_session","session_id":"$sessionId","after_seq":0}""")
-        }
-        override fun onMessage(ws: WebSocket, text: String) {
-            // parse AgentEvent dan update UI
-        }
-    }
-)
-// Start agent run: POST /api/sessions/{id}/agent-runs
-// { "prompt": "...", "model": "claude-sonnet-4-6" }
-```
-
-## Security
-
-- API key di-hash SHA-256 — plain text tidak pernah tersimpan di DB
-- Setiap user berjalan di Docker container terisolasi (`--network none`)
-- Tidak ada production secrets di workspace agent
-- Main branch write disabled untuk agent
-- Auto-merge disabled by default
-- OpenClaw Gateway hanya bind ke loopback (tidak exposed ke internet)
-- Postgres dan Redis di private Docker network
-- UFW: hanya port 22, 80, 443 terbuka
-
-## Struktur Direktori (VPS)
-
-```
-/srv/ai-platform/
-├── .env                    # secrets (chmod 600)
-├── docker-compose.yml
-├── Caddyfile
-├── manage.sh               # management menu
-├── 9router/                # 9router config & data
-├── app/backend/            # Rust source
-├── workspaces/             # repo clones per user
-├── worktrees/              # disposable run worktrees
-├── logs/
-└── backups/                # daily Postgres dumps (retain 7 hari)
-```
+| Method | Path | Keterangan |
+|---|---|---|
+| `POST` | `/api/apikeys` | Buat API key baru (admin) |
+| `GET` | `/api/apikeys` | List API keys |
+| `POST` | `/api/apikeys/:id/revoke` | Revoke API key |
+| `POST` | `/api/projects` | Buat project baru |
+| `GET` | `/api/projects` | List projects |
+| `GET` | `/api/projects/:id` | Detail project |
+| `PATCH` | `/api/projects/:id` | Update project |
+| `GET/PATCH` | `/api/projects/:id/policy` | Get/update policy |
+| `POST` | `/api/projects/:pid/sessions` | Buat coding session |
+| `GET` | `/api/projects/:pid/sessions` | List sessions |
+| `GET` | `/api/sessions/:id/messages` | Riwayat pesan session |
+| `POST` | `/api/sessions/:sid/agent-runs` | Mulai agent run |
+| `GET` | `/api/agent-runs/:id` | Status run |
+| `POST` | `/api/agent-runs/:id/cancel` | Cancel run |
+| `GET` | `/api/agent-runs/:id/diff` | Diff hasil run |
+| `GET` | `/api/agent-runs/:id/events` | Event stream run |
+| `GET` | `/api/usage` | Usage summary |
+| `WS` | `/ws?api_key=ak_xxx` | WebSocket realtime |
 
 ## Development
 
+### Prerequisites
+
+- Rust 1.88+
+- Docker & Docker Compose
+- PostgreSQL 16
+- Redis 7
+
+### Build & Run Lokal
+
 ```bash
+# Start dependencies
 docker compose up -d postgres redis
-cd backend && cargo run        # → http://localhost:8080
+
+# Run backend
+cd backend && cargo run
+
+# Run tests
 cargo test
+
+# Lint
 cargo clippy -- -D warnings
 ```
 
-## Troubleshooting
+### Build Docker Image
 
-| Masalah | Solusi |
-|---|---|
-| Backend tidak start | `docker compose logs backend` — cek `.env` |
-| 9router tidak connect | Cek panel 9router di port 4000 |
-| Run stuck di `queued` | `docker compose logs backend \| grep agent_run_worker` |
-| Container tidak dibuat | Pastikan `docker.sock` ter-mount di backend container |
-| WebSocket disconnect | Reconnect dengan backoff, catch-up via `GET /api/agent-runs/:id/events?after_seq=N` |
+```bash
+cd /root/dealtech-code
+docker build -f backend/Dockerfile -t ai-platform-backend backend/
+```
+
+### Deploy
+
+```bash
+cd /srv/ai-platform && docker compose up -d --no-deps backend
+```
 
 ## License
 
 Internal use only.
+

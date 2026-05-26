@@ -5,6 +5,7 @@ mod error;
 mod http;
 mod infra;
 mod services;
+mod telegram;
 mod workers;
 
 use std::sync::Arc;
@@ -60,6 +61,17 @@ async fn main() -> anyhow::Result<()> {
         db_arc,
         redis.clone(),
     ));
+
+    // Telegram bot polling
+    if config.telegram_enabled && !config.telegram_bot_token.is_empty() {
+        let tg_config = Arc::new(config.clone());
+        let tg_db = db.clone();
+        let tg_redis = redis.clone();
+        tokio::spawn(async move {
+            telegram::start_polling(tg_config, tg_db, tg_redis).await;
+        });
+        tracing::info!("Telegram bot enabled");
+    }
 
     let app = http::routes::app_router(state);
     let addr = format!("0.0.0.0:{}", config.app_port);

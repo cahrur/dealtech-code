@@ -30,6 +30,10 @@ pub struct Config {
     pub max_concurrent_runs: usize,
     pub openclaw_max_retries: u32,
     pub user_rate_limit_per_minute: u64,
+
+    // Telegram bot
+    pub telegram_bot_token: String,
+    pub telegram_enabled: bool,
 }
 
 impl Config {
@@ -81,6 +85,12 @@ impl Config {
                 .unwrap_or_else(|_| "10".into())
                 .parse()
                 .unwrap_or(10),
+
+            telegram_bot_token: env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default(),
+            telegram_enabled: env::var("TELEGRAM_ENABLED")
+                .unwrap_or_else(|_| "false".into())
+                .parse()
+                .unwrap_or(false),
         })
     }
 
