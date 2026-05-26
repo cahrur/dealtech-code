@@ -238,6 +238,7 @@ pub async fn run_nonstream(config: &Config, input: &OpenClawRunInput) -> Result<
     if !res.status().is_success() {
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
+        tracing::error!(status = %status, body = %text, "OpenClaw non-stream HTTP error");
         return Err(AppError::Internal(anyhow::anyhow!(
             "OpenClaw non-stream error {}: {}",
             status,
