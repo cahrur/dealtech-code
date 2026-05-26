@@ -152,6 +152,7 @@ async fn handle_command(
         "/help" => cmd_help(client, config, db, tg_user, chat_id).await?,
         "/adduser" => cmd_adduser(client, config, db, tg_user, chat_id, &parts).await?,
         "/removeuser" => cmd_removeuser(client, config, db, tg_user, chat_id, &parts).await?,
+        "/newproject" => cmd_newproject(client, config, db, tg_user, chat_id, &parts).await?,
         _ => {
             send_message(client, &config.telegram_bot_token, chat_id,
                 "❓ Perintah tidak dikenal. Gunakan /help untuk melihat daftar perintah.").await?;
@@ -400,6 +401,82 @@ async fn cmd_removeuser(
         send_message(client, &config.telegram_bot_token, chat_id,
             "User tidak ditemukan.").await?;
     }
+    Ok(())
+}
+
+async fn cmd_newproject(
+    client: &Client,
+    config: &Config,
+    db: &PgPool,
+    tg_user: &TelegramDbUser,
+    chat_id: i64,
+    parts: &[&str],
+) -> anyhow::Result<()> {
+    // Format: /newproject <nama> <repo_url>
+    if parts.len() < 3 {
+        send_message(client, &config.telegram_bot_token, chat_id,
+            "Gunakan: /newproject <nama> <repo_url>\nContoh: /newproject test-martabak https://github.com/user/test-martabak").await?;
+        return Ok(());
+    }
+    let name = parts[1].trim();
+    let repo_url = parts[2].trim();
+
+    // Buat slug dari nama (lowercase, spasi jadi dash)
+    let slug = name.to_lowercase().replace(' ', "-");
+
+    // Validasi repo_url
+    if !repo_url.starts_with("https://") {
+        send_message(client, &config.telegram_bot_token, chat_id,
+            "⚠️ repo_url harus diawali https://").await?;
+        return Ok(());
+    }
+
+    // Cek apakah slug sudah ada
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM projects WHERE slug = $1)")
+        .bind(&slug)
+        .fetch_one(db)
+        .await
+        .unwrap_or(false);
+    if exists {
+        send_message(client, &config.telegram_bot_token, chat_id,
+            &format!("⚠️ Project dengan slug `{}` sudah ada. Gunakan nama lain.", slug)).await?;
+        return Ok(());
+    }
+
+    // Buat project
+    let project_id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO projects (id, team_id, name, slug, repo_url, openclaw_agent_id)
+         VALUES (uuid_generate_v4(), uuid_generate_v4(), $1, $2, $3, 'default')
+         RETURNING id"
+    )
+    .bind(name)
+    .bind(&slug)
+    .bind(repo_url)
+    .fetch_one(db)
+    .await
+    .map_err(|e| anyhow::anyhow!("Gagal buat project: {}", e))?;
+
+    // Tambah user sebagai admin project
+    let _ = sqlx::query(
+        "INSERT INTO project_members (project_id, user_id, role) VALUES ($1, $2, 'admin')"
+    )
+    .bind(project_id)
+    .bind(tg_user.user_id)
+    .execute(db)
+    .await;
+
+    // Set sebagai active project
+    let _ = sqlx::query(
+        "UPDATE telegram_users SET active_project_id = $1 WHERE telegram_id = $2"
+    )
+    .bind(project_id)
+    .bind(tg_user.telegram_id)
+    .execute(db)
+    .await;
+
+    send_message(client, &config.telegram_bot_token, chat_id,
+        &format!("✅ Project `{}` berhasil dibuat!\nRepo: {}\nSlug: {}\n\nProject ini sudah di-set sebagai project aktif. Langsung kirim prompt untuk mulai coding.",
+            name, repo_url, slug)).await?;
     Ok(())
 }
 
