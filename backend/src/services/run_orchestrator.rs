@@ -142,6 +142,15 @@ async fn run_inner(
         &repo_url, &branch_name, &worktree_str, &git_status,
     );
 
+    // Fetch session history (exclude current user message which is the prompt)
+    let history: Vec<(String, String)> = crate::services::session_service::messages(
+        db.as_ref(), session_id,
+    ).await.unwrap_or_default()
+    .into_iter()
+    .filter(|m| m.content != run.prompt || m.role != "user")
+    .map(|m| (m.role, m.content))
+    .collect();
+
     // Single OpenClaw call — streaming, OpenClaw writes files directly via its own tools
     let input = openclaw_service::OpenClawRunInput {
         agent_id: run.openclaw_agent_id.clone(),
@@ -150,6 +159,7 @@ async fn run_inner(
         instructions,
         prompt: openclaw_service::sanitize_user_prompt(&run.prompt),
         model: run.model.clone(),
+        history,
     };
 
     let agent_reply = match openclaw_service::run_agent_full(&config, &input).await {
