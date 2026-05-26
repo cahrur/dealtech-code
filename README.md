@@ -129,6 +129,7 @@ Bot menggunakan sistem whitelist. Hanya user yang terdaftar di tabel `telegram_u
 | `/start` | Mulai, tampilkan project aktif |
 | `/projects` | Lihat daftar project yang bisa diakses |
 | `/project <slug>` | Pilih project aktif |
+| `/newproject <nama> <repo_url>` | Buat project baru dan set sebagai aktif |
 | `/status` | Tampilkan status saat ini |
 | `/help` | Tampilkan bantuan |
 | `/adduser <telegram_id> <nama>` | (Admin) Tambah user ke whitelist |
