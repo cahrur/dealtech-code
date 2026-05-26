@@ -432,6 +432,13 @@ async fn cmd_newproject(
         return Ok(());
     }
 
+    // Sanitize: strip token dari URL (https://x-access-token:TOKEN@github.com → https://github.com)
+    let repo_url = if let Some(at_pos) = repo_url.find('@') {
+        format!("https://{}", &repo_url[at_pos + 1..])
+    } else {
+        repo_url.to_string()
+    };
+
     // Cek apakah slug sudah ada
     let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM projects WHERE slug = $1)")
         .bind(&slug)
@@ -452,7 +459,7 @@ async fn cmd_newproject(
     )
     .bind(name)
     .bind(&slug)
-    .bind(repo_url)
+    .bind(repo_url.as_str())
     .fetch_one(db)
     .await
     .map_err(|e| anyhow::anyhow!("Gagal buat project: {}", e))?;
