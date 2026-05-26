@@ -47,8 +47,11 @@ pub async fn execute_run(
     repo_url: String,
     policy_config: PolicyConfig,
 ) {
+    let start_time = std::time::Instant::now();
     if let Err(e) = run_inner(db.clone(), redis.clone(), config.clone(), run_id, team_slug.clone(), project_slug.clone(), repo_url, policy_config).await {
         tracing::error!(run_id = %run_id, error = %e, "Agent run failed");
+        // Improvement 5: Log run duration on failure
+        tracing::info!(run_id = %run_id, duration_ms = start_time.elapsed().as_millis(), status = "failed", "Run finished");
         let error_msg = {
             let s = e.to_string();
             if s.trim().is_empty() { "Unknown error".to_string() } else { s }
@@ -108,6 +111,9 @@ async fn run_inner(
     repo_url: String,
     policy_config: PolicyConfig,
 ) -> anyhow::Result<()> {
+    // Improvement 5: Track run duration
+    let start_time = std::time::Instant::now();
+
     let run = sqlx::query_as::<_, AgentRun>("SELECT * FROM agent_runs WHERE id = $1")
         .bind(run_id).fetch_one(db.as_ref()).await?;
 
@@ -310,6 +316,9 @@ async fn run_inner(
 
     // Cleanup worktree after run completes (branch is kept for session reuse)
     let _ = workspace_service::cleanup_worktree(&worktree, &workspace_path).await;
+
+    // Improvement 5: Log run duration on success
+    tracing::info!(run_id = %run_id, duration_ms = start_time.elapsed().as_millis(), status = "completed", "Run finished");
 
     Ok(())
 }

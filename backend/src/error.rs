@@ -18,6 +18,8 @@ pub enum AppError {
     BadRequest(String),
     #[error("Conflict: {0}")]
     Conflict(String),
+    #[error("Rate limited: {0}")]
+    RateLimited(String),
     #[error("Database error")]
     Database(#[from] sqlx::Error),
     #[error("Internal error")]
@@ -32,6 +34,7 @@ impl IntoResponse for AppError {
             AppError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             AppError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
+            AppError::RateLimited(msg) => (StatusCode::TOO_MANY_REQUESTS, msg.clone()),
             AppError::Database(e) => {
                 tracing::error!("DB error: {:?}", e);
                 (StatusCode::INTERNAL_SERVER_ERROR, "Database error".to_string())

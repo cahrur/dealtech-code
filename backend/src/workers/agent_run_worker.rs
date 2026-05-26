@@ -1,24 +1,26 @@
 use redis::aio::ConnectionManager;
 use sqlx::PgPool;
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 use crate::config::Config;
 use crate::domain::agent_run::AgentRun;
 use crate::domain::policy::PolicyConfig;
 use crate::services::run_orchestrator;
 
-pub async fn run(db: Arc<PgPool>, redis: ConnectionManager, config: Arc<Config>) {
+pub async fn run(db: Arc<PgPool>, redis: ConnectionManager, config: Arc<Config>, semaphore: Option<Arc<Semaphore>>) {
     // Spawn the pub/sub listener alongside the polling loop
     let db2 = db.clone();
     let redis2 = redis.clone();
     let config2 = config.clone();
+    let sem2 = semaphore.clone();
     tokio::spawn(async move {
-        pubsub_listener(db2, redis2, config2).await;
+        pubsub_listener(db2, redis2, config2, sem2).await;
     });
 
     // Polling loop as fallback (every 5 seconds)
     loop {
-        if let Err(e) = process_queued(db.clone(), redis.clone(), config.clone()).await {
+        if let Err(e) = process_queued(db.clone(), redis.clone(), config.clone(), semaphore.clone()).await {
             tracing::error!("agent_run_worker error: {}", e);
         }
         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
@@ -26,7 +28,7 @@ pub async fn run(db: Arc<PgPool>, redis: ConnectionManager, config: Arc<Config>)
 }
 
 /// Listens to Redis pub/sub channel "agent_run:queued" for immediate processing
-async fn pubsub_listener(db: Arc<PgPool>, redis: ConnectionManager, config: Arc<Config>) {
+async fn pubsub_listener(db: Arc<PgPool>, redis: ConnectionManager, config: Arc<Config>, semaphore: Option<Arc<Semaphore>>) {
     use redis::Client;
 
     // We need a separate connection for pub/sub (can't reuse ConnectionManager)
@@ -69,8 +71,9 @@ async fn pubsub_listener(db: Arc<PgPool>, redis: ConnectionManager, config: Arc<
                         let db3 = db.clone();
                         let redis3 = redis.clone();
                         let config3 = config.clone();
+                        let sem3 = semaphore.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = process_queued(db3, redis3, config3).await {
+                            if let Err(e) = process_queued(db3, redis3, config3, sem3).await {
                                 tracing::error!("agent_run_worker (pubsub trigger) error: {}", e);
                             }
                         });
@@ -90,6 +93,7 @@ async fn process_queued(
     db: Arc<PgPool>,
     redis: ConnectionManager,
     config: Arc<Config>,
+    semaphore: Option<Arc<Semaphore>>,
 ) -> anyhow::Result<()> {
     #[derive(sqlx::FromRow)]
     struct ProjectInfo { slug: String, repo_url: String }
@@ -147,12 +151,19 @@ async fn process_queued(
             let redis2 = redis.clone();
             let cfg2 = config.clone();
             let run_id = run.id;
+            let sem_clone = semaphore.clone();
             tokio::spawn(async move {
+                // Improvement 2: Acquire semaphore permit before running
+                let _permit = match &sem_clone {
+                    Some(sem) => Some(sem.acquire().await.expect("semaphore closed")),
+                    None => None,
+                };
                 run_orchestrator::execute_run(
                     db2, redis2, cfg2, run_id,
                     run.user_id.to_string(), p.slug, p.repo_url,
                     policy_config,
                 ).await;
+                // Permit is dropped here, releasing the semaphore
             });
         }
     }

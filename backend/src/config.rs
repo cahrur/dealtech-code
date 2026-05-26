@@ -24,6 +24,12 @@ pub struct Config {
     pub workspaces_path: String,
     pub worktrees_path: String,
     pub logs_path: String,
+
+    // Production-readiness settings
+    pub graceful_shutdown: bool,
+    pub max_concurrent_runs: usize,
+    pub openclaw_max_retries: u32,
+    pub user_rate_limit_per_minute: u64,
 }
 
 impl Config {
@@ -58,6 +64,23 @@ impl Config {
                 .unwrap_or_else(|_| "/srv/ai-platform/worktrees".into()),
             logs_path: env::var("LOGS_PATH")
                 .unwrap_or_else(|_| "/srv/ai-platform/logs".into()),
+
+            graceful_shutdown: env::var("GRACEFUL_SHUTDOWN")
+                .unwrap_or_else(|_| "true".into())
+                .parse()
+                .unwrap_or(true),
+            max_concurrent_runs: env::var("MAX_CONCURRENT_RUNS")
+                .unwrap_or_else(|_| "5".into())
+                .parse()
+                .unwrap_or(5),
+            openclaw_max_retries: env::var("OPENCLAW_MAX_RETRIES")
+                .unwrap_or_else(|_| "3".into())
+                .parse()
+                .unwrap_or(3),
+            user_rate_limit_per_minute: env::var("USER_RATE_LIMIT_PER_MINUTE")
+                .unwrap_or_else(|_| "10".into())
+                .parse()
+                .unwrap_or(10),
         })
     }
 

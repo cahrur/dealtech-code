@@ -21,6 +21,22 @@ pub async fn create(
     Path(session_id): Path<Uuid>,
     Json(req): Json<CreateRunRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>)> {
+    // Improvement 4: Rate limiting per user
+    let rate_limit = state.config.user_rate_limit_per_minute;
+    if rate_limit > 0 {
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM agent_runs WHERE user_id=$1 AND created_at > NOW() - INTERVAL '1 minute'"
+        )
+        .bind(user_id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or(0);
+
+        if count >= rate_limit as i64 {
+            return Err(AppError::RateLimited("Terlalu banyak request. Tunggu sebentar.".to_string()));
+        }
+    }
+
     let session = session_service::get(&state.db, session_id).await?;
     let project = project_service::get(&state.db, session.project_id, user_id).await?;
     project_service::check_member(&state.db, session.project_id, user_id).await?;

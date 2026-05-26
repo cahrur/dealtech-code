@@ -206,6 +206,47 @@ pub async fn run_stream(
 }
 
 pub async fn run_nonstream(config: &Config, input: &OpenClawRunInput) -> Result<String> {
+    let max_retries = config.openclaw_max_retries;
+    let mut attempt = 0u32;
+
+    loop {
+        attempt += 1;
+        match run_nonstream_inner(config, input).await {
+            Ok(text) => return Ok(text),
+            Err(e) => {
+                // Only retry on network errors or 5xx; not on 4xx
+                let is_retryable = match &e {
+                    AppError::Internal(inner) => {
+                        let msg = inner.to_string();
+                        // 4xx errors are not retryable
+                        if msg.contains("non-stream error 4") {
+                            false
+                        } else {
+                            true
+                        }
+                    }
+                    _ => false,
+                };
+
+                if !is_retryable || max_retries == 0 || attempt > max_retries {
+                    return Err(e);
+                }
+
+                let backoff_secs = 1u64 << (attempt - 1); // 1s, 2s, 4s
+                tracing::warn!(
+                    attempt = attempt,
+                    max_retries = max_retries,
+                    backoff_secs = backoff_secs,
+                    error = %e,
+                    "OpenClaw non-stream request failed, retrying"
+                );
+                tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
+            }
+        }
+    }
+}
+
+async fn run_nonstream_inner(config: &Config, input: &OpenClawRunInput) -> Result<String> {
     let client = Client::new();
     // Build input: array of message items if history exists, plain string otherwise
     let input_val = if input.history.is_empty() {

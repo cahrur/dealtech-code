@@ -8,6 +8,7 @@ mod services;
 mod workers;
 
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use app_state::AppState;
@@ -36,6 +37,13 @@ async fn main() -> anyhow::Result<()> {
     let db_arc = Arc::new(db.clone());
     let config_arc = Arc::new(config.clone());
 
+    // Improvement 2: Create semaphore for max concurrent runs
+    let semaphore = if config.max_concurrent_runs > 0 {
+        Some(Arc::new(Semaphore::new(config.max_concurrent_runs)))
+    } else {
+        None
+    };
+
     tokio::spawn(workers::cleanup_worker::run(
         db.clone(),
         config.worktrees_path.clone(),
@@ -45,6 +53,7 @@ async fn main() -> anyhow::Result<()> {
         db_arc.clone(),
         redis.clone(),
         config_arc.clone(),
+        semaphore,
     ));
 
     tokio::spawn(workers::stuck_run_recovery::run(
@@ -57,7 +66,39 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app).await?;
+
+    // Improvement 1: Graceful shutdown
+    if config.graceful_shutdown {
+        let shutdown_signal = async {
+            let ctrl_c = async {
+                tokio::signal::ctrl_c()
+                    .await
+                    .expect("failed to install CTRL+C handler");
+            };
+            #[cfg(unix)]
+            let terminate = async {
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("failed to install SIGTERM handler")
+                    .recv()
+                    .await;
+            };
+            #[cfg(not(unix))]
+            let terminate = std::future::pending::<()>();
+
+            tokio::select! {
+                _ = ctrl_c => {},
+                _ = terminate => {},
+            }
+            tracing::info!("Shutting down gracefully");
+        };
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal)
+            .await?;
+        // Wait for running tasks to finish (max 30 seconds)
+        tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+    } else {
+        axum::serve(listener, app).await?;
+    }
 
     Ok(())
 }
