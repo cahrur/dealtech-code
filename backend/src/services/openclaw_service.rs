@@ -249,7 +249,7 @@ pub async fn run_nonstream(config: &Config, input: &OpenClawRunInput) -> Result<
                             let is_text = part
                                 .get("type")
                                 .and_then(|t| t.as_str())
-                                .map(|t| t == "text")
+                                .map(|t| t == "text" || t == "output_text")
                                 .unwrap_or(false);
                             if is_text {
                                 part.get("text").and_then(|t| t.as_str())
