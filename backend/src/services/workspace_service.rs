@@ -142,9 +142,34 @@ pub async fn create_worktree(
     Ok(worktree_path)
 }
 
-pub async fn cleanup_worktree(worktree_path: &PathBuf) -> anyhow::Result<()> {
+pub async fn cleanup_worktree(
+    worktree_path: &PathBuf,
+    workspace_path: &PathBuf,
+    branch_name: &str,
+) -> anyhow::Result<()> {
+    // Unregister worktree from git first
+    let _ = Command::new("git")
+        .args(["-C", workspace_path.to_str().unwrap_or(""), "worktree", "remove", "--force", worktree_path.to_str().unwrap_or("")])
+        .status()
+        .await;
+
+    // Prune stale entries
+    let _ = Command::new("git")
+        .args(["-C", workspace_path.to_str().unwrap_or(""), "worktree", "prune"])
+        .status()
+        .await;
+
+    // Delete the branch
+    let _ = Command::new("git")
+        .args(["-C", workspace_path.to_str().unwrap_or(""), "branch", "-D", branch_name])
+        .status()
+        .await;
+
+    // Remove directory if still present
     if worktree_path.exists() {
-        tokio::fs::remove_dir_all(worktree_path).await?;
+        let _ = tokio::fs::remove_dir_all(worktree_path).await;
     }
+
+    tracing::info!(worktree = %worktree_path.display(), branch = %branch_name, "Worktree cleaned up");
     Ok(())
 }

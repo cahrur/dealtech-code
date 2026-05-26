@@ -47,7 +47,7 @@ pub async fn execute_run(
     repo_url: String,
     policy_config: PolicyConfig,
 ) {
-    if let Err(e) = run_inner(db.clone(), redis.clone(), config, run_id, team_slug, project_slug, repo_url, policy_config).await {
+    if let Err(e) = run_inner(db.clone(), redis.clone(), config.clone(), run_id, team_slug.clone(), project_slug.clone(), repo_url, policy_config).await {
         tracing::error!(run_id = %run_id, error = %e, "Agent run failed");
         let _ = sqlx::query(
             "UPDATE agent_runs SET status='failed_agent', finished_at=NOW(), error_message=$1 WHERE id=$2"
@@ -56,6 +56,26 @@ pub async fn execute_run(
         .bind(run_id)
         .execute(db.as_ref())
         .await;
+
+        // Cleanup worktree on failure
+        let run_info = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            "SELECT worktree_path, branch_name FROM agent_runs WHERE id=$1"
+        )
+        .bind(run_id)
+        .fetch_optional(db.as_ref())
+        .await
+        .ok()
+        .flatten();
+        if let Some((Some(wt_path), Some(branch))) = run_info {
+            let workspace_path = std::path::PathBuf::from(&config.workspaces_path)
+                .join(&team_slug)
+                .join(&project_slug);
+            let _ = workspace_service::cleanup_worktree(
+                &std::path::PathBuf::from(&wt_path),
+                &workspace_path,
+                &branch,
+            ).await;
+        }
         // Emit failure event so the Android app receives a terminal signal
         let session_id_opt = sqlx::query_scalar::<_, uuid::Uuid>(
             "SELECT session_id FROM agent_runs WHERE id = $1"
@@ -252,6 +272,12 @@ async fn run_inner(
     let _ = crate::services::usage_service::record(
         db.as_ref(), Some(user_id), Some(run_id), &run.model, 0, 0,
     ).await;
+
+    // Cleanup worktree after run completes
+    let workspace_path = std::path::PathBuf::from(&config.workspaces_path)
+        .join(&team_slug)
+        .join(&project_slug);
+    let _ = workspace_service::cleanup_worktree(&worktree, &workspace_path, &branch_name).await;
 
     Ok(())
 }
