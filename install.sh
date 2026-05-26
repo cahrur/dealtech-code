@@ -88,6 +88,16 @@ collect_config() {
   read -rp "GitHub Personal Access Token (untuk push ke repo, optional): " GITHUB_TOKEN
 
   echo ""
+  read -rp "Telegram Bot Token (dari @BotFather, optional — Enter to skip): " TELEGRAM_BOT_TOKEN
+  if [[ -n "$TELEGRAM_BOT_TOKEN" ]]; then
+    TELEGRAM_ENABLED=true
+    info "Telegram bot akan diaktifkan"
+  else
+    TELEGRAM_ENABLED=false
+    info "Telegram bot dinonaktifkan (bisa diaktifkan nanti via .env)"
+  fi
+
+  echo ""
   info "Domain:         $DOMAIN"
   info "Admin email:    $ADMIN_EMAIL"
   info "Postgres pass:  ${PG_PASS:0:8}... (truncated)"
@@ -195,6 +205,10 @@ GITHUB_TOKEN=${GITHUB_TOKEN}
 # ── OpenClaw Gateway ──────────────────────────────────────────────────────────
 OPENCLAW_BASE_URL=http://host.docker.internal:${OPENCLAW_PORT}
 OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_TOKEN}
+
+# ── Telegram Bot ─────────────────────────────────────────────────────────────
+TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+TELEGRAM_ENABLED=${TELEGRAM_ENABLED:-false}
 
 # ── App ───────────────────────────────────────────────────────────────────────
 APP_ENV=production
@@ -738,7 +752,16 @@ print_summary() {
   echo "     scp -r backend/ user@vps:$APP_DIR/backend/"
   echo "     cd $PLATFORM_DIR && docker compose up -d --build"
   echo ""
-  echo "  5. Verify health:"
+  echo "  5. Setup Telegram Bot (opsional):"
+  echo "     a. Buat bot di @BotFather, dapat token"
+  echo "     b. Edit .env: TELEGRAM_BOT_TOKEN=<token> dan TELEGRAM_ENABLED=true"
+  echo "     c. Restart: cd $PLATFORM_DIR && docker compose up -d --no-deps backend"
+  echo "     d. Daftarkan admin pertama ke whitelist:"
+  echo "        docker exec ai-platform-postgres-1 psql -U postgres -d aicode -c \\""
+  echo "        INSERT INTO telegram_users (telegram_id, user_id, name)"
+  echo "        VALUES (<telegram_id>, '<user_id_dari_DB>', '<nama>');\\""
+  echo ""
+  echo "  6. Verify health:"
   echo "     curl https://$DOMAIN/health"
   echo ""
   echo -e "${BOLD}Management menu (anytime):${NC}"
