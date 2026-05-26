@@ -34,7 +34,9 @@ pub struct Config {
     // Telegram bot
     pub telegram_bot_token: String,
     pub telegram_enabled: bool,
-}
+
+    // Security
+    pub cors_origin: String,  // comma-separated allowed origins, "*" = allow all
 
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
@@ -91,6 +93,8 @@ impl Config {
                 .unwrap_or_else(|_| "false".into())
                 .parse()
                 .unwrap_or(false),
+
+            cors_origin: env::var("CORS_ORIGIN").unwrap_or_else(|_| "*".into()),
         })
     }
 

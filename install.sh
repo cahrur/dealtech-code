@@ -210,6 +210,11 @@ OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_TOKEN}
 TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
 TELEGRAM_ENABLED=${TELEGRAM_ENABLED:-false}
 
+# ── Security ─────────────────────────────────────────────────────────────────
+# CORS_ORIGIN: comma-separated allowed origins. "*" = allow all (dev only)
+# Production example: CORS_ORIGIN=https://app.dealtech.ai,https://admin.dealtech.ai
+CORS_ORIGIN=${CORS_ORIGIN:-*}
+
 # ── App ───────────────────────────────────────────────────────────────────────
 APP_ENV=production
 APP_PORT=8080
