@@ -66,14 +66,13 @@ pub async fn execute_run(
         .await
         .ok()
         .flatten();
-        if let Some((Some(wt_path), Some(branch))) = run_info {
+        if let Some((Some(wt_path), Some(_branch))) = run_info {
             let workspace_path = std::path::PathBuf::from(&config.workspaces_path)
                 .join(&team_slug)
                 .join(&project_slug);
             let _ = workspace_service::cleanup_worktree(
                 &std::path::PathBuf::from(&wt_path),
                 &workspace_path,
-                &branch,
             ).await;
         }
         // Emit failure event so the Android app receives a terminal signal
@@ -121,22 +120,29 @@ async fn run_inner(
         serde_json::json!({"run_id": run_id})).await?;
 
     // Prepare workspace — graceful error: tell user instead of crashing
-    if let Err(e) = workspace_service::prepare_workspace(
+    let workspace_path = match workspace_service::prepare_workspace(
         &config, &team_slug, &project_slug, &repo_url,
     ).await {
-        let reply = format!(
-            "Tidak bisa mengakses repository `{}`. Pastikan URL repo benar dan credentials sudah dikonfigurasi.\n\nDetail: {}",
-            repo_url, e
-        );
-        return finish_with_reply(db.as_ref(), &mut redis, run_id, session_id, &reply, false).await;
-    }
+        Ok(p) => p,
+        Err(e) => {
+            let reply = format!(
+                "Tidak bisa mengakses repository `{}`. Pastikan URL repo benar dan credentials sudah dikonfigurasi.\n\nDetail: {}",
+                repo_url, e
+            );
+            return finish_with_reply(db.as_ref(), &mut redis, run_id, session_id, &reply, false).await;
+        }
+    };
 
-    let now = time::OffsetDateTime::now_utc();
-    let branch_name = format!(
-        "ai/{}{:02}{:02}-{}",
-        now.year(), now.month() as u8, now.day(),
-        &run_id.to_string()[..8]
-    );
+    // Get or create persistent branch for this session (1 branch per session)
+    let branch_name = match workspace_service::get_or_create_session_branch(
+        db.as_ref(), &workspace_path, session_id,
+    ).await {
+        Ok(b) => b,
+        Err(e) => {
+            let reply = format!("Gagal menyiapkan branch untuk sesi ini. Detail: {}", e);
+            return finish_with_reply(db.as_ref(), &mut redis, run_id, session_id, &reply, false).await;
+        }
+    };
 
     // Create worktree — graceful error
     let worktree = match workspace_service::create_worktree(
@@ -273,11 +279,8 @@ async fn run_inner(
         db.as_ref(), Some(user_id), Some(run_id), &run.model, 0, 0,
     ).await;
 
-    // Cleanup worktree after run completes
-    let workspace_path = std::path::PathBuf::from(&config.workspaces_path)
-        .join(&team_slug)
-        .join(&project_slug);
-    let _ = workspace_service::cleanup_worktree(&worktree, &workspace_path, &branch_name).await;
+    // Cleanup worktree after run completes (branch is kept for session reuse)
+    let _ = workspace_service::cleanup_worktree(&worktree, &workspace_path).await;
 
     Ok(())
 }
