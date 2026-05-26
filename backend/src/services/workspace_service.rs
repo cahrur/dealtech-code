@@ -193,6 +193,55 @@ pub async fn create_worktree(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+
+        // Handle "already checked out" — stale worktree from a crashed/timed-out run.
+        // Find and force-remove the stale worktree, then retry once.
+        if stderr.contains("already checked out") {
+            tracing::warn!(
+                branch = %branch_name,
+                "Branch already checked out in stale worktree, force-removing and retrying"
+            );
+            // git worktree list --porcelain to find which path has the branch
+            let list_out = Command::new("git")
+                .args(["-C", workspace_path.to_str().unwrap(), "worktree", "list", "--porcelain"])
+                .output().await.ok();
+            let list_str = list_out
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .unwrap_or_default();
+            // Parse: find worktree path that has this branch
+            let mut stale_path: Option<String> = None;
+            let mut current_wt: Option<String> = None;
+            for line in list_str.lines() {
+                if let Some(p) = line.strip_prefix("worktree ") {
+                    current_wt = Some(p.to_string());
+                } else if line == format!("branch refs/heads/{}", branch_name) {
+                    stale_path = current_wt.clone();
+                }
+            }
+            if let Some(stale) = stale_path {
+                tracing::warn!(stale = %stale, "Removing stale worktree");
+                let _ = Command::new("git")
+                    .args(["-C", workspace_path.to_str().unwrap(), "worktree", "remove", "--force", &stale])
+                    .status().await;
+                let _ = Command::new("git")
+                    .args(["-C", workspace_path.to_str().unwrap(), "worktree", "prune"])
+                    .status().await;
+                // Retry worktree add
+                let retry = Command::new("git")
+                    .args(&args)
+                    .output().await
+                    .map_err(|e| AppError::Internal(anyhow::anyhow!("git worktree add retry: {}", e)))?;
+                if retry.status.success() {
+                    tracing::info!(worktree = %worktree_path.display(), branch = %branch_name, "Worktree created after stale cleanup");
+                    return Ok(worktree_path);
+                }
+                let retry_err = String::from_utf8_lossy(&retry.stderr);
+                return Err(AppError::Internal(anyhow::anyhow!(
+                    "git worktree add failed after stale cleanup: {}", retry_err.trim()
+                )));
+            }
+        }
+
         tracing::error!(
             workspace = %workspace_path.display(),
             branch = %branch_name,
