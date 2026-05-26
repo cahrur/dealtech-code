@@ -1,4 +1,5 @@
 use axum::{extract::{Path, Query, State}, http::StatusCode, Extension, Json};
+use redis::AsyncCommands;
 use serde::Deserialize;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -27,6 +28,13 @@ pub async fn create(
     let run = run_orchestrator::create_run(
         &state.db, session_id, session.project_id, user_id, req, &project.openclaw_agent_id,
     ).await.map_err(AppError::Internal)?;
+
+    // Improvement 4: Publish to Redis channel so worker picks up immediately
+    {
+        let mut redis_conn = state.redis.clone();
+        let payload = serde_json::json!({"run_id": run.id}).to_string();
+        let _: std::result::Result<i64, _> = redis_conn.publish("agent_run:queued", &payload).await;
+    }
 
     // Load policy dari DB; fallback ke default jika belum dikonfigurasi
     let policy_config = {

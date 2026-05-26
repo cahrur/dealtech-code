@@ -7,7 +7,7 @@ use crate::config::Config;
 use crate::domain::agent_run::{AgentRun, CreateRunRequest};
 use crate::domain::policy::PolicyConfig;
 use crate::services::{
-    audit_service, file_action_service, git_service, openclaw_service, policy_engine::PolicyEngine,
+    audit_service, git_service, openclaw_service, policy_engine::PolicyEngine,
     realtime_service, workspace_service,
 };
 
@@ -27,8 +27,8 @@ pub async fn create_run(
     let session_key = format!("project_{}:run_{}", project_id, run_id);
     let run = sqlx::query_as::<_, AgentRun>(
         "INSERT INTO agent_runs
-         (id, session_id, project_id, user_id, prompt, status, auto_mode, openclaw_agent_id, openclaw_session_key, model)
-         VALUES ($1,$2,$3,$4,$5,'queued',$6,$7,$8,$9) RETURNING *",
+         (id, session_id, project_id, user_id, prompt, status, auto_mode, openclaw_agent_id, openclaw_session_key, model, timeout_at)
+         VALUES ($1,$2,$3,$4,$5,'queued',$6,$7,$8,$9, NOW() + INTERVAL '10 minutes') RETURNING *",
     )
     .bind(run_id).bind(session_id).bind(project_id).bind(user_id)
     .bind(&req.prompt).bind(&auto_mode).bind(openclaw_agent_id).bind(&session_key).bind(&model)
@@ -49,10 +49,14 @@ pub async fn execute_run(
 ) {
     if let Err(e) = run_inner(db.clone(), redis.clone(), config.clone(), run_id, team_slug.clone(), project_slug.clone(), repo_url, policy_config).await {
         tracing::error!(run_id = %run_id, error = %e, "Agent run failed");
+        let error_msg = {
+            let s = e.to_string();
+            if s.trim().is_empty() { "Unknown error".to_string() } else { s }
+        };
         let _ = sqlx::query(
             "UPDATE agent_runs SET status='failed_agent', finished_at=NOW(), error_message=$1 WHERE id=$2"
         )
-        .bind(e.to_string())
+        .bind(&error_msg)
         .bind(run_id)
         .execute(db.as_ref())
         .await;
@@ -109,6 +113,21 @@ async fn run_inner(
 
     let policy = PolicyEngine::new(policy_config);
     let (session_id, project_id, user_id) = (run.session_id, run.project_id, run.user_id);
+
+    // Improvement 2: Concurrency guard — only one active run per session
+    let concurrent_count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM agent_runs WHERE session_id=$1 AND status IN ('queued','processing','running_agent') AND id != $2"
+    )
+    .bind(session_id)
+    .bind(run_id)
+    .fetch_one(db.as_ref())
+    .await
+    .unwrap_or(0);
+
+    if concurrent_count > 0 {
+        let reply = "Masih ada run yang sedang berjalan di sesi ini. Tunggu sebentar lalu coba lagi.";
+        return finish_with_reply(db.as_ref(), &mut redis, run_id, session_id, reply, false).await;
+    }
 
     // Persist user message immediately so reopening a session still shows it
     let _ = crate::services::session_service::add_message(
@@ -188,15 +207,25 @@ async fn run_inner(
         history,
     };
 
-    let agent_reply = match openclaw_service::run_agent_full(&config, &input).await {
-        Ok(r) => {
+    let agent_reply = match tokio::time::timeout(
+        tokio::time::Duration::from_secs(600),
+        openclaw_service::run_agent_full(&config, &input),
+    ).await {
+        Ok(Ok(r)) => {
             tracing::info!(reply_len = r.reply.len(), actions = r.actions.len(), reply_preview = %&r.reply[..r.reply.len().min(200)], "OpenClaw reply");
             r.reply
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             tracing::error!("OpenClaw call failed: {:#}", e);
             let reply = "Agent tidak bisa diproses saat ini. Silakan coba lagi.".to_string();
             return finish_with_reply(db.as_ref(), &mut redis, run_id, session_id, &reply, true).await;
+        }
+        Err(_elapsed) => {
+            tracing::error!(run_id = %run_id, "OpenClaw call timed out after 10 minutes");
+            sqlx::query("UPDATE agent_runs SET error_message='Run timed out after 10 minutes' WHERE id=$1")
+                .bind(run_id).execute(db.as_ref()).await?;
+            let reply = "Run timed out after 10 minutes. Silakan coba lagi dengan prompt yang lebih sederhana.";
+            return finish_with_reply(db.as_ref(), &mut redis, run_id, session_id, reply, true).await;
         }
     };
 
@@ -297,9 +326,15 @@ async fn finish_with_reply(
 ) -> anyhow::Result<()> {
     let _ = crate::services::session_service::add_message(db, session_id, "assistant", reply).await;
     let status = if is_failure { "failed_agent" } else { "completed" };
-    set_status(db, run_id, status).await?;
-    sqlx::query("UPDATE agent_runs SET finished_at=NOW() WHERE id=$1")
-        .bind(run_id).execute(db).await?;
+    // Improvement 3: Always set error_message when is_failure=true
+    if is_failure {
+        let error_msg = if reply.trim().is_empty() { "Unknown error" } else { reply };
+        sqlx::query("UPDATE agent_runs SET status=$1, finished_at=NOW(), error_message=$2 WHERE id=$3")
+            .bind(status).bind(error_msg).bind(run_id).execute(db).await?;
+    } else {
+        sqlx::query("UPDATE agent_runs SET status=$1, finished_at=NOW() WHERE id=$2")
+            .bind(status).bind(run_id).execute(db).await?;
+    }
     let event = if is_failure { "agent_run.failed" } else { "agent_run.completed" };
     emit(db, redis, run_id, session_id, event,
         serde_json::json!({"run_id": run_id, "files_changed": 0})).await?;

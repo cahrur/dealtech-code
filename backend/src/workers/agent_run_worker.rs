@@ -8,9 +8,79 @@ use crate::domain::policy::PolicyConfig;
 use crate::services::run_orchestrator;
 
 pub async fn run(db: Arc<PgPool>, redis: ConnectionManager, config: Arc<Config>) {
+    // Spawn the pub/sub listener alongside the polling loop
+    let db2 = db.clone();
+    let redis2 = redis.clone();
+    let config2 = config.clone();
+    tokio::spawn(async move {
+        pubsub_listener(db2, redis2, config2).await;
+    });
+
+    // Polling loop as fallback (every 5 seconds)
     loop {
         if let Err(e) = process_queued(db.clone(), redis.clone(), config.clone()).await {
             tracing::error!("agent_run_worker error: {}", e);
+        }
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+    }
+}
+
+/// Listens to Redis pub/sub channel "agent_run:queued" for immediate processing
+async fn pubsub_listener(db: Arc<PgPool>, redis: ConnectionManager, config: Arc<Config>) {
+    use redis::Client;
+
+    // We need a separate connection for pub/sub (can't reuse ConnectionManager)
+    let redis_url = config.redis_url();
+    let client = match Client::open(redis_url.as_str()) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("Failed to create Redis client for pubsub: {}", e);
+            return;
+        }
+    };
+
+    loop {
+        match client.get_async_pubsub().await {
+            Ok(mut pubsub) => {
+                if let Err(e) = pubsub.subscribe("agent_run:queued").await {
+                    tracing::error!("Failed to subscribe to agent_run:queued: {}", e);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                    continue;
+                }
+                tracing::info!("Subscribed to agent_run:queued channel");
+
+                use futures_util::StreamExt;
+                let mut msg_stream = pubsub.on_message();
+
+                while let Some(msg) = msg_stream.next().await {
+                    let payload: String = match msg.get_payload() {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    };
+
+                    // Parse run_id from payload
+                    let run_id: Option<uuid::Uuid> = serde_json::from_str::<serde_json::Value>(&payload)
+                        .ok()
+                        .and_then(|v| v.get("run_id")?.as_str().map(|s| s.to_string()))
+                        .and_then(|s| s.parse().ok());
+
+                    if let Some(_run_id) = run_id {
+                        // Process queued runs immediately
+                        let db3 = db.clone();
+                        let redis3 = redis.clone();
+                        let config3 = config.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = process_queued(db3, redis3, config3).await {
+                                tracing::error!("agent_run_worker (pubsub trigger) error: {}", e);
+                            }
+                        });
+                    }
+                }
+                tracing::warn!("pubsub stream ended, reconnecting...");
+            }
+            Err(e) => {
+                tracing::error!("Failed to get pubsub connection: {}", e);
+            }
         }
         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
     }
@@ -58,7 +128,7 @@ async fn process_queued(
             })
             .unwrap_or_default();
 
-            // Mark as processing immediately to prevent duplicate pickup on next poll
+            // Mark as processing immediately to prevent duplicate pickup
             let updated = sqlx::query_scalar::<_, i64>(
                 "UPDATE agent_runs SET status='processing' WHERE id=$1 AND status='queued' RETURNING 1"
             )

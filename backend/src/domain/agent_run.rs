@@ -68,6 +68,8 @@ pub struct AgentRun {
     #[serde(with = "time::serde::rfc3339::option")]
     pub finished_at: Option<OffsetDateTime>,
     pub error_message: Option<String>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub timeout_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
 }

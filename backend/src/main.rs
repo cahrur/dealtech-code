@@ -42,9 +42,14 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     tokio::spawn(workers::agent_run_worker::run(
+        db_arc.clone(),
+        redis.clone(),
+        config_arc.clone(),
+    ));
+
+    tokio::spawn(workers::stuck_run_recovery::run(
         db_arc,
         redis.clone(),
-        config_arc,
     ));
 
     let app = http::routes::app_router(state);
