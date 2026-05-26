@@ -150,6 +150,8 @@ async fn handle_command(
         "/project" => cmd_set_project(client, config, db, tg_user, chat_id, &parts).await?,
         "/status" => cmd_status(client, config, db, tg_user, chat_id).await?,
         "/help" => cmd_help(client, config, db, tg_user, chat_id).await?,
+        "/cost" => cmd_cost(client, config, db, tg_user, chat_id, &parts).await?,
+        "/diff" => cmd_diff(client, config, db, tg_user, chat_id).await?,
         "/adduser" => cmd_adduser(client, config, db, tg_user, chat_id, &parts).await?,
         "/removeuser" => cmd_removeuser(client, config, db, tg_user, chat_id, &parts).await?,
         "/newproject" => cmd_newproject(client, config, db, tg_user, chat_id, &parts).await?,
@@ -292,6 +294,8 @@ async fn cmd_help(client: &Client, config: &Config, db: &PgPool, tg_user: &Teleg
         /project <slug> — Pilih project aktif\n\
         /newproject <nama> <repo_url> — Buat project baru\n\
         /status — Lihat status saat ini\n\
+        /cost [period] — Lihat biaya (today|yesterday|month|lastmonth|year|all)\n\
+        /diff — Lihat diff commit terakhir\n\
         /help — Tampilkan bantuan ini{admin_section}\n\n\
         Kirim pesan biasa untuk memulai coding dengan AI agent.",
         admin_section = admin_section
@@ -488,6 +492,184 @@ async fn cmd_newproject(
     Ok(())
 }
 
+async fn cmd_cost(
+    client: &Client,
+    config: &Config,
+    db: &PgPool,
+    tg_user: &TelegramDbUser,
+    chat_id: i64,
+    parts: &[&str],
+) -> anyhow::Result<()> {
+    let period = parts.get(1).unwrap_or(&"today").trim();
+    let (period_filter, period_label) = match period {
+        "today" => ("created_at >= CURRENT_DATE", "Hari Ini"),
+        "yesterday" => ("created_at >= CURRENT_DATE - INTERVAL '1 day' AND created_at < CURRENT_DATE", "Kemarin"),
+        "month" => ("DATE_TRUNC('month', created_at) = DATE_TRUNC('month', NOW())", "Bulan Ini"),
+        "lastmonth" => ("DATE_TRUNC('month', created_at) = DATE_TRUNC('month', NOW() - INTERVAL '1 month')", "Bulan Lalu"),
+        "year" => ("DATE_TRUNC('year', created_at) = DATE_TRUNC('year', NOW())", "Tahun Ini"),
+        "all" => ("1=1", "Semua"),
+        _ => {
+            send_message(client, &config.telegram_bot_token, chat_id,
+                "❓ Period tidak valid. Gunakan: today | yesterday | month | lastmonth | year | all").await?;
+            return Ok(());
+        }
+    };
+
+    let query = format!(
+        "SELECT \
+            COALESCE(COUNT(*), 0) as total_runs, \
+            COALESCE(SUM(tokens_input), 0) as total_input, \
+            COALESCE(SUM(tokens_output), 0) as total_output, \
+            COALESCE(SUM(cost_usd), 0)::FLOAT8 as total_cost, \
+            COALESCE(COUNT(*) FILTER (WHERE status = 'completed'), 0) as completed_runs, \
+            COALESCE(COUNT(*) FILTER (WHERE status = 'failed_agent'), 0) as failed_runs \
+         FROM agent_runs WHERE user_id = $1 AND {}",
+        period_filter
+    );
+
+    let row = sqlx::query_as::<_, (i64, i64, i64, f64, i64, i64)>(&query)
+        .bind(tg_user.user_id)
+        .fetch_one(db)
+        .await?;
+
+    let (total_runs, total_input, total_output, total_cost, completed_runs, failed_runs) = row;
+
+    let reply = format!(
+        "💰 Cost Report — {}\n\n\
+         ✅ Run selesai: {}\n\
+         ❌ Run gagal: {}\n\
+         📊 Total run: {}\n\n\
+         🔤 Token input:  {}\n\
+         🔤 Token output: {}\n\
+         💵 Estimasi biaya: ${:.4}\n\n\
+         Gunakan /cost <period> untuk periode lain:\n\
+         today | yesterday | month | lastmonth | year | all",
+        period_label, completed_runs, failed_runs, total_runs,
+        format_number(total_input), format_number(total_output), total_cost
+    );
+
+    send_message(client, &config.telegram_bot_token, chat_id, &reply).await?;
+    Ok(())
+}
+
+fn format_number(n: i64) -> String {
+    let s = n.to_string();
+    let mut result = String::new();
+    for (i, c) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            result.push(',');
+        }
+        result.push(c);
+    }
+    result.chars().rev().collect()
+}
+
+async fn cmd_diff(
+    client: &Client,
+    config: &Config,
+    db: &PgPool,
+    tg_user: &TelegramDbUser,
+    chat_id: i64,
+) -> anyhow::Result<()> {
+    // Find last completed run for this user
+    let last_run = sqlx::query_as::<_, (Uuid, Option<String>, Option<String>)>(
+        "SELECT id, worktree_path, branch_name FROM agent_runs \
+         WHERE user_id = $1 AND status = 'completed' AND commit_sha IS NOT NULL \
+         ORDER BY finished_at DESC LIMIT 1"
+    )
+    .bind(tg_user.user_id)
+    .fetch_optional(db)
+    .await?;
+
+    let (_run_id, worktree_path, _branch) = match last_run {
+        Some(r) => r,
+        None => {
+            send_message(client, &config.telegram_bot_token, chat_id,
+                "Belum ada run yang selesai dengan commit.").await?;
+            return Ok(());
+        }
+    };
+
+    // Get workspace path from project config
+    let workspace_from_project = if let Some(pid) = tg_user.active_project_id {
+        let slug = sqlx::query_scalar::<_, String>(
+            "SELECT slug FROM projects WHERE id = $1"
+        ).bind(pid).fetch_optional(db).await?.unwrap_or_default();
+        if !slug.is_empty() {
+            Some(format!("{}/default/{}", config.workspaces_path, slug))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Try worktree_path first, then workspace from project
+    let diff_path = worktree_path
+        .or(workspace_from_project)
+        .unwrap_or_default();
+
+    if diff_path.is_empty() {
+        send_message(client, &config.telegram_bot_token, chat_id,
+            "Tidak bisa menemukan workspace untuk diff.").await?;
+        return Ok(());
+    }
+
+    // Run git diff
+    let output = tokio::process::Command::new("git")
+        .args(["-C", &diff_path, "diff", "HEAD~1", "HEAD"])
+        .output()
+        .await;
+
+    let diff_text = match output {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr);
+            send_message(client, &config.telegram_bot_token, chat_id,
+                &format!("Git diff gagal: {}", err)).await?;
+            return Ok(());
+        }
+        Err(e) => {
+            send_message(client, &config.telegram_bot_token, chat_id,
+                &format!("Error menjalankan git: {}", e)).await?;
+            return Ok(());
+        }
+    };
+
+    if diff_text.trim().is_empty() {
+        send_message(client, &config.telegram_bot_token, chat_id,
+            "Tidak ada diff untuk commit terakhir.").await?;
+        return Ok(());
+    }
+
+    if diff_text.len() <= 3000 {
+        let msg = format!("```diff\n{}\n```", diff_text);
+        send_message(client, &config.telegram_bot_token, chat_id, &msg).await?;
+    } else {
+        // Send as file
+        send_document(client, &config.telegram_bot_token, chat_id, "diff.patch", diff_text.as_bytes()).await?;
+    }
+    Ok(())
+}
+
+async fn send_document(
+    client: &Client,
+    token: &str,
+    chat_id: i64,
+    filename: &str,
+    content: &[u8],
+) -> anyhow::Result<()> {
+    let url = format!("https://api.telegram.org/bot{}/sendDocument", token);
+    let part = reqwest::multipart::Part::bytes(content.to_vec())
+        .file_name(filename.to_string())
+        .mime_str("text/plain")?;
+    let form = reqwest::multipart::Form::new()
+        .text("chat_id", chat_id.to_string())
+        .part("document", part);
+    client.post(&url).multipart(form).send().await?;
+    Ok(())
+}
+
 async fn is_admin_user(db: &PgPool, tg_user: &TelegramDbUser) -> anyhow::Result<bool> {
     let role = sqlx::query_scalar::<_, String>("SELECT role FROM users WHERE id = $1")
         .bind(tg_user.user_id)
@@ -549,7 +731,7 @@ async fn handle_regular_message(
     };
 
     let run = run_orchestrator::create_run(
-        db, session_id, project_id, tg_user.user_id, req, &openclaw_agent_id,
+        db, session_id, project_id, tg_user.user_id, req, &openclaw_agent_id, Some(chat_id),
     ).await?;
 
     // Load policy

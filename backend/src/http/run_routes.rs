@@ -42,7 +42,7 @@ pub async fn create(
     project_service::check_member(&state.db, session.project_id, user_id).await?;
 
     let run = run_orchestrator::create_run(
-        &state.db, session_id, session.project_id, user_id, req, &project.openclaw_agent_id,
+        &state.db, session_id, session.project_id, user_id, req, &project.openclaw_agent_id, None,
     ).await.map_err(AppError::Internal)?;
 
     // Improvement 4: Publish to Redis channel so worker picks up immediately

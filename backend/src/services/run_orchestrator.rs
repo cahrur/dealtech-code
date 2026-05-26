@@ -18,6 +18,7 @@ pub async fn create_run(
     user_id: Uuid,
     req: CreateRunRequest,
     openclaw_agent_id: &str,
+    telegram_chat_id: Option<i64>,
 ) -> anyhow::Result<AgentRun> {
     let run_id = Uuid::new_v4();
     let auto_mode = req.auto_mode.unwrap_or_else(|| "auto_trusted".to_string());
@@ -27,11 +28,12 @@ pub async fn create_run(
     let session_key = format!("project_{}:run_{}", project_id, run_id);
     let run = sqlx::query_as::<_, AgentRun>(
         "INSERT INTO agent_runs
-         (id, session_id, project_id, user_id, prompt, status, auto_mode, openclaw_agent_id, openclaw_session_key, model, timeout_at)
-         VALUES ($1,$2,$3,$4,$5,'queued',$6,$7,$8,$9, NOW() + INTERVAL '10 minutes') RETURNING *",
+         (id, session_id, project_id, user_id, prompt, status, auto_mode, openclaw_agent_id, openclaw_session_key, model, timeout_at, telegram_chat_id)
+         VALUES ($1,$2,$3,$4,$5,'queued',$6,$7,$8,$9, NOW() + INTERVAL '10 minutes', $10) RETURNING *",
     )
     .bind(run_id).bind(session_id).bind(project_id).bind(user_id)
     .bind(&req.prompt).bind(&auto_mode).bind(openclaw_agent_id).bind(&session_key).bind(&model)
+    .bind(telegram_chat_id)
     .fetch_one(db)
     .await?;
     Ok(run)
@@ -300,18 +302,64 @@ async fn run_inner(
         db.as_ref(), session_id, "assistant", &final_reply,
     ).await;
 
+    // Cost tracking: estimate tokens from reply length
+    let tokens_output = (agent_reply.len() as i32) / 4; // rough estimate: 4 chars per token
+    let tokens_input = (run.prompt.len() as i32) / 4;
+    let cost_usd = (tokens_input as f64) * 0.000003 + (tokens_output as f64) * 0.000015;
+
+    // Diff stat: get git diff --stat for completed run
+    let diff_stat_output = if commit_sha.is_some() {
+        let stat_out = tokio::process::Command::new("git")
+            .args(["-C", worktree.to_str().unwrap_or(""), "diff", "HEAD~1", "HEAD", "--stat"])
+            .output()
+            .await
+            .ok();
+        stat_out.map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .filter(|s| !s.trim().is_empty())
+    } else {
+        None
+    };
+
     set_status(&db, run_id, "completed").await?;
-    sqlx::query("UPDATE agent_runs SET finished_at=NOW() WHERE id=$1")
-        .bind(run_id).execute(db.as_ref()).await?;
+    sqlx::query(
+        "UPDATE agent_runs SET finished_at=NOW(), tokens_input=$1, tokens_output=$2, cost_usd=$3, diff_stat=$4 WHERE id=$5"
+    )
+    .bind(tokens_input)
+    .bind(tokens_output)
+    .bind(cost_usd)
+    .bind(&diff_stat_output)
+    .bind(run_id)
+    .execute(db.as_ref())
+    .await?;
+
     emit(&db, &mut redis, run_id, session_id, "agent_run.completed",
         serde_json::json!({"run_id": run_id, "files_changed": changed.len()})).await?;
+
+    // Publish to Redis channel for Telegram notification
+    if let Some(ref diff_stat_str) = diff_stat_output {
+        let tg_chat_id = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT telegram_chat_id FROM agent_runs WHERE id = $1"
+        ).bind(run_id).fetch_one(db.as_ref()).await.unwrap_or(None);
+        if let Some(chat_id) = tg_chat_id {
+            let notify_payload = serde_json::json!({
+                "run_id": run_id.to_string(),
+                "chat_id": chat_id,
+                "diff_stat": diff_stat_str,
+            });
+            let _: std::result::Result<(), _> = redis::cmd("PUBLISH")
+                .arg("agent_run:completed")
+                .arg(notify_payload.to_string())
+                .query_async(&mut redis)
+                .await;
+        }
+    }
 
     audit_service::log(db.as_ref(), Some(user_id), Some(project_id), Some(run_id),
         "agent_run.completed",
         serde_json::json!({"branch": branch_name, "files": changed})).await?;
 
     let _ = crate::services::usage_service::record(
-        db.as_ref(), Some(user_id), Some(run_id), &run.model, 0, 0,
+        db.as_ref(), Some(user_id), Some(run_id), &run.model, tokens_input as i64, tokens_output as i64,
     ).await;
 
     // Cleanup worktree after run completes (branch is kept for session reuse)

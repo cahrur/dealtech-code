@@ -70,6 +70,11 @@ pub struct AgentRun {
     pub error_message: Option<String>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub timeout_at: Option<OffsetDateTime>,
+    pub tokens_input: i32,
+    pub tokens_output: i32,
+    pub cost_usd: f64,
+    pub diff_stat: Option<String>,
+    pub telegram_chat_id: Option<i64>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
 }
