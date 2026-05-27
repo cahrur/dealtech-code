@@ -243,6 +243,11 @@ services:
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
     ports:
       - "80:80"
       - "443:443"
@@ -260,6 +265,11 @@ services:
       context: ./app/backend
       dockerfile: Dockerfile
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "10"
     env_file: .env
     ports:
       - "127.0.0.1:8080:8080"
@@ -285,6 +295,11 @@ services:
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
     environment:
       POSTGRES_DB: ${DB_NAME}
       POSTGRES_USER: ${DB_USER}
@@ -301,6 +316,11 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
     command: >
       redis-server
       --appendonly yes
