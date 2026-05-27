@@ -144,7 +144,6 @@ install_deps() {
 create_dirs() {
   section "Creating directory structure"
   local dirs=(
-    "$APP_DIR/backend"
     "$DATA_DIR/postgres/init"
     "$DATA_DIR/redis"
     "$WORKSPACES_DIR"
@@ -381,12 +380,12 @@ setup_firewall() {
 
 # ─── Backend Dockerfile placeholder ──────────────────────────────────────────
 write_backend_placeholder() {
-  section "Writing backend Dockerfile placeholder"
-  local dockerfile="$APP_DIR/backend/Dockerfile"
-  if [[ -f "$dockerfile" ]]; then
-    info "Dockerfile already exists — skipping"
+  # Skip placeholder if backend is already a symlink or has real source
+  if [[ -L "$APP_DIR/backend" || -f "$APP_DIR/backend/Cargo.toml" ]]; then
+    info "Backend source already present — skipping placeholder"
     return
   fi
+  section "Writing backend Dockerfile placeholder"
   cat > "$dockerfile" <<'EOF'
 # Build stage
 FROM rust:1.78-slim-bookworm AS builder
@@ -492,11 +491,22 @@ start_services() {
 
   log "Infrastructure services running"
 
-  # Copy backend source from repo
+  # Link backend source from repo (symlink so no manual sync needed)
   if [[ -d "$REPO_DIR/backend" ]]; then
-    info "Copying backend source from repo..."
-    cp -r "$REPO_DIR/backend/"* "$APP_DIR/backend/"
-    log "Backend source copied"
+    if [[ -L "$APP_DIR/backend" ]]; then
+      info "Backend symlink already exists — skipping"
+    elif [[ -d "$APP_DIR/backend" ]]; then
+      warn "$APP_DIR/backend is a directory, replacing with symlink..."
+      rm -rf "$APP_DIR/backend"
+      ln -s "$REPO_DIR/backend" "$APP_DIR/backend"
+      log "Backend symlink created: $APP_DIR/backend -> $REPO_DIR/backend"
+    else
+      ln -s "$REPO_DIR/backend" "$APP_DIR/backend"
+      log "Backend symlink created: $APP_DIR/backend -> $REPO_DIR/backend"
+    fi
+  else
+    warn "Backend source not found at $REPO_DIR/backend — creating $APP_DIR/backend as directory"
+    mkdir -p "$APP_DIR/backend"
   fi
 
   # Build and start backend
