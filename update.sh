@@ -23,10 +23,19 @@ info "Pulling latest code from GitHub..."
 git -C "$REPO_DIR" pull
 log "Code updated"
 
-# 2. Copy backend source
-info "Copying backend source..."
-cp -r "$REPO_DIR/backend/"* "$PLATFORM_DIR/app/backend/"
-log "Backend source copied"
+# 2. Ensure backend symlink is in place (replaces old cp -r approach)
+info "Checking backend symlink..."
+if [[ -L "$PLATFORM_DIR/app/backend" ]]; then
+    log "Backend symlink already in place"
+elif [[ -d "$PLATFORM_DIR/app/backend" ]]; then
+    warn "$PLATFORM_DIR/app/backend is a directory (old install). Replacing with symlink..."
+    rm -rf "$PLATFORM_DIR/app/backend"
+    ln -s "$REPO_DIR/backend" "$PLATFORM_DIR/app/backend"
+    log "Backend symlink created"
+else
+    ln -s "$REPO_DIR/backend" "$PLATFORM_DIR/app/backend"
+    log "Backend symlink created"
+fi
 
 # 3. Rebuild backend
 info "Rebuilding backend Docker image..."
