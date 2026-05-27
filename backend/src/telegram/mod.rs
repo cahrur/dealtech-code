@@ -152,6 +152,8 @@ async fn handle_command(
         "/newproject" => cmd_newproject(client, config, db, tg_user, chat_id, &parts).await?,
         "/cancel" => cmd_cancel(client, config, db, tg_user, chat_id, &mut redis).await?,
         "/retry" => cmd_retry(client, config, db, tg_user, chat_id, &mut redis).await?,
+        "/diff" => cmd_diff(client, config, db, tg_user, chat_id).await?,
+        "/pr" => cmd_pr(client, config, db, tg_user, chat_id).await?,
         "/backup" => cmd_backup(client, config, db, tg_user, chat_id).await?,
         "/newsession" => cmd_newsession(client, config, db, tg_user, chat_id, &mut redis).await?,
         "/runs" => cmd_runs(client, config, db, tg_user, chat_id).await?,
@@ -778,6 +780,129 @@ async fn cmd_runs(
     Ok(())
 }
 
+async fn cmd_diff(
+    client: &Client,
+    config: &Config,
+    db: &PgPool,
+    tg_user: &TelegramDbUser,
+    chat_id: i64,
+) -> anyhow::Result<()> {
+    let project_id = match tg_user.active_project_id {
+        Some(id) => id,
+        None => {
+            send_message(client, &config.telegram_bot_token, chat_id,
+                "⚠️ Pilih project dulu dengan /project <slug>.").await?;
+            return Ok(());
+        }
+    };
+
+    // Get last completed run with a commit for this user+project
+    let row = sqlx::query_as::<_, (uuid::Uuid, Option<String>, Option<String>, Option<String>)>(
+        "SELECT id, commit_sha, diff_stat, branch_name \
+         FROM agent_runs \
+         WHERE user_id=$1 AND project_id=$2 AND status='completed' AND commit_sha IS NOT NULL \
+         ORDER BY finished_at DESC LIMIT 1"
+    )
+    .bind(tg_user.user_id)
+    .bind(project_id)
+    .fetch_optional(db)
+    .await?;
+
+    match row {
+        None => {
+            send_message(client, &config.telegram_bot_token, chat_id,
+                "ℹ️ Belum ada run yang menghasilkan commit.").await?;
+        }
+        Some((run_id, commit_sha, diff_stat, branch_name)) => {
+            let sha_short = commit_sha.as_deref().unwrap_or("-");
+            let sha_display = if sha_short.len() >= 8 { &sha_short[..8] } else { sha_short };
+            let branch = branch_name.as_deref().unwrap_or("-");
+
+            let body = match diff_stat {
+                Some(ref stat) if !stat.trim().is_empty() => {
+                    // Truncate if too long for Telegram (max 4096 chars)
+                    let stat_trimmed = if stat.len() > 3000 {
+                        format!("{}\n...(terpotong)", &stat[..3000])
+                    } else {
+                        stat.clone()
+                    };
+                    format!(
+                        "📄 *Diff run terakhir*\n\
+                        🌿 Branch: `{}`\n\
+                        🔖 Commit: `{}`\n\
+                        🆔 Run: `{}`\n\n\
+                        ```\n{}```",
+                        branch, sha_display, &run_id.to_string()[..8], stat_trimmed
+                    )
+                }
+                _ => {
+                    format!(
+                        "📄 *Diff run terakhir*\n\
+                        🌿 Branch: `{}`\n\
+                        🔖 Commit: `{}`\n\n\
+                        _(diff stat tidak tersedia untuk run ini)_",
+                        branch, sha_display
+                    )
+                }
+            };
+            send_message(client, &config.telegram_bot_token, chat_id, &body).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_pr(
+    client: &Client,
+    config: &Config,
+    db: &PgPool,
+    tg_user: &TelegramDbUser,
+    chat_id: i64,
+) -> anyhow::Result<()> {
+    let project_id = match tg_user.active_project_id {
+        Some(id) => id,
+        None => {
+            send_message(client, &config.telegram_bot_token, chat_id,
+                "⚠️ Pilih project dulu dengan /project <slug>.").await?;
+            return Ok(());
+        }
+    };
+
+    // Get last 3 runs with a PR for this project
+    let rows = sqlx::query_as::<_, (uuid::Uuid, Option<String>, Option<i32>, Option<String>, String)>(
+        "SELECT id, pr_url, pr_number, branch_name, prompt \
+         FROM agent_runs \
+         WHERE project_id=$1 AND pr_url IS NOT NULL \
+         ORDER BY finished_at DESC LIMIT 3"
+    )
+    .bind(project_id)
+    .fetch_all(db)
+    .await?;
+
+    if rows.is_empty() {
+        send_message(client, &config.telegram_bot_token, chat_id,
+            "ℹ️ Belum ada PR yang dibuat untuk project ini.").await?;
+        return Ok(());
+    }
+
+    let mut reply = "🔗 *Pull Requests terbaru*\n".to_string();
+    for (run_id, pr_url, pr_number, branch_name, prompt) in rows {
+        let num = pr_number.map(|n| format!("#{}", n)).unwrap_or_else(|| "-".to_string());
+        let branch = branch_name.as_deref().unwrap_or("-");
+        let prompt_short: String = prompt.chars().take(50).collect();
+        let url = pr_url.as_deref().unwrap_or("-");
+        reply.push_str(&format!(
+            "\n🟢 PR {} — `{}`\n\
+            💬 _{}_\n\
+            🔗 {}\n",
+            num, branch, prompt_short, url
+        ));
+        let _ = run_id; // suppress unused warning
+    }
+
+    send_message(client, &config.telegram_bot_token, chat_id, &reply).await?;
+    Ok(())
+}
+
 async fn cmd_help(
     client: &Client,
     config: &Config,
@@ -793,6 +918,8 @@ async fn cmd_help(
         /project <slug> — Pilih project aktif\n\
         /newproject <nama> <repo_url> — Tambah project baru\n\
         /runs — Lihat 10 run terakhir\n\
+        /diff — Lihat file yang diubah di run terakhir\n\
+        /pr — Lihat PR terbaru project ini\n\
         /newsession — Mulai session baru (branch baru)\n\
         /retry — Ulangi run terakhir yang gagal\n\
         /cancel — Batalkan run yang sedang berjalan\n\
