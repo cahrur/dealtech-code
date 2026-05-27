@@ -156,7 +156,7 @@ async fn handle_command(
         "/newsession" => cmd_newsession(client, config, db, tg_user, chat_id, &mut redis).await?,
         "/runs" => cmd_runs(client, config, db, tg_user, chat_id).await?,
         "/status" => cmd_status(client, config, db, tg_user, chat_id).await?,
-        "/help" => cmd_help(client, config, chat_id).await?,
+        "/help" => cmd_help(client, config, db, &tg_user, chat_id).await?,
         "/adduser" => cmd_adduser(client, config, db, tg_user, chat_id, &parts).await?,
         "/removeuser" => cmd_removeuser(client, config, db, tg_user, chat_id, &parts).await?,
         _ => {
@@ -778,8 +778,16 @@ async fn cmd_runs(
     Ok(())
 }
 
-async fn cmd_help(client: &Client, config: &Config, chat_id: i64) -> anyhow::Result<()> {
-    let reply = "🤖 Dealtech Code AI Agent\n\n\
+async fn cmd_help(
+    client: &Client,
+    config: &Config,
+    db: &PgPool,
+    tg_user: &TelegramDbUser,
+    chat_id: i64,
+) -> anyhow::Result<()> {
+    let is_admin = is_admin_user(db, tg_user).await.unwrap_or(false);
+
+    let mut reply = "🤖 *Dealtech Code AI Agent*\n\n\
         /start — Mulai\n\
         /projects — Lihat daftar project\n\
         /project <slug> — Pilih project aktif\n\
@@ -790,12 +798,17 @@ async fn cmd_help(client: &Client, config: &Config, chat_id: i64) -> anyhow::Res
         /cancel — Batalkan run yang sedang berjalan\n\
         /status — Lihat status saat ini\n\
         /help — Tampilkan bantuan ini\n\n\
-        Admin:\n\
-        /adduser <telegram_id> <nama> — Tambah user\n\
-        /removeuser <telegram_id> — Hapus user\n\
-        /backup — Backup database (kirim via Telegram)\n\n\
-        Kirim pesan biasa untuk memulai coding dengan AI agent.";
-    send_message(client, &config.telegram_bot_token, chat_id, reply).await?;
+        Kirim pesan biasa untuk memulai coding dengan AI agent."
+        .to_string();
+
+    if is_admin {
+        reply.push_str("\n\n─── *Admin* ───\n\
+            /adduser <telegram_id> <nama> — Tambah user\n\
+            /removeuser <telegram_id> — Hapus user\n\
+            /backup — Backup database (kirim via Telegram)");
+    }
+
+    send_message(client, &config.telegram_bot_token, chat_id, &reply).await?;
     Ok(())
 }
 
