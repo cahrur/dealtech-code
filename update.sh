@@ -8,9 +8,10 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 PLATFORM_DIR="/srv/ai-platform"
 
-GREEN='\033[0;32m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+GREEN='GREEN='\033[0;32m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'33[0;32m'; CYAN='GREEN='\033[0;32m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'33[0;36m'; YELLOW='GREEN='\033[0;32m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'33[1;33m'; BOLD='GREEN='\033[0;32m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'33[1m'; NC='GREEN='\033[0;32m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'33[0m'
 log()  { echo -e "${GREEN}[✓]${NC} $1"; }
 info() { echo -e "${CYAN}[i]${NC} $1"; }
+warn() { echo -e "${YELLOW}[!]${NC} $1"; }
 
 echo -e "${BOLD}${CYAN}"
 echo "╔══════════════════════════════════════╗"
@@ -96,3 +97,34 @@ echo ""
 echo "Cek status:"
 echo "  docker compose ps"
 echo "  docker compose logs -f backend"
+
+# 6. Ensure new env vars are present (added in recent updates)
+info "Checking for missing env vars in .env..."
+ENV_FILE="$PLATFORM_DIR/.env"
+ADDED=0
+
+add_env_if_missing() {
+    local key="$1"
+    local default_val="$2"
+    local comment="$3"
+    if ! grep -q "^${key}=" "$ENV_FILE" 2>/dev/null; then
+        echo "" >> "$ENV_FILE"
+        echo "# $comment" >> "$ENV_FILE"
+        echo "${key}=${default_val}" >> "$ENV_FILE"
+        warn "Ditambahkan ke .env: ${key}=${default_val}"
+        ADDED=1
+    fi
+}
+
+add_env_if_missing "CORS_ORIGIN"               "*"           "Allowed CORS origins (* = all, atau pisah koma)"
+add_env_if_missing "DISK_ALERT_THRESHOLD_PCT"  "85"          "Alert disk ke Telegram saat usage >= nilai ini (%)"
+add_env_if_missing "TELEGRAM_ADMIN_CHAT_ID"    ""            "Chat ID admin untuk disk alert dan backup otomatis"
+add_env_if_missing "BACKUP_HOUR_UTC"           "18"          "Jam backup harian (UTC). 18 = 01:00 WIB"
+
+if [[ $ADDED -eq 1 ]]; then
+    warn "Env vars baru ditambahkan. Isi nilai yang kosong di $ENV_FILE lalu restart:"
+    warn "  nano $ENV_FILE"
+    warn "  docker compose restart backend"
+else
+    log "Semua env vars sudah lengkap"
+fi
