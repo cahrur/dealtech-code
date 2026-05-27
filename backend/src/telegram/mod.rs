@@ -266,20 +266,137 @@ async fn cmd_status(
     tg_user: &TelegramDbUser,
     chat_id: i64,
 ) -> anyhow::Result<()> {
-    let project_info = if let Some(pid) = tg_user.active_project_id {
+    let is_admin = is_admin_user(db, tg_user).await.unwrap_or(false);
+
+    // ── Info project aktif ─────────────────────────────────────────────────────────────
+    let (project_name, project_slug, active_branch) = if let Some(pid) = tg_user.active_project_id {
         let row = sqlx::query_as::<_, (String, String)>(
             "SELECT name, slug FROM projects WHERE id = $1"
         ).bind(pid).fetch_optional(db).await?;
+        let branch = sqlx::query_scalar::<_, String>(
+            "SELECT active_branch FROM coding_sessions \
+             WHERE project_id=$1 AND user_id=$2 AND active_branch IS NOT NULL \
+             ORDER BY created_at DESC LIMIT 1"
+        ).bind(pid).bind(tg_user.user_id).fetch_optional(db).await?.unwrap_or_else(|| "-".to_string());
         match row {
-            Some((name, slug)) => format!("📂 Project: {} ({})\n", name, slug),
-            None => "📂 Project: (tidak ditemukan)\n".to_string(),
+            Some((n, s)) => (n, s, branch),
+            None => ("(tidak ditemukan)".to_string(), "-".to_string(), "-".to_string()),
         }
     } else {
-        "📂 Project: belum dipilih\n".to_string()
+        ("belum dipilih".to_string(), "-".to_string(), "-".to_string())
     };
-    let reply = format!("📊 Status\n\n{}👤 User: {}", project_info, tg_user.name);
+
+    // ── Run stats user ini ─────────────────────────────────────────────────────────────
+    let (runs_today, cost_today, active_run_status) = if let Some(pid) = tg_user.active_project_id {
+        let runs: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_runs WHERE user_id=$1 AND project_id=$2 AND created_at > NOW() - INTERVAL '24 hours'"
+        ).bind(tg_user.user_id).bind(pid).fetch_one(db).await.unwrap_or(0);
+
+        let cost: f64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(cost_usd), 0) FROM agent_runs WHERE user_id=$1 AND project_id=$2 AND created_at > NOW() - INTERVAL '24 hours'"
+        ).bind(tg_user.user_id).bind(pid).fetch_one(db).await.unwrap_or(0.0);
+
+        let active: Option<String> = sqlx::query_scalar(
+            "SELECT status FROM agent_runs WHERE user_id=$1 AND project_id=$2 \
+             AND status NOT IN ('completed','failed_agent','cancelled','timed_out') \
+             ORDER BY created_at DESC LIMIT 1"
+        ).bind(tg_user.user_id).bind(pid).fetch_optional(db).await.unwrap_or(None);
+
+        (runs, cost, active)
+    } else {
+        (0, 0.0, None)
+    };
+
+    // ── Build user reply ───────────────────────────────────────────────────────────────
+    let run_status_line = match &active_run_status {
+        Some(s) => format!("\n⏳ Run aktif: {}", s),
+        None => String::new(),
+    };
+
+    let mut reply = format!(
+        "📊 *Status*\n\n\
+        👤 User: {}\n\
+        📂 Project: {} ({})\n\
+        🌿 Branch: `{}`{}\n\n\
+        📅 Runs hari ini: {}\n\
+        💰 Cost hari ini: ${:.4}",
+        tg_user.name,
+        project_name, project_slug,
+        active_branch,
+        run_status_line,
+        runs_today,
+        cost_today,
+    );
+
+    // ── Admin section ───────────────────────────────────────────────────────────────
+    if is_admin {
+        let total_users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM telegram_users")
+            .fetch_one(db).await.unwrap_or(0);
+        let total_projects: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM projects")
+            .fetch_one(db).await.unwrap_or(0);
+        let total_runs_today: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_runs WHERE created_at > NOW() - INTERVAL '24 hours'"
+        ).fetch_one(db).await.unwrap_or(0);
+        let total_cost_today: f64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(cost_usd), 0) FROM agent_runs WHERE created_at > NOW() - INTERVAL '24 hours'"
+        ).fetch_one(db).await.unwrap_or(0.0);
+        let active_runs: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_runs WHERE status NOT IN ('completed','failed_agent','cancelled','timed_out')"
+        ).fetch_one(db).await.unwrap_or(0);
+        let total_cost_all: f64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(cost_usd), 0) FROM agent_runs"
+        ).fetch_one(db).await.unwrap_or(0.0);
+
+        // Disk usage
+        let disk_info = get_disk_summary();
+
+        reply.push_str(&format!(
+            "\n\n─── *Admin Panel* ───\n\
+            👥 Total users: {}\n\
+            📁 Total projects: {}\n\
+            ⚡ Active runs: {}\n\
+            📅 Runs hari ini (semua): {}\n\
+            💰 Cost hari ini (semua): ${:.4}\n\
+            💳 Total cost all-time: ${:.4}\n\
+            {}",
+            total_users, total_projects, active_runs,
+            total_runs_today, total_cost_today, total_cost_all,
+            disk_info,
+        ));
+    }
+
     send_message(client, &config.telegram_bot_token, chat_id, &reply).await?;
     Ok(())
+}
+
+fn get_disk_summary() -> String {
+    let paths = [
+        ("/srv/ai-platform/workspaces", "Workspaces"),
+        ("/srv/ai-platform/worktrees", "Worktrees"),
+    ];
+    let mut parts = Vec::new();
+    for (path, label) in &paths {
+        if let Ok(pct) = get_disk_pct(path) {
+            let icon = if pct >= 90 { "🔴" } else if pct >= 75 { "🟡" } else { "🟢" };
+            parts.push(format!("{} {}: {}%", icon, label, pct));
+        }
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
+    format!("💾 Disk: {}", parts.join(" | "))
+}
+
+fn get_disk_pct(path: &str) -> anyhow::Result<u64> {
+    use std::ffi::CString;
+    let c_path = CString::new(path)?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let ret = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+    if ret != 0 { anyhow::bail!("statvfs failed"); }
+    let total = stat.f_blocks * stat.f_frsize;
+    if total == 0 { return Ok(0); }
+    let used = (stat.f_blocks - stat.f_bfree) * stat.f_frsize;
+    Ok((used * 100 / total) as u64)
 }
 
 async fn cmd_retry(
