@@ -151,6 +151,8 @@ async fn handle_command(
         "/project" => cmd_set_project(client, config, db, tg_user, chat_id, &parts).await?,
         "/newproject" => cmd_newproject(client, config, db, tg_user, chat_id, &parts).await?,
         "/cancel" => cmd_cancel(client, config, db, tg_user, chat_id, &mut redis).await?,
+        "/retry" => cmd_retry(client, config, db, tg_user, chat_id, &mut redis).await?,
+        "/backup" => cmd_backup(client, config, db, tg_user, chat_id).await?,
         "/newsession" => cmd_newsession(client, config, db, tg_user, chat_id, &mut redis).await?,
         "/runs" => cmd_runs(client, config, db, tg_user, chat_id).await?,
         "/status" => cmd_status(client, config, db, tg_user, chat_id).await?,
@@ -277,6 +279,153 @@ async fn cmd_status(
     };
     let reply = format!("📊 Status\n\n{}👤 User: {}", project_info, tg_user.name);
     send_message(client, &config.telegram_bot_token, chat_id, &reply).await?;
+    Ok(())
+}
+
+async fn cmd_retry(
+    client: &Client,
+    config: &Config,
+    db: &PgPool,
+    tg_user: &TelegramDbUser,
+    chat_id: i64,
+    redis: &mut ConnectionManager,
+) -> anyhow::Result<()> {
+    let project_id = match tg_user.active_project_id {
+        Some(pid) => pid,
+        None => {
+            send_message(client, &config.telegram_bot_token, chat_id,
+                "Pilih project dulu dengan /project <slug>").await?;
+            return Ok(());
+        }
+    };
+
+    // Find last run for this user+project
+    let last = sqlx::query_as::<_, (Uuid, String, String)>(
+        "SELECT id, prompt, status FROM agent_runs \
+         WHERE user_id=$1 AND project_id=$2 \
+         ORDER BY created_at DESC LIMIT 1"
+    )
+    .bind(tg_user.user_id)
+    .bind(project_id)
+    .fetch_optional(db)
+    .await?;
+
+    let (last_id, prompt, status) = match last {
+        Some(r) => r,
+        None => {
+            send_message(client, &config.telegram_bot_token, chat_id,
+                "Tidak ada run sebelumnya untuk di-retry.").await?;
+            return Ok(());
+        }
+    };
+
+    // Don't retry a run that's still running
+    if matches!(status.as_str(), "queued" | "processing" | "running_agent" | "preparing_workspace" | "collecting_diff" | "auto_push_or_pr") {
+        send_message(client, &config.telegram_bot_token, chat_id,
+            "⏳ Run sebelumnya masih berjalan. Tunggu selesai dulu.").await?;
+        return Ok(());
+    }
+
+    tracing::info!(last_run_id = %last_id, "Retrying run via Telegram");
+
+    // Get session and project info
+    let session_id = get_or_create_session(db, tg_user, project_id).await?;
+    let project = match crate::services::project_service::get(db, project_id, tg_user.user_id).await {
+        Ok(p) => p,
+        Err(_) => {
+            send_message(client, &config.telegram_bot_token, chat_id,
+                "❌ Gagal mengambil info project.").await?;
+            return Ok(());
+        }
+    };
+
+    let req = crate::domain::agent_run::CreateRunRequest { prompt: prompt.clone(), auto_mode: None, model: None };
+    match crate::services::run_orchestrator::create_run(
+        db, session_id, project_id, tg_user.user_id, req, &project.openclaw_agent_id, Some(chat_id),
+    ).await {
+        Ok(_) => {
+            send_message(client, &config.telegram_bot_token, chat_id,
+                &format!("🔄 Retry dimulai!\n\nPrompt: \"{}...\"",
+                    &prompt.chars().take(80).collect::<String>())).await?;
+        }
+        Err(e) => {
+            send_message(client, &config.telegram_bot_token, chat_id,
+                &format!("❌ Gagal retry: {}", e)).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_backup(
+    client: &Client,
+    config: &Config,
+    db: &PgPool,
+    tg_user: &TelegramDbUser,
+    chat_id: i64,
+) -> anyhow::Result<()> {
+    // Admin only
+    let is_admin = is_admin_user(db, tg_user).await?;
+    if !is_admin {
+        send_message(client, &config.telegram_bot_token, chat_id,
+            "❌ Hanya admin yang bisa backup.").await?;
+        return Ok(());
+    }
+
+    send_message(client, &config.telegram_bot_token, chat_id,
+        "⏳ Membuat backup database...").await?;
+
+    // Run pg_dump inside postgres container
+    let now = time::OffsetDateTime::now_utc();
+    let timestamp = format!("{:04}{:02}{:02}_{:02}{:02}{:02}",
+        now.year(), now.month() as u8, now.day(),
+        now.hour(), now.minute(), now.second());
+    let backup_file = format!("/tmp/aicode_backup_{}.sql.gz", timestamp);
+
+    let output = tokio::process::Command::new("docker")
+        .args(["exec", "ai-platform-postgres-1",
+            "sh", "-c",
+            &format!("pg_dump -U postgres aicode | gzip > /tmp/backup_{}.sql.gz && cat /tmp/backup_{}.sql.gz",
+                timestamp, timestamp)])
+        .output()
+        .await;
+
+    match output {
+        Ok(out) if out.status.success() && !out.stdout.is_empty() => {
+            // Write to temp file
+            tokio::fs::write(&backup_file, &out.stdout).await?;
+            let size_kb = out.stdout.len() / 1024;
+
+            // Send file via Telegram if < 45MB
+            if out.stdout.len() < 45 * 1024 * 1024 {
+                let url = format!("https://api.telegram.org/bot{}/sendDocument", config.telegram_bot_token);
+                let file_part = reqwest::multipart::Form::new()
+                    .text("chat_id", chat_id.to_string())
+                    .text("caption", format!("✅ Backup DB — {} KB — {}", size_kb, timestamp))
+                    .part("document",
+                        reqwest::multipart::Part::bytes(out.stdout)
+                            .file_name(format!("aicode_backup_{}.sql.gz", timestamp))
+                            .mime_str("application/gzip")?);
+                static TG_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+                let tg = TG_CLIENT.get_or_init(reqwest::Client::new);
+                let _ = tg.post(&url).multipart(file_part).send().await;
+            } else {
+                send_message(client, &config.telegram_bot_token, chat_id,
+                    &format!("✅ Backup selesai ({} KB) tapi terlalu besar untuk dikirim via Telegram.\nFile tersimpan di server: {}",
+                        size_kb, backup_file)).await?;
+            }
+            // Cleanup temp file
+            let _ = tokio::fs::remove_file(&backup_file).await;
+        }
+        Ok(out) => {
+            let err = String::from_utf8_lossy(&out.stderr);
+            send_message(client, &config.telegram_bot_token, chat_id,
+                &format!("❌ Backup gagal: {}", err.chars().take(200).collect::<String>())).await?;
+        }
+        Err(e) => {
+            send_message(client, &config.telegram_bot_token, chat_id,
+                &format!("❌ Backup gagal: {}", e)).await?;
+        }
+    }
     Ok(())
 }
 
@@ -520,12 +669,14 @@ async fn cmd_help(client: &Client, config: &Config, chat_id: i64) -> anyhow::Res
         /newproject <nama> <repo_url> — Tambah project baru\n\
         /runs — Lihat 10 run terakhir\n\
         /newsession — Mulai session baru (branch baru)\n\
+        /retry — Ulangi run terakhir yang gagal\n\
         /cancel — Batalkan run yang sedang berjalan\n\
         /status — Lihat status saat ini\n\
         /help — Tampilkan bantuan ini\n\n\
         Admin:\n\
         /adduser <telegram_id> <nama> — Tambah user\n\
-        /removeuser <telegram_id> — Hapus user\n\n\
+        /removeuser <telegram_id> — Hapus user\n\
+        /backup — Backup database (kirim via Telegram)\n\n\
         Kirim pesan biasa untuk memulai coding dengan AI agent.";
     send_message(client, &config.telegram_bot_token, chat_id, reply).await?;
     Ok(())
