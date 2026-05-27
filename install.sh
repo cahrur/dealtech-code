@@ -213,8 +213,8 @@ TELEGRAM_ENABLED=${TELEGRAM_ENABLED:-false}
 TELEGRAM_ADMIN_CHAT_ID=${TELEGRAM_ADMIN_CHAT_ID:-}
 
 # ── Disk Alert ───────────────────────────────────────────────────────────────
-# Alert ke TELEGRAM_ADMIN_CHAT_ID saat disk >= threshold ini (%)
-DISK_ALERT_THRESHOLD_PCT=85
+# Jam backup harian (UTC). 18 = 01:00 WIB
+BACKUP_HOUR_UTC=18
 
 # ── Security ─────────────────────────────────────────────────────────────────
 # CORS_ORIGIN: comma-separated allowed origins. "*" = allow all (dev only)
