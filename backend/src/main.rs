@@ -62,6 +62,12 @@ async fn main() -> anyhow::Result<()> {
         redis.clone(),
     ));
 
+    tokio::spawn(workers::disk_alert_worker::run(
+        config.clone(),
+        db.clone(),
+        redis.clone(),
+    ));
+
     // Telegram bot polling
     if config.telegram_enabled && !config.telegram_bot_token.is_empty() {
         let tg_config = Arc::new(config.clone());

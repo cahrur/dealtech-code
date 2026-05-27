@@ -37,6 +37,8 @@ pub struct Config {
 
     // Security
     pub cors_origin: String,  // comma-separated allowed origins, "*" = allow all
+    pub disk_alert_threshold_pct: Option<u64>, // alert when disk usage >= this % (default 85)
+    pub telegram_admin_chat_id: Option<i64>,   // Telegram chat_id to receive admin alerts
 }
 
 impl Config {
@@ -96,6 +98,8 @@ impl Config {
                 .unwrap_or(false),
 
             cors_origin: env::var("CORS_ORIGIN").unwrap_or_else(|_| "*".into()),
+            disk_alert_threshold_pct: env::var("DISK_ALERT_THRESHOLD_PCT").ok().and_then(|v| v.parse().ok()),
+            telegram_admin_chat_id: env::var("TELEGRAM_ADMIN_CHAT_ID").ok().and_then(|v| v.parse().ok()),
         })
     }
 
