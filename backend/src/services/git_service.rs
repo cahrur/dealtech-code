@@ -54,25 +54,29 @@ pub async fn commit(worktree_path: &PathBuf, message: &str) -> Result<String> {
 }
 
 pub async fn push_branch(worktree_path: &PathBuf, branch_name: &str, github_token: Option<&str>) -> Result<()> {
-    // If we have a token, push via authenticated HTTPS remote URL directly
-    // to avoid relying on SSH keys that may not have access.
     let mut cmd = Command::new("git");
     if let Some(token) = github_token {
-        // Get the current remote URL and inject token
+        // Get remote URL, strip any embedded token, push via env-var auth
         let remote_out = Command::new("git")
             .args(["-C", worktree_path.to_str().unwrap(), "remote", "get-url", "origin"])
             .output()
             .await
             .map_err(|e| AppError::Internal(anyhow::anyhow!("git remote get-url: {}", e)))?;
         let remote_url = String::from_utf8_lossy(&remote_out.stdout).trim().to_string();
-        let auth_url = crate::services::workspace_service::inject_token_to_url(&remote_url, token);
-        cmd.args(["-C", worktree_path.to_str().unwrap(), "push", &auth_url, branch_name]);
+        let clean_url = crate::services::workspace_service::clean_github_url(&remote_url);
+        // Update remote to clean URL (no embedded token)
+        let _ = Command::new("git")
+            .args(["-C", worktree_path.to_str().unwrap(), "remote", "set-url", "origin", &clean_url])
+            .status().await;
+        // Auth via env var — not visible in ps aux
+        for (k, v) in crate::services::workspace_service::git_auth_env(token) {
+            cmd.env(k, v);
+        }
+        cmd.args(["-C", worktree_path.to_str().unwrap(), "push", "origin", branch_name]);
     } else {
         cmd.args(["-C", worktree_path.to_str().unwrap(), "push", "origin", branch_name]);
     }
-    let out = cmd
-        .output()
-        .await
+    let out = cmd.output().await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("git push: {}", e)))?;
     if !out.status.success() {
         return Err(AppError::Internal(anyhow::anyhow!(

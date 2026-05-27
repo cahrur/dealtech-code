@@ -6,11 +6,35 @@ use sqlx::PgPool;
 use crate::config::Config;
 use crate::error::{AppError, Result};
 
+/// Returns a clean HTTPS GitHub URL — no embedded token.
+/// SSH and token-embedded URLs are both normalized.
+pub fn clean_github_url(repo_url: &str) -> String {
+    // SSH: git@github.com:owner/repo.git → https://github.com/owner/repo.git
+    if let Some(rest) = repo_url.strip_prefix("git@github.com:") {
+        return format!("https://github.com/{}", rest);
+    }
+    // Strip existing token: https://x-access-token:TOKEN@github.com/... → https://github.com/...
+    if let Some(rest) = repo_url.strip_prefix("https://") {
+        if let Some(at_pos) = rest.find('@') {
+            return format!("https://{}", &rest[at_pos + 1..]);
+        }
+    }
+    repo_url.to_string()
+}
+
+/// Returns git env vars to authenticate via HTTP header.
+/// Token is passed as an env var — NOT embedded in the URL — so it is
+/// not visible in `ps aux` or git logs.
+pub fn git_auth_env(token: &str) -> Vec<(String, String)> {
+    vec![
+        ("GIT_CONFIG_COUNT".to_string(), "1".to_string()),
+        ("GIT_CONFIG_KEY_0".to_string(), "http.extraHeader".to_string()),
+        ("GIT_CONFIG_VALUE_0".to_string(), format!("Authorization: token {}", token)),
+    ]
+}
+
 /// Convert any GitHub repo URL to an authenticated HTTPS URL.
-/// Handles:
-///   git@github.com:owner/repo.git  → https://x-access-token:TOKEN@github.com/owner/repo.git
-///   https://github.com/owner/repo  → https://x-access-token:TOKEN@github.com/owner/repo
-///   https://x-access-token:...@github.com/... → unchanged (already has token)
+/// Kept for backward compat — prefer clean_github_url + git_auth_env for new code.
 pub fn inject_token_to_url(repo_url: &str, token: &str) -> String {
     // SSH format: git@github.com:owner/repo.git
     if let Some(rest) = repo_url.strip_prefix("git@github.com:") {
@@ -31,27 +55,28 @@ pub async fn prepare_workspace(
     repo_url: &str,
     github_token: Option<&str>,
 ) -> Result<PathBuf> {
-    // Use authenticated URL when token is available
-    let effective_url = match github_token {
-        Some(token) => inject_token_to_url(repo_url, token),
+    // Use clean URL (no embedded token) + auth via env var to avoid token in ps aux
+    let clean_url = match github_token {
+        Some(_) => clean_github_url(repo_url),
         None => repo_url.to_string(),
     };
+    let auth_env = github_token.map(git_auth_env).unwrap_or_default();
     let workspace_path = PathBuf::from(&config.workspaces_path)
         .join(team_slug)
         .join(project_slug);
 
     if workspace_path.exists() {
-        // Update remote URL to use current token (token may have rotated)
+        // Update remote URL to clean URL (no token)
         if github_token.is_some() {
             let _ = Command::new("git")
-                .args(["-C", workspace_path.to_str().unwrap(), "remote", "set-url", "origin", &effective_url])
+                .args(["-C", workspace_path.to_str().unwrap(), "remote", "set-url", "origin", &clean_url])
                 .status()
                 .await;
         }
-        let status = Command::new("git")
-            .args(["-C", workspace_path.to_str().unwrap(), "fetch", "origin"])
-            .status()
-            .await
+        let mut fetch_cmd = Command::new("git");
+        fetch_cmd.args(["-C", workspace_path.to_str().unwrap(), "fetch", "origin"]);
+        for (k, v) in &auth_env { fetch_cmd.env(k, v); }
+        let status = fetch_cmd.status().await
             .map_err(|e| AppError::Internal(anyhow::anyhow!("git fetch: {}", e)))?;
         if !status.success() {
             return Err(AppError::Internal(anyhow::anyhow!("git fetch failed")));
@@ -68,10 +93,10 @@ pub async fn prepare_workspace(
         tokio::fs::create_dir_all(&workspace_path)
             .await
             .map_err(|e| AppError::Internal(anyhow::anyhow!("mkdir: {}", e)))?;
-        let status = Command::new("git")
-            .args(["clone", &effective_url, workspace_path.to_str().unwrap()])
-            .status()
-            .await
+        let mut clone_cmd = Command::new("git");
+        clone_cmd.args(["clone", &clean_url, workspace_path.to_str().unwrap()]);
+        for (k, v) in &auth_env { clone_cmd.env(k, v); }
+        let status = clone_cmd.status().await
             .map_err(|e| AppError::Internal(anyhow::anyhow!("git clone: {}", e)))?;
         if !status.success() {
             return Err(AppError::Internal(anyhow::anyhow!("git clone failed")));
