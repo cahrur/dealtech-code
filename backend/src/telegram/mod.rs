@@ -151,6 +151,7 @@ async fn handle_command(
         "/project" => cmd_set_project(client, config, db, tg_user, chat_id, &parts).await?,
         "/newproject" => cmd_newproject(client, config, db, tg_user, chat_id, &parts).await?,
         "/cancel" => cmd_cancel(client, config, db, tg_user, chat_id, &mut redis).await?,
+        "/runs" => cmd_runs(client, config, db, tg_user, chat_id).await?,
         "/status" => cmd_status(client, config, db, tg_user, chat_id).await?,
         "/help" => cmd_help(client, config, chat_id).await?,
         "/adduser" => cmd_adduser(client, config, db, tg_user, chat_id, &parts).await?,
@@ -409,12 +410,76 @@ async fn cmd_newproject(
     Ok(())
 }
 
+async fn cmd_runs(
+    client: &Client,
+    config: &Config,
+    db: &PgPool,
+    tg_user: &TelegramDbUser,
+    chat_id: i64,
+) -> anyhow::Result<()> {
+    // Get active project
+    let project_id = match tg_user.active_project_id {
+        Some(pid) => pid,
+        None => {
+            send_message(client, &config.telegram_bot_token, chat_id,
+                "Pilih project dulu dengan /project <slug>").await?;
+            return Ok(());
+        }
+    };
+
+    // Fetch last 10 runs for this project + user
+    let rows = sqlx::query_as::<_, (uuid::Uuid, String, Option<String>, Option<String>, Option<f64>, Option<String>)>(
+        "SELECT r.id, r.status, r.commit_sha, r.branch_name, r.cost_usd, \
+         LEFT(r.prompt, 60) \
+         FROM agent_runs r \
+         WHERE r.project_id = $1 AND r.user_id = $2 \
+         ORDER BY r.created_at DESC LIMIT 10"
+    )
+    .bind(project_id)
+    .bind(tg_user.user_id)
+    .fetch_all(db)
+    .await?;
+
+    if rows.is_empty() {
+        send_message(client, &config.telegram_bot_token, chat_id,
+            "Belum ada run di project ini.").await?;
+        return Ok(());
+    }
+
+    let mut lines = vec!["📋 10 Run Terakhir\n".to_string()];
+    for (id, status, commit_sha, branch, cost, prompt) in &rows {
+        let status_icon = match status.as_str() {
+            "completed"    => "✅",
+            "failed_agent" => "❌",
+            "cancelled"    => "🚫",
+            "queued" | "processing" | "running_agent" |
+            "preparing_workspace" | "collecting_diff" | "auto_push_or_pr" => "⏳",
+            _ => "❓",
+        };
+        let short_id = &id.to_string()[..8];
+        let commit = commit_sha.as_deref().map(|s| &s[..s.len().min(7)]).unwrap_or("-");
+        let branch_short = branch.as_deref().unwrap_or("-");
+        let cost_str = cost.map(|c| format!("${:.4}", c)).unwrap_or_else(|| "-".to_string());
+        let prompt_short = prompt.as_deref().unwrap_or("");
+        lines.push(format!(
+            "{} [{}] {}\n   branch: {} | commit: {} | cost: {}\n   \"{}...\"\n",
+            status_icon, short_id, status,
+            branch_short, commit, cost_str,
+            prompt_short
+        ));
+    }
+
+    send_message(client, &config.telegram_bot_token, chat_id, &lines.join("")).await?;
+    Ok(())
+}
+
 async fn cmd_help(client: &Client, config: &Config, chat_id: i64) -> anyhow::Result<()> {
     let reply = "🤖 Dealtech Code AI Agent\n\n\
         /start — Mulai\n\
         /projects — Lihat daftar project\n\
         /project <slug> — Pilih project aktif\n\
         /newproject <nama> <repo_url> — Tambah project baru\n\
+        /runs — Lihat 10 run terakhir\n\
         /cancel — Batalkan run yang sedang berjalan\n\
         /status — Lihat status saat ini\n\
         /help — Tampilkan bantuan ini\n\n\
