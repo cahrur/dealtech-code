@@ -92,6 +92,7 @@ collect_config() {
   if [[ -n "$TELEGRAM_BOT_TOKEN" ]]; then
     TELEGRAM_ENABLED=true
     info "Telegram bot akan diaktifkan"
+    read -rp "Telegram Chat ID kamu (untuk disk alert & notif admin, optional): " TELEGRAM_ADMIN_CHAT_ID
   else
     TELEGRAM_ENABLED=false
     info "Telegram bot dinonaktifkan (bisa diaktifkan nanti via .env)"
@@ -208,6 +209,12 @@ OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_TOKEN}
 # ── Telegram Bot ─────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
 TELEGRAM_ENABLED=${TELEGRAM_ENABLED:-false}
+# Chat ID admin untuk disk alert dan notifikasi sistem
+TELEGRAM_ADMIN_CHAT_ID=${TELEGRAM_ADMIN_CHAT_ID:-}
+
+# ── Disk Alert ───────────────────────────────────────────────────────────────
+# Alert ke TELEGRAM_ADMIN_CHAT_ID saat disk >= threshold ini (%)
+DISK_ALERT_THRESHOLD_PCT=85
 
 # ── Security ─────────────────────────────────────────────────────────────────
 # CORS_ORIGIN: comma-separated allowed origins. "*" = allow all (dev only)
