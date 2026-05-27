@@ -490,8 +490,10 @@ async fn emit(
 
 /// Send a Telegram message directly via Bot API (fire-and-forget).
 pub async fn notify_telegram(bot_token: &str, chat_id: i64, text: &str) {
+    // Reuse a single client across all calls — avoids TCP connection overhead
+    static TG_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    let client = TG_CLIENT.get_or_init(reqwest::Client::new);
     let url = format!("https://api.telegram.org/bot{}/sendMessage", bot_token);
     let body = serde_json::json!({ "chat_id": chat_id, "text": text, "parse_mode": "Markdown" });
-    let client = reqwest::Client::new();
     let _ = client.post(&url).json(&body).send().await;
 }

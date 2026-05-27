@@ -2,9 +2,9 @@ use axum::{
     extract::{Request, State},
     http::{HeaderValue, StatusCode},
     middleware::{self, Next},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{get, post},
-    Router,
+    Json, Router,
 };
 use tower_http::cors::{Any, CorsLayer};
 
@@ -78,8 +78,30 @@ pub fn app_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn health() -> &'static str {
-    "ok"
+async fn health(State(state): State<AppState>) -> impl IntoResponse {
+    // Check DB
+    let db_ok = sqlx::query_scalar::<_, i32>("SELECT 1")
+        .fetch_one(&state.db)
+        .await
+        .is_ok();
+
+    // Check Redis
+    let redis_ok = {
+        let mut r = state.redis.clone();
+        redis::cmd("PING")
+            .query_async::<_, String>(&mut r)
+            .await
+            .is_ok()
+    };
+
+    let status = if db_ok && redis_ok { "ok" } else { "degraded" };
+    let code = if db_ok && redis_ok { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+
+    (code, Json(serde_json::json!({
+        "status": status,
+        "db": if db_ok { "ok" } else { "error" },
+        "redis": if redis_ok { "ok" } else { "error" },
+    })))
 }
 
 pub async fn api_key_middleware(

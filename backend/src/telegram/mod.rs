@@ -566,7 +566,10 @@ async fn cmd_adduser(
         return Ok(());
     }
 
-    // Auto-create user in users table
+    // Wrap both inserts in a transaction — if telegram_users insert fails,
+    // the users row is also rolled back (no orphaned records)
+    let mut tx = db.begin().await?;
+
     let new_user_id = Uuid::new_v4();
     let username = format!("tg_{}", target_tg_id);
     sqlx::query(
@@ -577,12 +580,12 @@ async fn cmd_adduser(
     .bind(new_user_id)
     .bind(&username)
     .bind(format!("{}@telegram.local", target_tg_id))
-    .execute(db)
+    .execute(&mut *tx)
     .await?;
 
     let actual_user_id = sqlx::query_scalar::<_, Uuid>(
         "SELECT id FROM users WHERE username = $1"
-    ).bind(&username).fetch_one(db).await?;
+    ).bind(&username).fetch_one(&mut *tx).await?;
 
     sqlx::query(
         "INSERT INTO telegram_users (telegram_id, user_id, name, added_by) VALUES ($1, $2, $3, $4)"
@@ -591,8 +594,10 @@ async fn cmd_adduser(
     .bind(actual_user_id)
     .bind(&name)
     .bind(tg_user.user_id)
-    .execute(db)
+    .execute(&mut *tx)
     .await?;
+
+    tx.commit().await?;
 
     send_message(client, &config.telegram_bot_token, chat_id,
         &format!("✅ User {} (ID: {}) berhasil ditambahkan.", name, target_tg_id)).await?;
@@ -668,6 +673,23 @@ async fn handle_regular_message(
             return Ok(());
         }
     };
+
+    // Rate limiting: max user_rate_limit_per_minute runs per user per minute
+    let rate_limit = config.user_rate_limit_per_minute;
+    if rate_limit > 0 {
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM agent_runs WHERE user_id=$1 AND created_at > NOW() - INTERVAL '1 minute'"
+        )
+        .bind(tg_user.user_id)
+        .fetch_one(db)
+        .await
+        .unwrap_or(0);
+        if count >= rate_limit as i64 {
+            send_message(client, &config.telegram_bot_token, chat_id,
+                "⏳ Terlalu banyak request. Tunggu sebentar sebelum kirim lagi.").await?;
+            return Ok(());
+        }
+    }
 
     // Send processing indicator
     send_message(client, &config.telegram_bot_token, chat_id, "⏳ Sedang diproses...").await?;
