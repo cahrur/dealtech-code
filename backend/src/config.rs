@@ -39,6 +39,7 @@ pub struct Config {
     pub cors_origin: String,  // comma-separated allowed origins, "*" = allow all
     pub disk_alert_threshold_pct: Option<u64>, // alert when disk usage >= this % (default 85)
     pub telegram_admin_chat_id: Option<i64>,   // Telegram chat_id to receive admin alerts
+    pub backup_hour_utc: Option<u8>,           // hour (0-23 UTC) for daily backup, default 2
 }
 
 impl Config {
@@ -100,6 +101,7 @@ impl Config {
             cors_origin: env::var("CORS_ORIGIN").unwrap_or_else(|_| "*".into()),
             disk_alert_threshold_pct: env::var("DISK_ALERT_THRESHOLD_PCT").ok().and_then(|v| v.parse().ok()),
             telegram_admin_chat_id: env::var("TELEGRAM_ADMIN_CHAT_ID").ok().and_then(|v| v.parse().ok()),
+            backup_hour_utc: env::var("BACKUP_HOUR_UTC").ok().and_then(|v| v.parse().ok()),
         })
     }
 
