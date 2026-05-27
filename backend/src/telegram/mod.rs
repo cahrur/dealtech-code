@@ -151,6 +151,7 @@ async fn handle_command(
         "/project" => cmd_set_project(client, config, db, tg_user, chat_id, &parts).await?,
         "/newproject" => cmd_newproject(client, config, db, tg_user, chat_id, &parts).await?,
         "/cancel" => cmd_cancel(client, config, db, tg_user, chat_id, &mut redis).await?,
+        "/newsession" => cmd_newsession(client, config, db, tg_user, chat_id, &mut redis).await?,
         "/runs" => cmd_runs(client, config, db, tg_user, chat_id).await?,
         "/status" => cmd_status(client, config, db, tg_user, chat_id).await?,
         "/help" => cmd_help(client, config, chat_id).await?,
@@ -410,6 +411,51 @@ async fn cmd_newproject(
     Ok(())
 }
 
+async fn cmd_newsession(
+    client: &Client,
+    config: &Config,
+    db: &PgPool,
+    tg_user: &TelegramDbUser,
+    chat_id: i64,
+    redis: &mut ConnectionManager,
+) -> anyhow::Result<()> {
+    let project_id = match tg_user.active_project_id {
+        Some(pid) => pid,
+        None => {
+            send_message(client, &config.telegram_bot_token, chat_id,
+                "Pilih project dulu dengan /project <slug>").await?;
+            return Ok(());
+        }
+    };
+
+    // Create new session
+    let session_id = Uuid::new_v4();
+    let title = format!("Telegram - {} - {} (new)", tg_user.name, chrono_today());
+    sqlx::query(
+        "INSERT INTO coding_sessions (id, project_id, user_id, title) VALUES ($1, $2, $3, $4)"
+    )
+    .bind(session_id)
+    .bind(project_id)
+    .bind(tg_user.user_id)
+    .bind(&title)
+    .execute(db)
+    .await?;
+
+    // Pin this session in Redis for this user+project (expires in 24h)
+    let key = format!("tg:pinned_session:{}:{}", tg_user.user_id, project_id);
+    let _: std::result::Result<(), _> = redis::cmd("SETEX")
+        .arg(&key)
+        .arg(86400u64)
+        .arg(session_id.to_string())
+        .query_async(redis)
+        .await;
+
+    send_message(client, &config.telegram_bot_token, chat_id,
+        &format!("✅ Session baru dimulai!\n\nID: {}\nBranch baru akan dibuat saat kamu kirim pesan pertama.",
+            &session_id.to_string()[..8])).await?;
+    Ok(())
+}
+
 async fn cmd_runs(
     client: &Client,
     config: &Config,
@@ -480,6 +526,7 @@ async fn cmd_help(client: &Client, config: &Config, chat_id: i64) -> anyhow::Res
         /project <slug> — Pilih project aktif\n\
         /newproject <nama> <repo_url> — Tambah project baru\n\
         /runs — Lihat 10 run terakhir\n\
+        /newsession — Mulai session baru (branch baru)\n\
         /cancel — Batalkan run yang sedang berjalan\n\
         /status — Lihat status saat ini\n\
         /help — Tampilkan bantuan ini\n\n\
@@ -646,8 +693,8 @@ async fn handle_regular_message(
         }
     };
 
-    // Auto-create or reuse today's coding session
-    let session_id = get_or_create_session(db, tg_user, project_id).await?;
+    // Auto-create or reuse today's coding session (checks Redis pinned session first)
+    let session_id = get_or_create_session(db, &mut redis.clone(), tg_user, project_id).await?;
 
     // Create run request
     let req = crate::domain::agent_run::CreateRunRequest {
@@ -692,9 +739,32 @@ async fn handle_regular_message(
 
 async fn get_or_create_session(
     db: &PgPool,
+    redis: &mut ConnectionManager,
     tg_user: &TelegramDbUser,
     project_id: Uuid,
 ) -> anyhow::Result<Uuid> {
+    // Check Redis for pinned session (set by /newsession)
+    let pin_key = format!("tg:pinned_session:{}:{}", tg_user.user_id, project_id);
+    let pinned: Option<String> = redis::cmd("GET")
+        .arg(&pin_key)
+        .query_async(redis)
+        .await
+        .unwrap_or(None);
+    if let Some(sid_str) = pinned {
+        if let Ok(sid) = Uuid::parse_str(&sid_str) {
+            // Verify session still exists in DB
+            let exists = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM coding_sessions WHERE id = $1)"
+            ).bind(sid).fetch_one(db).await.unwrap_or(false);
+            if exists {
+                return Ok(sid);
+            }
+            // Session gone — clear pin
+            let _: std::result::Result<(), _> = redis::cmd("DEL")
+                .arg(&pin_key).query_async(redis).await;
+        }
+    }
+
     // Check for existing session today for this telegram user + project
     let today_session = sqlx::query_scalar::<_, Uuid>(
         "SELECT id FROM coding_sessions \
