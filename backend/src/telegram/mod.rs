@@ -687,7 +687,7 @@ async fn handle_regular_message(
     };
 
     // Auto-create or reuse today's coding session (checks Redis pinned session first)
-    let session_id = get_or_create_session(db, &mut redis.clone(), tg_user, project_id).await?;
+    let session_id = get_or_create_session(db, tg_user, project_id).await?;
 
     // Create run request
     let req = crate::domain::agent_run::CreateRunRequest {
@@ -732,32 +732,9 @@ async fn handle_regular_message(
 
 async fn get_or_create_session(
     db: &PgPool,
-    redis: &mut ConnectionManager,
     tg_user: &TelegramDbUser,
     project_id: Uuid,
 ) -> anyhow::Result<Uuid> {
-    // Check Redis for pinned session (set by /newsession)
-    let pin_key = format!("tg:pinned_session:{}:{}", tg_user.user_id, project_id);
-    let pinned: Option<String> = redis::cmd("GET")
-        .arg(&pin_key)
-        .query_async(redis)
-        .await
-        .unwrap_or(None);
-    if let Some(sid_str) = pinned {
-        if let Ok(sid) = Uuid::parse_str(&sid_str) {
-            // Verify session still exists in DB
-            let exists = sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS(SELECT 1 FROM coding_sessions WHERE id = $1)"
-            ).bind(sid).fetch_one(db).await.unwrap_or(false);
-            if exists {
-                return Ok(sid);
-            }
-            // Session gone — clear pin
-            let _: std::result::Result<(), _> = redis::cmd("DEL")
-                .arg(&pin_key).query_async(redis).await;
-        }
-    }
-
     // Check for existing session today for this telegram user + project (fresh context per day)
     let today_session = sqlx::query_scalar::<_, Uuid>(
         "SELECT id FROM coding_sessions \
