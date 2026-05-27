@@ -34,7 +34,7 @@ pub async fn commit(worktree_path: &PathBuf, message: &str) -> Result<String> {
         .args([
             "-C", worktree_path.to_str().unwrap(),
             "commit", "-m", message,
-            "--author", "AI Agent <agent@ai-platform>",
+            "--author", "Dealtech Code <dealtechdeveloper@gmail.com>",
         ])
         .output()
         .await
