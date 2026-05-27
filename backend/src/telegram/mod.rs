@@ -765,11 +765,11 @@ async fn get_or_create_session(
         }
     }
 
-    // Check for existing session today for this telegram user + project
-    let today_session = sqlx::query_scalar::<_, Uuid>(
+    // Check for most recent session for this user + project (no date filter)
+    // Branch persists across days — new session only via /newsession
+    let latest_session = sqlx::query_scalar::<_, Uuid>(
         "SELECT id FROM coding_sessions \
          WHERE project_id = $1 AND user_id = $2 \
-         AND created_at::date = CURRENT_DATE \
          ORDER BY created_at DESC LIMIT 1"
     )
     .bind(project_id)
@@ -777,7 +777,7 @@ async fn get_or_create_session(
     .fetch_optional(db)
     .await?;
 
-    if let Some(sid) = today_session {
+    if let Some(sid) = latest_session {
         return Ok(sid);
     }
 
