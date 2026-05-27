@@ -24,9 +24,11 @@ async fn check_disk(
     let threshold = config.disk_alert_threshold_pct.unwrap_or(DEFAULT_THRESHOLD_PCT);
 
     let paths = [
-        ("/", "Root (/)"),
         ("/srv/ai-platform/workspaces", "Workspaces"),
         ("/srv/ai-platform/worktrees", "Worktrees"),
+        // Note: "/" inside container = overlay FS, not host disk.
+        // workspaces/worktrees are host-mounted volumes — their statvfs
+        // returns the actual host filesystem stats.
     ];
 
     let mut alerts: Vec<String> = Vec::new();
