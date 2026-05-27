@@ -98,13 +98,14 @@ pub async fn check_member(db: &PgPool, project_id: Uuid, user_id: Uuid) -> Resul
     .await? {
         return Ok(role);
     }
-    // Admin keys can access all projects
+    // Check if user has admin role in users table
     let is_admin: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM api_keys WHERE id = $1 AND role = 'admin' AND revoked_at IS NULL)"
+        "SELECT EXISTS(SELECT 1 FROM users WHERE id = $1 AND role = 'admin')"
     )
     .bind(user_id)
     .fetch_one(db)
-    .await?;
+    .await
+    .unwrap_or(false);
     if is_admin {
         return Ok("admin".to_string());
     }
