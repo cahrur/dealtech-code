@@ -220,13 +220,20 @@ async fn run_inner(
         &repo_url, &branch_name, &worktree_str, &git_status,
     );
 
-    // Fetch session history (exclude current user message which is the prompt)
-    let history: Vec<(String, String)> = crate::services::session_service::messages(
-        db.as_ref(), session_id,
-    ).await.unwrap_or_default()
+    // Fetch session history — cap at last 20 messages to avoid context bloat
+    // (unbounded history = higher cost + slower responses over time)
+    let history: Vec<(String, String)> = sqlx::query_as::<_, (String, String)>(
+        "SELECT role, content FROM messages \
+         WHERE session_id = $1 \
+         ORDER BY created_at DESC LIMIT 20"
+    )
+    .bind(session_id)
+    .fetch_all(db.as_ref())
+    .await
+    .unwrap_or_default()
     .into_iter()
-    .filter(|m| m.content != run.prompt || m.role != "user")
-    .map(|m| (m.role, m.content))
+    .rev() // restore chronological order
+    .filter(|(role, content)| !(content == &run.prompt && role == "user"))
     .collect();
 
     // Single OpenClaw call — streaming, OpenClaw writes files directly via its own tools
