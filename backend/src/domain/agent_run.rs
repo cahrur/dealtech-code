@@ -70,6 +70,7 @@ pub struct AgentRun {
     pub error_message: Option<String>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub timeout_at: Option<OffsetDateTime>,
+    pub telegram_chat_id: Option<i64>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
 }

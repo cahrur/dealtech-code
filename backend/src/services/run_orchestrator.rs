@@ -7,6 +7,7 @@ use crate::config::Config;
 use crate::domain::agent_run::{AgentRun, CreateRunRequest};
 use crate::domain::policy::PolicyConfig;
 use crate::services::{
+    usage_service,
     audit_service, git_service, openclaw_service, policy_engine::PolicyEngine,
     realtime_service, workspace_service,
 };
@@ -145,6 +146,20 @@ async fn run_inner(
     set_status(&db, run_id, "preparing_workspace").await?;
     emit(&db, &mut redis, run_id, session_id, "agent_run.started",
         serde_json::json!({"run_id": run_id})).await?;
+
+    // Notify Telegram user that agent is working
+    if let Some(chat_id) = run.telegram_chat_id {
+        notify_telegram(&config.telegram_bot_token, chat_id,
+            "⏳ Agent sedang bekerja... Saya akan kabari kalau sudah selesai.").await;
+        // Store active run_id in Redis so /cancel can find it
+        let key = format!("tg:active_run:{}", chat_id);
+        let _: std::result::Result<(), _> = redis::cmd("SETEX")
+            .arg(&key)
+            .arg(700u64) // expire after ~12 min (slightly longer than agent timeout)
+            .arg(run_id.to_string())
+            .query_async(&mut redis)
+            .await;
+    }
 
     // Prepare workspace — graceful error: tell user instead of crashing
     let github_token = config.github_token.as_deref();
@@ -304,6 +319,18 @@ async fn run_inner(
         db.as_ref(), session_id, "assistant", &final_reply,
     ).await;
 
+    // Notify Telegram user that run is complete
+    if let Some(chat_id) = run.telegram_chat_id {
+        // Clear active run key
+        let key = format!("tg:active_run:{}", chat_id);
+        let _: std::result::Result<(), _> = redis::cmd("DEL")
+            .arg(&key)
+            .query_async(&mut redis)
+            .await;
+        let tg_msg = format!("{}", final_reply);
+        notify_telegram(&config.telegram_bot_token, chat_id, &tg_msg).await;
+    }
+
     // Cost tracking: use real token usage from OpenClaw response
     let tokens_input = agent_response.usage.input_tokens;
     let tokens_output = agent_response.usage.output_tokens;
@@ -392,7 +419,6 @@ async fn finish_with_reply(
 ) -> anyhow::Result<()> {
     let _ = crate::services::session_service::add_message(db, session_id, "assistant", reply).await;
     let status = if is_failure { "failed_agent" } else { "completed" };
-    // Improvement 3: Always set error_message when is_failure=true
     if is_failure {
         let error_msg = if reply.trim().is_empty() { "Unknown error" } else { reply };
         sqlx::query("UPDATE agent_runs SET status=$1, finished_at=NOW(), error_message=$2 WHERE id=$3")
@@ -404,6 +430,26 @@ async fn finish_with_reply(
     let event = if is_failure { "agent_run.failed" } else { "agent_run.completed" };
     emit(db, redis, run_id, session_id, event,
         serde_json::json!({"run_id": run_id, "files_changed": 0})).await?;
+
+    // Notify Telegram if this run came from a Telegram message
+    // Notify Telegram if this run came from a Telegram message — clear active run key
+    let chat_id: Option<i64> = sqlx::query_scalar(
+        "SELECT telegram_chat_id FROM agent_runs WHERE id = $1"
+    )
+    .bind(run_id)
+    .fetch_optional(db)
+    .await
+    .unwrap_or(None)
+    .flatten();
+
+    if let Some(cid) = chat_id {
+        let key = format!("tg:active_run:{}", cid);
+        let _: std::result::Result<(), _> = redis::cmd("DEL")
+            .arg(&key)
+            .query_async(redis)
+            .await;
+    }
+
     Ok(())
 }
 
@@ -431,4 +477,12 @@ async fn emit(
     payload["session_id"] = serde_json::json!(session_id);
     realtime_service::publish_event(redis, session_id, &payload).await?;
     Ok(())
+}
+
+/// Send a Telegram message directly via Bot API (fire-and-forget).
+pub async fn notify_telegram(bot_token: &str, chat_id: i64, text: &str) {
+    let url = format!("https://api.telegram.org/bot{}/sendMessage", bot_token);
+    let body = serde_json::json!({ "chat_id": chat_id, "text": text, "parse_mode": "Markdown" });
+    let client = reqwest::Client::new();
+    let _ = client.post(&url).json(&body).send().await;
 }

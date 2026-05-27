@@ -125,7 +125,7 @@ async fn handle_message(
     };
 
     if text.starts_with('/') {
-        handle_command(client, config, db, &tg_user, chat_id, text).await?;
+        handle_command(client, config, db, redis.clone(), &tg_user, chat_id, text).await?;
     } else {
         handle_regular_message(client, config, db, redis, &tg_user, chat_id, text).await?;
     }
@@ -137,6 +137,7 @@ async fn handle_command(
     client: &Client,
     config: &Config,
     db: &PgPool,
+    mut redis: ConnectionManager,
     tg_user: &TelegramDbUser,
     chat_id: i64,
     text: &str,
@@ -149,6 +150,7 @@ async fn handle_command(
         "/projects" => cmd_projects(client, config, db, tg_user, chat_id).await?,
         "/project" => cmd_set_project(client, config, db, tg_user, chat_id, &parts).await?,
         "/newproject" => cmd_newproject(client, config, db, tg_user, chat_id, &parts).await?,
+        "/cancel" => cmd_cancel(client, config, db, tg_user, chat_id, &mut redis).await?,
         "/status" => cmd_status(client, config, db, tg_user, chat_id).await?,
         "/help" => cmd_help(client, config, chat_id).await?,
         "/adduser" => cmd_adduser(client, config, db, tg_user, chat_id, &parts).await?,
@@ -276,6 +278,58 @@ async fn cmd_status(
     Ok(())
 }
 
+async fn cmd_cancel(
+    client: &Client,
+    config: &Config,
+    db: &PgPool,
+    tg_user: &TelegramDbUser,
+    chat_id: i64,
+    redis: &mut ConnectionManager,
+) -> anyhow::Result<()> {
+    // Look up active run_id from Redis
+    let key = format!("tg:active_run:{}", chat_id);
+    let run_id_str: Option<String> = redis::cmd("GET")
+        .arg(&key)
+        .query_async(redis)
+        .await
+        .unwrap_or(None);
+
+    let run_id = match run_id_str.as_deref().and_then(|s| uuid::Uuid::parse_str(s).ok()) {
+        Some(id) => id,
+        None => {
+            send_message(client, &config.telegram_bot_token, chat_id,
+                "Tidak ada run yang sedang berjalan.").await?;
+            return Ok(());
+        }
+    };
+
+    // Mark run as cancelled in DB
+    let updated = sqlx::query(
+        "UPDATE agent_runs SET status='cancelled', finished_at=NOW(), error_message='Dibatalkan oleh user' \
+         WHERE id=$1 AND user_id=$2 AND status IN ('queued','processing','running_agent','preparing_workspace','collecting_diff','auto_push_or_pr')"
+    )
+    .bind(run_id)
+    .bind(tg_user.user_id)
+    .execute(db)
+    .await?;
+
+    if updated.rows_affected() == 0 {
+        send_message(client, &config.telegram_bot_token, chat_id,
+            "Run tidak ditemukan atau sudah selesai.").await?;
+        return Ok(());
+    }
+
+    // Clear Redis key
+    let _: std::result::Result<(), _> = redis::cmd("DEL")
+        .arg(&key)
+        .query_async(redis)
+        .await;
+
+    send_message(client, &config.telegram_bot_token, chat_id,
+        "❌ Run dibatalkan.").await?;
+    Ok(())
+}
+
 async fn cmd_newproject(
     client: &Client,
     config: &Config,
@@ -361,6 +415,7 @@ async fn cmd_help(client: &Client, config: &Config, chat_id: i64) -> anyhow::Res
         /projects — Lihat daftar project\n\
         /project <slug> — Pilih project aktif\n\
         /newproject <nama> <repo_url> — Tambah project baru\n\
+        /cancel — Batalkan run yang sedang berjalan\n\
         /status — Lihat status saat ini\n\
         /help — Tampilkan bantuan ini\n\n\
         Admin:\n\
