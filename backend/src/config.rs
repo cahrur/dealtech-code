@@ -37,6 +37,7 @@ pub struct Config {
 
     // Security
     pub cors_origin: String,  // comma-separated allowed origins, "*" = allow all
+}
 
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {

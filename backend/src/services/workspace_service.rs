@@ -6,17 +6,48 @@ use sqlx::PgPool;
 use crate::config::Config;
 use crate::error::{AppError, Result};
 
+/// Convert any GitHub repo URL to an authenticated HTTPS URL.
+/// Handles:
+///   git@github.com:owner/repo.git  → https://x-access-token:TOKEN@github.com/owner/repo.git
+///   https://github.com/owner/repo  → https://x-access-token:TOKEN@github.com/owner/repo
+///   https://x-access-token:...@github.com/... → unchanged (already has token)
+pub fn inject_token_to_url(repo_url: &str, token: &str) -> String {
+    // SSH format: git@github.com:owner/repo.git
+    if let Some(rest) = repo_url.strip_prefix("git@github.com:") {
+        return format!("https://x-access-token:{}@github.com/{}", token, rest);
+    }
+    // Plain HTTPS without token
+    if let Some(rest) = repo_url.strip_prefix("https://github.com/") {
+        return format!("https://x-access-token:{}@github.com/{}", token, rest);
+    }
+    // Already has credentials or unknown format — return as-is
+    repo_url.to_string()
+}
+
 pub async fn prepare_workspace(
     config: &Config,
     team_slug: &str,
     project_slug: &str,
     repo_url: &str,
+    github_token: Option<&str>,
 ) -> Result<PathBuf> {
+    // Use authenticated URL when token is available
+    let effective_url = match github_token {
+        Some(token) => inject_token_to_url(repo_url, token),
+        None => repo_url.to_string(),
+    };
     let workspace_path = PathBuf::from(&config.workspaces_path)
         .join(team_slug)
         .join(project_slug);
 
     if workspace_path.exists() {
+        // Update remote URL to use current token (token may have rotated)
+        if github_token.is_some() {
+            let _ = Command::new("git")
+                .args(["-C", workspace_path.to_str().unwrap(), "remote", "set-url", "origin", &effective_url])
+                .status()
+                .await;
+        }
         let status = Command::new("git")
             .args(["-C", workspace_path.to_str().unwrap(), "fetch", "origin"])
             .status()
@@ -38,7 +69,7 @@ pub async fn prepare_workspace(
             .await
             .map_err(|e| AppError::Internal(anyhow::anyhow!("mkdir: {}", e)))?;
         let status = Command::new("git")
-            .args(["clone", repo_url, workspace_path.to_str().unwrap()])
+            .args(["clone", &effective_url, workspace_path.to_str().unwrap()])
             .status()
             .await
             .map_err(|e| AppError::Internal(anyhow::anyhow!("git clone: {}", e)))?;

@@ -53,9 +53,24 @@ pub async fn commit(worktree_path: &PathBuf, message: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&sha.stdout).trim().to_string())
 }
 
-pub async fn push_branch(worktree_path: &PathBuf, branch_name: &str) -> Result<()> {
-    let out = Command::new("git")
-        .args(["-C", worktree_path.to_str().unwrap(), "push", "origin", branch_name])
+pub async fn push_branch(worktree_path: &PathBuf, branch_name: &str, github_token: Option<&str>) -> Result<()> {
+    // If we have a token, push via authenticated HTTPS remote URL directly
+    // to avoid relying on SSH keys that may not have access.
+    let mut cmd = Command::new("git");
+    if let Some(token) = github_token {
+        // Get the current remote URL and inject token
+        let remote_out = Command::new("git")
+            .args(["-C", worktree_path.to_str().unwrap(), "remote", "get-url", "origin"])
+            .output()
+            .await
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("git remote get-url: {}", e)))?;
+        let remote_url = String::from_utf8_lossy(&remote_out.stdout).trim().to_string();
+        let auth_url = crate::services::workspace_service::inject_token_to_url(&remote_url, token);
+        cmd.args(["-C", worktree_path.to_str().unwrap(), "push", &auth_url, branch_name]);
+    } else {
+        cmd.args(["-C", worktree_path.to_str().unwrap(), "push", "origin", branch_name]);
+    }
+    let out = cmd
         .output()
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("git push: {}", e)))?;

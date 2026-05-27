@@ -147,8 +147,9 @@ async fn run_inner(
         serde_json::json!({"run_id": run_id})).await?;
 
     // Prepare workspace — graceful error: tell user instead of crashing
+    let github_token = config.github_token.as_deref();
     let workspace_path = match workspace_service::prepare_workspace(
-        &config, &team_slug, &project_slug, &repo_url,
+        &config, &team_slug, &project_slug, &repo_url, github_token,
     ).await {
         Ok(p) => p,
         Err(e) => {
@@ -266,7 +267,7 @@ async fn run_inner(
 
                 if policy.can_push_branch() {
                     set_status(&db, run_id, "auto_push_or_pr").await?;
-                    match git_service::push_branch(&worktree, &branch_name).await {
+                    match git_service::push_branch(&worktree, &branch_name, config.github_token.as_deref()).await {
                         Ok(()) => {
                             pushed_branch = true;
                             emit(&db, &mut redis, run_id, session_id, "pr.created", serde_json::json!({
