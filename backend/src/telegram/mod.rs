@@ -148,6 +148,7 @@ async fn handle_command(
         "/start" => cmd_start(client, config, db, tg_user, chat_id).await?,
         "/projects" => cmd_projects(client, config, db, tg_user, chat_id).await?,
         "/project" => cmd_set_project(client, config, db, tg_user, chat_id, &parts).await?,
+        "/newproject" => cmd_newproject(client, config, db, tg_user, chat_id, &parts).await?,
         "/status" => cmd_status(client, config, db, tg_user, chat_id).await?,
         "/help" => cmd_help(client, config, chat_id).await?,
         "/adduser" => cmd_adduser(client, config, db, tg_user, chat_id, &parts).await?,
@@ -275,11 +276,91 @@ async fn cmd_status(
     Ok(())
 }
 
+async fn cmd_newproject(
+    client: &Client,
+    config: &Config,
+    db: &PgPool,
+    tg_user: &TelegramDbUser,
+    chat_id: i64,
+    parts: &[&str],
+) -> anyhow::Result<()> {
+    // Usage: /newproject <nama> <repo_url>
+    let name = parts.get(1).unwrap_or(&"").trim();
+    let repo_url = parts.get(2).unwrap_or(&"").trim();
+
+    if name.is_empty() || repo_url.is_empty() {
+        send_message(client, &config.telegram_bot_token, chat_id,
+            "Gunakan: /newproject <nama> <repo_url>\nContoh: /newproject my-api https://github.com/org/my-api").await?;
+        return Ok(());
+    }
+
+    if !repo_url.starts_with("https://") && !repo_url.starts_with("git@") {
+        send_message(client, &config.telegram_bot_token, chat_id,
+            "❌ repo_url tidak valid. Gunakan format https://github.com/... atau git@github.com:...").await?;
+        return Ok(());
+    }
+
+    // Use user_id as team_id (consistent with how workspace paths are built)
+    let team_id = tg_user.user_id;
+    let slug = name.to_lowercase().replace(' ', "-");
+
+    // Check if slug already exists for this user
+    let existing: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM projects p \
+         INNER JOIN project_members pm ON pm.project_id = p.id \
+         WHERE pm.user_id = $1 AND p.slug = $2"
+    )
+    .bind(tg_user.user_id)
+    .bind(&slug)
+    .fetch_optional(db)
+    .await?;
+
+    if existing.is_some() {
+        send_message(client, &config.telegram_bot_token, chat_id,
+            &format!("❌ Project dengan slug '{}' sudah ada. Gunakan nama lain.", slug)).await?;
+        return Ok(());
+    }
+
+    let req = crate::domain::project::CreateProjectRequest {
+        name: name.to_string(),
+        repo_url: Some(repo_url.to_string()),
+        openclaw_agent_id: "default".to_string(),
+        description: None,
+        create_github_repo: Some(false),
+        github_private: None,
+        github_org: None,
+    };
+
+    match crate::services::project_service::create(db, tg_user.user_id, team_id, req).await {
+        Ok(project) => {
+            // Auto-set as active project
+            sqlx::query(
+                "UPDATE telegram_users SET active_project_id = $1, updated_at = NOW() WHERE id = $2"
+            )
+            .bind(project.id)
+            .bind(tg_user.id)
+            .execute(db)
+            .await?;
+
+            send_message(client, &config.telegram_bot_token, chat_id,
+                &format!("✅ Project '{}' berhasil dibuat!\n\nSlug: {}\nRepo: {}\n\nProject ini sudah diset sebagai project aktif. Langsung kirim pesan untuk mulai coding!",
+                    project.name, project.slug, project.repo_url)).await?;
+        }
+        Err(e) => {
+            tracing::error!("Failed to create project via telegram: {}", e);
+            send_message(client, &config.telegram_bot_token, chat_id,
+                &format!("❌ Gagal membuat project: {}", e)).await?;
+        }
+    }
+    Ok(())
+}
+
 async fn cmd_help(client: &Client, config: &Config, chat_id: i64) -> anyhow::Result<()> {
     let reply = "🤖 Dealtech Code AI Agent\n\n\
         /start — Mulai\n\
         /projects — Lihat daftar project\n\
         /project <slug> — Pilih project aktif\n\
+        /newproject <nama> <repo_url> — Tambah project baru\n\
         /status — Lihat status saat ini\n\
         /help — Tampilkan bantuan ini\n\n\
         Admin:\n\
