@@ -149,12 +149,9 @@ async fn handle_command(
         "/projects" => cmd_projects(client, config, db, tg_user, chat_id).await?,
         "/project" => cmd_set_project(client, config, db, tg_user, chat_id, &parts).await?,
         "/status" => cmd_status(client, config, db, tg_user, chat_id).await?,
-        "/help" => cmd_help(client, config, db, tg_user, chat_id).await?,
-        "/cost" => cmd_cost(client, config, db, tg_user, chat_id, &parts).await?,
-        "/diff" => cmd_diff(client, config, db, tg_user, chat_id).await?,
+        "/help" => cmd_help(client, config, chat_id).await?,
         "/adduser" => cmd_adduser(client, config, db, tg_user, chat_id, &parts).await?,
         "/removeuser" => cmd_removeuser(client, config, db, tg_user, chat_id, &parts).await?,
-        "/newproject" => cmd_newproject(client, config, db, tg_user, chat_id, &parts).await?,
         _ => {
             send_message(client, &config.telegram_bot_token, chat_id,
                 "❓ Perintah tidak dikenal. Gunakan /help untuk melihat daftar perintah.").await?;
@@ -278,29 +275,18 @@ async fn cmd_status(
     Ok(())
 }
 
-async fn cmd_help(client: &Client, config: &Config, db: &PgPool, tg_user: &TelegramDbUser, chat_id: i64) -> anyhow::Result<()> {
-    let is_admin = is_admin_user(db, tg_user).await.unwrap_or(false);
-    let admin_section = if is_admin {
-        "\n\nAdmin:\n\
-        /adduser <telegram_id> <nama> — Tambah user\n\
-        /removeuser <telegram_id> — Hapus user"
-    } else {
-        ""
-    };
-    let reply = format!(
-        "🤖 Dealtech Code AI Agent\n\n\
+async fn cmd_help(client: &Client, config: &Config, chat_id: i64) -> anyhow::Result<()> {
+    let reply = "🤖 Dealtech Code AI Agent\n\n\
         /start — Mulai\n\
         /projects — Lihat daftar project\n\
         /project <slug> — Pilih project aktif\n\
-        /newproject <nama> <repo_url> — Buat project baru\n\
         /status — Lihat status saat ini\n\
-        /cost [period] — Lihat biaya (today|yesterday|month|lastmonth|year|all)\n\
-        /diff — Lihat diff commit terakhir\n\
-        /help — Tampilkan bantuan ini{admin_section}\n\n\
-        Kirim pesan biasa untuk memulai coding dengan AI agent.",
-        admin_section = admin_section
-    );
-    send_message(client, &config.telegram_bot_token, chat_id, &reply).await?;
+        /help — Tampilkan bantuan ini\n\n\
+        Admin:\n\
+        /adduser <telegram_id> <nama> — Tambah user\n\
+        /removeuser <telegram_id> — Hapus user\n\n\
+        Kirim pesan biasa untuk memulai coding dengan AI agent.";
+    send_message(client, &config.telegram_bot_token, chat_id, reply).await?;
     Ok(())
 }
 
@@ -406,267 +392,6 @@ async fn cmd_removeuser(
         send_message(client, &config.telegram_bot_token, chat_id,
             "User tidak ditemukan.").await?;
     }
-    Ok(())
-}
-
-async fn cmd_newproject(
-    client: &Client,
-    config: &Config,
-    db: &PgPool,
-    tg_user: &TelegramDbUser,
-    chat_id: i64,
-    parts: &[&str],
-) -> anyhow::Result<()> {
-    // Format: /newproject <nama> <repo_url>
-    if parts.len() < 3 {
-        send_message(client, &config.telegram_bot_token, chat_id,
-            "Gunakan: /newproject <nama> <repo_url>\nContoh: /newproject test-martabak https://github.com/user/test-martabak").await?;
-        return Ok(());
-    }
-    let name = parts[1].trim();
-    let repo_url = parts[2].trim();
-
-    // Buat slug dari nama (lowercase, spasi jadi dash)
-    let slug = name.to_lowercase().replace(' ', "-");
-
-    // Validasi repo_url
-    if !repo_url.starts_with("https://") {
-        send_message(client, &config.telegram_bot_token, chat_id,
-            "⚠️ repo_url harus diawali https://").await?;
-        return Ok(());
-    }
-
-    // Sanitize: strip token dari URL (https://x-access-token:TOKEN@github.com → https://github.com)
-    let repo_url = if let Some(at_pos) = repo_url.find('@') {
-        format!("https://{}", &repo_url[at_pos + 1..])
-    } else {
-        repo_url.to_string()
-    };
-
-    // Cek apakah slug sudah ada
-    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM projects WHERE slug = $1)")
-        .bind(&slug)
-        .fetch_one(db)
-        .await
-        .unwrap_or(false);
-    if exists {
-        send_message(client, &config.telegram_bot_token, chat_id,
-            &format!("⚠️ Project dengan slug `{}` sudah ada. Gunakan nama lain.", slug)).await?;
-        return Ok(());
-    }
-
-    // Buat project
-    let project_id: uuid::Uuid = sqlx::query_scalar(
-        "INSERT INTO projects (id, team_id, name, slug, repo_url, openclaw_agent_id)
-         VALUES (uuid_generate_v4(), uuid_generate_v4(), $1, $2, $3, 'default')
-         RETURNING id"
-    )
-    .bind(name)
-    .bind(&slug)
-    .bind(repo_url.as_str())
-    .fetch_one(db)
-    .await
-    .map_err(|e| anyhow::anyhow!("Gagal buat project: {}", e))?;
-
-    // Tambah user sebagai admin project
-    let _ = sqlx::query(
-        "INSERT INTO project_members (project_id, user_id, role) VALUES ($1, $2, 'admin')"
-    )
-    .bind(project_id)
-    .bind(tg_user.user_id)
-    .execute(db)
-    .await;
-
-    // Set sebagai active project
-    let _ = sqlx::query(
-        "UPDATE telegram_users SET active_project_id = $1 WHERE telegram_id = $2"
-    )
-    .bind(project_id)
-    .bind(tg_user.telegram_id)
-    .execute(db)
-    .await;
-
-    send_message(client, &config.telegram_bot_token, chat_id,
-        &format!("✅ Project `{}` berhasil dibuat!\nRepo: {}\nSlug: {}\n\nProject ini sudah di-set sebagai project aktif. Langsung kirim prompt untuk mulai coding.",
-            name, repo_url, slug)).await?;
-    Ok(())
-}
-
-async fn cmd_cost(
-    client: &Client,
-    config: &Config,
-    db: &PgPool,
-    tg_user: &TelegramDbUser,
-    chat_id: i64,
-    parts: &[&str],
-) -> anyhow::Result<()> {
-    let period = parts.get(1).unwrap_or(&"today").trim();
-    let (period_filter, period_label) = match period {
-        "today" => ("created_at >= CURRENT_DATE", "Hari Ini"),
-        "yesterday" => ("created_at >= CURRENT_DATE - INTERVAL '1 day' AND created_at < CURRENT_DATE", "Kemarin"),
-        "month" => ("DATE_TRUNC('month', created_at) = DATE_TRUNC('month', NOW())", "Bulan Ini"),
-        "lastmonth" => ("DATE_TRUNC('month', created_at) = DATE_TRUNC('month', NOW() - INTERVAL '1 month')", "Bulan Lalu"),
-        "year" => ("DATE_TRUNC('year', created_at) = DATE_TRUNC('year', NOW())", "Tahun Ini"),
-        "all" => ("1=1", "Semua"),
-        _ => {
-            send_message(client, &config.telegram_bot_token, chat_id,
-                "❓ Period tidak valid. Gunakan: today | yesterday | month | lastmonth | year | all").await?;
-            return Ok(());
-        }
-    };
-
-    let query = format!(
-        "SELECT \
-            COALESCE(COUNT(*), 0) as total_runs, \
-            COALESCE(SUM(tokens_input), 0) as total_input, \
-            COALESCE(SUM(tokens_output), 0) as total_output, \
-            COALESCE(SUM(cost_usd), 0)::FLOAT8 as total_cost, \
-            COALESCE(COUNT(*) FILTER (WHERE status = 'completed'), 0) as completed_runs, \
-            COALESCE(COUNT(*) FILTER (WHERE status = 'failed_agent'), 0) as failed_runs \
-         FROM agent_runs WHERE user_id = $1 AND {}",
-        period_filter
-    );
-
-    let row = sqlx::query_as::<_, (i64, i64, i64, f64, i64, i64)>(&query)
-        .bind(tg_user.user_id)
-        .fetch_one(db)
-        .await?;
-
-    let (total_runs, total_input, total_output, total_cost, completed_runs, failed_runs) = row;
-
-    let reply = format!(
-        "💰 Cost Report — {}\n\n\
-         ✅ Run selesai: {}\n\
-         ❌ Run gagal: {}\n\
-         📊 Total run: {}\n\n\
-         🔤 Token input:  {}\n\
-         🔤 Token output: {}\n\
-         💵 Estimasi biaya: ${:.4}\n\n\
-         Gunakan /cost <period> untuk periode lain:\n\
-         today | yesterday | month | lastmonth | year | all",
-        period_label, completed_runs, failed_runs, total_runs,
-        format_number(total_input), format_number(total_output), total_cost
-    );
-
-    send_message(client, &config.telegram_bot_token, chat_id, &reply).await?;
-    Ok(())
-}
-
-fn format_number(n: i64) -> String {
-    let s = n.to_string();
-    let mut result = String::new();
-    for (i, c) in s.chars().rev().enumerate() {
-        if i > 0 && i % 3 == 0 {
-            result.push(',');
-        }
-        result.push(c);
-    }
-    result.chars().rev().collect()
-}
-
-async fn cmd_diff(
-    client: &Client,
-    config: &Config,
-    db: &PgPool,
-    tg_user: &TelegramDbUser,
-    chat_id: i64,
-) -> anyhow::Result<()> {
-    // Find last completed run for this user
-    let last_run = sqlx::query_as::<_, (Uuid, Option<String>, Option<String>)>(
-        "SELECT id, worktree_path, branch_name FROM agent_runs \
-         WHERE user_id = $1 AND status = 'completed' AND commit_sha IS NOT NULL \
-         ORDER BY finished_at DESC LIMIT 1"
-    )
-    .bind(tg_user.user_id)
-    .fetch_optional(db)
-    .await?;
-
-    let (_run_id, worktree_path, _branch) = match last_run {
-        Some(r) => r,
-        None => {
-            send_message(client, &config.telegram_bot_token, chat_id,
-                "Belum ada run yang selesai dengan commit.").await?;
-            return Ok(());
-        }
-    };
-
-    // Get workspace path from project config
-    let workspace_from_project = if let Some(pid) = tg_user.active_project_id {
-        let slug = sqlx::query_scalar::<_, String>(
-            "SELECT slug FROM projects WHERE id = $1"
-        ).bind(pid).fetch_optional(db).await?.unwrap_or_default();
-        if !slug.is_empty() {
-            Some(format!("{}/default/{}", config.workspaces_path, slug))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    // Try worktree_path first, then workspace from project
-    let diff_path = worktree_path
-        .or(workspace_from_project)
-        .unwrap_or_default();
-
-    if diff_path.is_empty() {
-        send_message(client, &config.telegram_bot_token, chat_id,
-            "Tidak bisa menemukan workspace untuk diff.").await?;
-        return Ok(());
-    }
-
-    // Run git diff
-    let output = tokio::process::Command::new("git")
-        .args(["-C", &diff_path, "diff", "HEAD~1", "HEAD"])
-        .output()
-        .await;
-
-    let diff_text = match output {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
-        Ok(o) => {
-            let err = String::from_utf8_lossy(&o.stderr);
-            send_message(client, &config.telegram_bot_token, chat_id,
-                &format!("Git diff gagal: {}", err)).await?;
-            return Ok(());
-        }
-        Err(e) => {
-            send_message(client, &config.telegram_bot_token, chat_id,
-                &format!("Error menjalankan git: {}", e)).await?;
-            return Ok(());
-        }
-    };
-
-    if diff_text.trim().is_empty() {
-        send_message(client, &config.telegram_bot_token, chat_id,
-            "Tidak ada diff untuk commit terakhir.").await?;
-        return Ok(());
-    }
-
-    if diff_text.len() <= 3000 {
-        let msg = format!("```diff\n{}\n```", diff_text);
-        send_message(client, &config.telegram_bot_token, chat_id, &msg).await?;
-    } else {
-        // Send as file
-        send_document(client, &config.telegram_bot_token, chat_id, "diff.patch", diff_text.as_bytes()).await?;
-    }
-    Ok(())
-}
-
-async fn send_document(
-    client: &Client,
-    token: &str,
-    chat_id: i64,
-    filename: &str,
-    content: &[u8],
-) -> anyhow::Result<()> {
-    let url = format!("https://api.telegram.org/bot{}/sendDocument", token);
-    let part = reqwest::multipart::Part::bytes(content.to_vec())
-        .file_name(filename.to_string())
-        .mime_str("text/plain")?;
-    let form = reqwest::multipart::Form::new()
-        .text("chat_id", chat_id.to_string())
-        .part("document", part);
-    client.post(&url).multipart(form).send().await?;
     Ok(())
 }
 
