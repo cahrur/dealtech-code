@@ -25,7 +25,7 @@ async fn recover_stuck_runs(db: &PgPool, redis: &mut ConnectionManager) -> anyho
     let stuck_runs = sqlx::query_as::<_, StuckRun>(
         "SELECT id, session_id FROM agent_runs \
          WHERE status IN ('running_agent','processing','queued') \
-         AND (timeout_at < NOW() OR (timeout_at IS NULL AND created_at < NOW() - INTERVAL '15 minutes'))"
+         AND timeout_at < NOW()"
     )
     .fetch_all(db)
     .await?;
