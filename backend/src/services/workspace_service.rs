@@ -100,8 +100,9 @@ pub async fn get_or_create_session_branch(
     db: &PgPool,
     workspace_path: &PathBuf,
     session_id: Uuid,
+    force_new: bool,
 ) -> Result<String> {
-    // Check if session already has an active branch
+    // Check if this session already has a branch assigned
     let existing: Option<String> = sqlx::query_scalar(
         "SELECT active_branch FROM coding_sessions WHERE id = $1"
     )
@@ -112,7 +113,6 @@ pub async fn get_or_create_session_branch(
     .flatten();
 
     if let Some(branch) = existing {
-        // Verify branch actually exists in git
         let exists = Command::new("git")
             .args(["-C", workspace_path.to_str().unwrap_or(""), "rev-parse", "--verify", &branch])
             .output().await.map(|o| o.status.success()).unwrap_or(false);
@@ -121,6 +121,41 @@ pub async fn get_or_create_session_branch(
             return Ok(branch);
         }
         tracing::warn!(session_id = %session_id, branch = %branch, "Session branch missing from git, recreating");
+    }
+
+    // If not force_new, try to reuse the latest branch from any session for same project+user
+    if !force_new {
+        let latest_branch: Option<String> = sqlx::query_scalar(
+            "SELECT active_branch FROM coding_sessions \
+             WHERE project_id = (SELECT project_id FROM coding_sessions WHERE id = $1) \
+             AND user_id = (SELECT user_id FROM coding_sessions WHERE id = $1) \
+             AND active_branch IS NOT NULL \
+             AND id != $1 \
+             ORDER BY created_at DESC LIMIT 1"
+        )
+        .bind(session_id)
+        .fetch_optional(db)
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("DB error: {}", e)))?
+        .flatten();
+
+        if let Some(branch) = latest_branch {
+            // Verify branch exists in git
+            let exists = Command::new("git")
+                .args(["-C", workspace_path.to_str().unwrap_or(""), "rev-parse", "--verify", &branch])
+                .output().await.map(|o| o.status.success()).unwrap_or(false);
+            if exists {
+                // Assign this branch to current session too
+                let _ = sqlx::query(
+                    "UPDATE coding_sessions SET active_branch=$1, branch_created_at=NOW() WHERE id=$2"
+                )
+                .bind(&branch)
+                .bind(session_id)
+                .execute(db).await;
+                tracing::info!(session_id = %session_id, branch = %branch, "Reusing branch from previous session");
+                return Ok(branch);
+            }
+        }
     }
 
     // Create new branch from main
@@ -132,13 +167,11 @@ pub async fn get_or_create_session_branch(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        // Branch may already exist but wasn't in DB — that's fine
         if !stderr.contains("already exists") {
             return Err(AppError::Internal(anyhow::anyhow!("git branch failed: {}", stderr.trim())));
         }
     }
 
-    // Persist to DB
     sqlx::query(
         "UPDATE coding_sessions SET active_branch=$1, branch_created_at=NOW() WHERE id=$2"
     )

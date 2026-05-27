@@ -177,8 +177,17 @@ async fn run_inner(
     };
 
     // Get or create persistent branch for this session (1 branch per session)
+    // Check if user requested a new branch via /newsession
+    let force_new_key = format!("tg:force_new_branch:{}:{}", user_id, run.project_id);
+    let force_new: bool = redis::cmd("GETDEL")
+        .arg(&force_new_key)
+        .query_async(&mut redis)
+        .await
+        .unwrap_or(None::<String>)
+        .is_some();
+
     let branch_name = match workspace_service::get_or_create_session_branch(
-        db.as_ref(), &workspace_path, session_id,
+        db.as_ref(), &workspace_path, session_id, force_new,
     ).await {
         Ok(b) => b,
         Err(e) => {

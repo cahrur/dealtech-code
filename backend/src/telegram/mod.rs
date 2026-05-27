@@ -428,31 +428,24 @@ async fn cmd_newsession(
         }
     };
 
-    // Create new session
-    let session_id = Uuid::new_v4();
-    let title = format!("Telegram - {} - {} (new)", tg_user.name, chrono_today());
-    sqlx::query(
-        "INSERT INTO coding_sessions (id, project_id, user_id, title) VALUES ($1, $2, $3, $4)"
-    )
-    .bind(session_id)
-    .bind(project_id)
-    .bind(tg_user.user_id)
-    .bind(&title)
-    .execute(db)
-    .await?;
-
-    // Pin this session in Redis for this user+project (expires in 24h)
-    let key = format!("tg:pinned_session:{}:{}", tg_user.user_id, project_id);
+    // Set force_new_branch flag in Redis — consumed once by next run
+    let force_key = format!("tg:force_new_branch:{}:{}", tg_user.user_id, project_id);
     let _: std::result::Result<(), _> = redis::cmd("SETEX")
-        .arg(&key)
+        .arg(&force_key)
         .arg(86400u64)
-        .arg(session_id.to_string())
+        .arg("1")
+        .query_async(redis)
+        .await;
+
+    // Also clear any pinned session so get_or_create_session makes a fresh one
+    let pin_key = format!("tg:pinned_session:{}:{}", tg_user.user_id, project_id);
+    let _: std::result::Result<(), _> = redis::cmd("DEL")
+        .arg(&pin_key)
         .query_async(redis)
         .await;
 
     send_message(client, &config.telegram_bot_token, chat_id,
-        &format!("✅ Session baru dimulai!\n\nID: {}\nBranch baru akan dibuat saat kamu kirim pesan pertama.",
-            &session_id.to_string()[..8])).await?;
+        "✅ Session baru akan dimulai saat kamu kirim pesan berikutnya.\nBranch baru akan dibuat otomatis.").await?;
     Ok(())
 }
 
@@ -765,11 +758,11 @@ async fn get_or_create_session(
         }
     }
 
-    // Check for most recent session for this user + project (no date filter)
-    // Branch persists across days — new session only via /newsession
-    let latest_session = sqlx::query_scalar::<_, Uuid>(
+    // Check for existing session today for this telegram user + project (fresh context per day)
+    let today_session = sqlx::query_scalar::<_, Uuid>(
         "SELECT id FROM coding_sessions \
          WHERE project_id = $1 AND user_id = $2 \
+         AND created_at::date = CURRENT_DATE \
          ORDER BY created_at DESC LIMIT 1"
     )
     .bind(project_id)
@@ -777,7 +770,7 @@ async fn get_or_create_session(
     .fetch_optional(db)
     .await?;
 
-    if let Some(sid) = latest_session {
+    if let Some(sid) = today_session {
         return Ok(sid);
     }
 
