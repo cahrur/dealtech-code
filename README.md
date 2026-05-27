@@ -1,6 +1,6 @@
 # Dealtech Code — AI Coding Agent Platform
 
-Platform AI coding agent yang memungkinkan tim developer berkolaborasi dengan AI untuk mengerjakan proyek coding langsung di repository GitHub. Kirim prompt dari Android app atau Telegram, agent AI bekerja otomatis — edit file, commit, dan push ke branch.
+Platform AI coding agent yang memungkinkan tim developer berkolaborasi dengan AI untuk mengerjakan proyek coding langsung di repository GitHub. Kirim prompt dari Android app atau Telegram, agent AI bekerja otomatis — edit file, commit, push ke branch, dan buat PR.
 
 ## Spesifikasi Server
 
@@ -29,7 +29,8 @@ Platform AI coding agent yang memungkinkan tim developer berkolaborasi dengan AI
 - **Concurrency Guard** — hanya 1 run aktif per session
 - **Rate Limiting per User** — batasi request per menit
 - **Disk Space Alert** — notifikasi Telegram ke admin saat disk ≥ 85% (configurable)
-- **DB Backup via Telegram** — admin bisa trigger backup langsung dari chat
+- **Scheduled Daily Backup** — backup DB otomatis tiap malam, kirim ke Telegram admin
+- **DB Backup via Telegram** — admin bisa trigger backup manual langsung dari chat
 - **Redis Pub/Sub** — instant run pickup tanpa polling
 - **Realtime WebSocket** — streaming event ke Android app
 - **Policy Engine** — kontrol apa yang boleh dilakukan agent
@@ -38,6 +39,7 @@ Platform AI coding agent yang memungkinkan tim developer berkolaborasi dengan AI
 - **Usage & Cost Tracking** — catat token dan estimasi biaya per run
 - **API Key Auth** — SHA-256 hash, plain text tidak tersimpan
 - **Log Rotation** — semua container punya limit log otomatis
+- **Token Security** — GitHub token dipass via env var, tidak visible di `ps aux`
 
 ## Arsitektur
 
@@ -49,8 +51,9 @@ Rust Backend (Axum + Tokio)
     ├── Telegram Bot (long polling)
     ├── Agent Run Worker (Redis pub/sub)
     ├── Stuck Run Recovery Worker
-    ├── Cleanup Worker
-    └── Disk Alert Worker
+    ├── Cleanup Worker (worktree)
+    ├── Disk Alert Worker (hourly)
+    └── Backup Worker (daily 01:00 WIB)
     ↓  Private HTTP/SSE
 OpenClaw Gateway → AI Provider (Claude / GPT / dll)
     ↓  Sandbox
@@ -65,9 +68,9 @@ Docker Container → Git Worktree → branch → edit → commit → push → PR
 4. Clone/fetch repo, buat git worktree dari session branch
 5. Kirim prompt + context (max 20 pesan terakhir) ke OpenClaw
 6. Agent edit file di worktree
-7. Commit, push ke branch, buat PR otomatis
-8. Kirim hasil ke user via Telegram atau WebSocket
-9. Cleanup worktree (branch tetap ada)
+7. Commit (author: Dealtech Code), push ke branch, buat PR otomatis
+8. Kirim hasil + link PR ke user via Telegram atau WebSocket
+9. Cleanup worktree (branch tetap ada di GitHub)
 
 ## Konfigurasi
 
@@ -96,11 +99,14 @@ File: `/srv/ai-platform/.env`
 | `USER_RATE_LIMIT_PER_MINUTE` | `10` | Max request per user per menit |
 | `TELEGRAM_BOT_TOKEN` | (empty) | Token bot dari @BotFather |
 | `TELEGRAM_ENABLED` | `false` | Aktifkan Telegram bot |
-| `TELEGRAM_ADMIN_CHAT_ID` | (optional) | Chat ID admin untuk disk alert |
+| `TELEGRAM_ADMIN_CHAT_ID` | (optional) | Chat ID admin untuk disk alert & backup |
 | `DISK_ALERT_THRESHOLD_PCT` | `85` | Alert saat disk ≥ nilai ini (%) |
+| `BACKUP_HOUR_UTC` | `18` | Jam backup harian UTC (18 = 01:00 WIB) |
 | `CORS_ORIGIN` | `*` | Allowed origins, pisah koma untuk restrict |
 
 > **GitHub Token Scope:** Untuk auto PR, token perlu scope `repo`. Untuk repo public saja, `public_repo` cukup.
+
+> **TELEGRAM_ADMIN_CHAT_ID:** Dapatkan chat ID kamu dengan kirim pesan ke bot lalu cek `https://api.telegram.org/bot<TOKEN>/getUpdates`.
 
 ## Telegram Bot
 
@@ -109,9 +115,9 @@ File: `/srv/ai-platform/.env`
 1. Buat bot via [@BotFather](https://t.me/BotFather), dapatkan token
 2. Tambahkan ke `.env`:
    ```bash
-   TELEGRAM_BOT_TOKEN=123456:ABC-DEF
+   TELEGRAM_BOT_TOKEN=***
    TELEGRAM_ENABLED=true
-   TELEGRAM_ADMIN_CHAT_ID=123456789  # chat_id kamu untuk disk alert
+   TELEGRAM_ADMIN_CHAT_ID=123456789
    ```
 3. Restart: `cd /srv/ai-platform && docker compose up -d --no-deps backend`
 
@@ -121,26 +127,55 @@ Hanya user terdaftar di `telegram_users` yang bisa pakai bot. User pertama otoma
 
 ### Command
 
-| Command | Keterangan |
-|---|---|
-| `/start` | Mulai, tampilkan project aktif |
-| `/projects` | Daftar project |
-| `/project <slug>` | Pilih project aktif |
-| `/newproject <nama> <repo_url>` | Buat project baru |
-| `/runs` | 10 run terakhir (status, branch, commit, cost) |
-| `/newsession` | Mulai session baru dengan branch baru |
-| `/retry` | Ulangi run terakhir yang gagal |
-| `/cancel` | Batalkan run yang sedang berjalan |
-| `/status` | Status saat ini |
-| `/help` | Tampilkan bantuan |
-| `/adduser <telegram_id> <nama>` | (Admin) Tambah user |
-| `/removeuser <telegram_id>` | (Admin) Hapus user |
-| `/backup` | (Admin) Backup DB, kirim file ke chat |
+| Command | Siapa | Keterangan |
+|---|---|---|
+| `/start` | Semua | Mulai, tampilkan project aktif |
+| `/projects` | Semua | Daftar project |
+| `/project <slug>` | Semua | Pilih project aktif |
+| `/newproject <nama> <repo_url>` | Semua | Buat project baru |
+| `/runs` | Semua | 10 run terakhir (status, branch, commit, cost) |
+| `/newsession` | Semua | Mulai session baru dengan branch baru |
+| `/retry` | Semua | Ulangi run terakhir yang gagal |
+| `/cancel` | Semua | Batalkan run yang sedang berjalan |
+| `/status` | Semua | Status saat ini (admin dapat info lebih lengkap) |
+| `/help` | Semua | Tampilkan bantuan |
+| `/adduser <telegram_id> <nama>` | Admin | Tambah user |
+| `/removeuser <telegram_id>` | Admin | Hapus user |
+| `/backup` | Admin | Backup DB manual, kirim file ke chat |
+
+### `/status` — User vs Admin
+
+**User biasa:**
+```
+📊 Status
+👤 User: Riski
+📂 Project: laziznu (laziznu)
+🌿 Branch: ai/session-0b140b65
+⏳ Run aktif: running_agent
+
+📅 Runs hari ini: 3
+💰 Cost hari ini: $0.0142
+```
+
+**Admin:**
+```
+📊 Status
+[... info user ...]
+
+─── Admin Panel ───
+👥 Total users: 5
+📁 Total projects: 3
+⚡ Active runs: 1
+📅 Runs hari ini (semua): 12
+💰 Cost hari ini (semua): $0.0891
+💳 Total cost all-time: $1.2340
+💾 Disk: 🟢 Workspaces: 23% | 🟢 Worktrees: 8%
+```
 
 ### Alur Penggunaan
 
 1. Admin tambah user: `/adduser 123456789 Nama`
-2. User pilih project: `/project my-api`
+2. User buat project: `/newproject my-api https://github.com/org/my-api`
 3. Kirim prompt: `"Tambahkan endpoint health check"`
 4. Bot balas: `"⏳ Agent sedang bekerja..."`
 5. Setelah selesai: hasil + link PR dikirim otomatis
@@ -150,14 +185,14 @@ Hanya user terdaftar di `telegram_users` yang bisa pakai bot. User pertama otoma
 ### Autentikasi
 
 ```
-X-API-Key: ak_your_key_here
+X-API-Key: ***
 ```
 
 ### Endpoint
 
 | Method | Path | Keterangan |
 |---|---|---|
-| `GET` | `/health` | Health check (DB + Redis status) |
+| `GET` | `/health` | Health check — returns `{"status","db","redis"}` |
 | `POST` | `/api/apikeys` | Buat API key (admin) |
 | `GET` | `/api/apikeys` | List API keys |
 | `POST` | `/api/apikeys/:id/revoke` | Revoke API key |
@@ -175,7 +210,7 @@ X-API-Key: ak_your_key_here
 | `GET` | `/api/agent-runs/:id/diff` | Diff hasil run |
 | `GET` | `/api/agent-runs/:id/events` | Event stream |
 | `GET` | `/api/usage` | Usage & cost summary |
-| `WS` | `/ws?api_key=ak_xxx` | WebSocket realtime |
+| `WS` | `/ws?api_key=***` | WebSocket realtime |
 
 ## Instalasi
 
@@ -190,8 +225,9 @@ Installer akan:
 - Install Docker, dependencies
 - Setup PostgreSQL, Redis, Caddy
 - Buat symlink backend ke repo (no drift)
-- Konfigurasi Telegram bot (opsional)
+- Konfigurasi Telegram bot + admin chat ID (opsional)
 - Setup SSL otomatis via Caddy
+- Konfigurasi disk alert dan scheduled backup
 
 ## Update
 
@@ -200,15 +236,32 @@ cd /root/dealtech-code && git pull
 ./update.sh
 ```
 
+`update.sh` otomatis:
+- Pull kode terbaru
+- Tambahkan env vars baru yang missing ke `.env`
+- Rebuild dan restart backend
+- Jalankan migrasi DB baru
+
+## Background Workers
+
+| Worker | Interval | Fungsi |
+|---|---|---|
+| `agent_run_worker` | Real-time (Redis) | Pickup dan jalankan queued runs |
+| `stuck_run_recovery` | Setiap 5 menit | Reset run yang stuck/timeout |
+| `cleanup_worker` | Setiap jam | Hapus worktree lama (>7 hari) |
+| `disk_alert_worker` | Setiap jam | Alert Telegram saat disk ≥ threshold |
+| `backup_worker` | Harian 01:00 WIB | Backup DB → kirim ke Telegram admin |
+
 ## Security
 
-- API key di-hash SHA-256, tidak pernah disimpan plaintext
-- GitHub token dipass via `GIT_CONFIG` env var (tidak visible di `ps aux`)
-- SQL: semua query parameterized
-- CORS: configurable via `CORS_ORIGIN`
-- Telegram: whitelist DB, admin check via DB role
-- Cleanup worker: path traversal protection (hanya hapus path di bawah `WORKTREES_PATH`)
-- Rate limiting: per user per menit
+- **API key:** di-hash SHA-256, tidak pernah disimpan plaintext
+- **GitHub token:** dipass via `GIT_CONFIG` env var — tidak visible di `ps aux`
+- **SQL:** semua query parameterized — tidak ada injection risk
+- **CORS:** configurable via `CORS_ORIGIN`
+- **Telegram:** whitelist DB, admin check via DB role
+- **Cleanup worker:** path traversal protection (hanya hapus path di bawah `WORKTREES_PATH`)
+- **Rate limiting:** per user per menit (HTTP + Telegram)
+- **Session history:** capped 20 pesan — mencegah context bloat dan cost tak terkendali
 
 ## Development
 
