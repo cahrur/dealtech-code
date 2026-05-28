@@ -547,11 +547,59 @@ pub fn sanitize_user_prompt(prompt: &str) -> String {
 
 pub fn sanitize_user_facing_response(raw: &str) -> String {
     let mut text = raw.trim().to_string();
+
+    // Extract <reply> content if present (highest priority)
     if let (Some(start), Some(end)) = (text.find("<reply>"), text.find("</reply>")) {
         if end > start + 7 {
             text = text[start + 7..end].trim().to_string();
+            return text;
         }
     }
+
+    // Strip thinking/reasoning blocks that leaked
+    // Remove <thinking>...</thinking>, <scratchpad>...</scratchpad>, etc.
+    let thinking_tags = ["thinking", "scratchpad", "analysis", "reasoning"];
+    for tag in &thinking_tags {
+        let open = format!("<{}>", tag);
+        let close = format!("</{}>", tag);
+        while let (Some(s), Some(e)) = (text.find(&open), text.find(&close)) {
+            if e > s {
+                text = format!("{}{}", &text[..s], &text[e + close.len()..]);
+            } else {
+                break;
+            }
+        }
+    }
+
+    // Strip lines that look like internal reasoning (common patterns)
+    let lines: Vec<&str> = text.lines().collect();
+    let mut cleaned_lines: Vec<&str> = Vec::new();
+    let mut in_thinking = false;
+    for line in &lines {
+        let trimmed = line.trim();
+        // Detect thinking patterns
+        if trimmed.starts_with("OK, I think") ||
+           trimmed.starts_with("Let me ") ||
+           trimmed.starts_with("Now, line ") ||
+           trimmed.starts_with("If the method") ||
+           trimmed.starts_with("That would be the bug. But") ||
+           trimmed.starts_with("OK, so ") ||
+           trimmed.starts_with("So ") && trimmed.contains("is called with") ||
+           trimmed.starts_with("But what if") ||
+           trimmed.starts_with("I'd need to read") ||
+           trimmed.starts_with("The critical question is:") {
+            in_thinking = true;
+            continue;
+        }
+        if in_thinking && trimmed.is_empty() {
+            in_thinking = false;
+            continue;
+        }
+        if !in_thinking {
+            cleaned_lines.push(line);
+        }
+    }
+    text = cleaned_lines.join("\n").trim().to_string();
 
     // Strip contaminated injection prefix that leaked into session history.
     // OpenClaw may repeat this from prior contaminated replies.
