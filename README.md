@@ -40,6 +40,48 @@ Platform AI coding agent yang memungkinkan tim developer berkolaborasi dengan AI
 - **API Key Auth** — SHA-256 hash, plain text tidak tersimpan
 - **Log Rotation** — semua container punya limit log otomatis
 - **Token Security** — GitHub token dipass via env var, tidak visible di `ps aux`
+- **XML-Structured System Prompt** — prompt optimal dengan XML tags (identity/principles/constraints/skills) untuk output AI yang lebih akurat dan konsisten
+- **On-Demand Skills** — 11 coding standards (OWASP, SOLID, deployment, dll) yang dibaca agent saat dibutuhkan, hemat token
+- **Honest & Objective AI** — agent tidak yes-man, memberikan kritik konstruktif dan alternatif lebih baik
+- **MCP Context7 Ready** — integrasi dokumentasi library real-time via Model Context Protocol
+- **Docker Build Cache Cleanup** — cron mingguan otomatis prune build cache (mencegah disk penuh)
+- **Markdown Fallback** — jika Telegram reject Markdown formatting, otomatis fallback ke plain text
+- **Split Polling/API Client** — polling client (35s) terpisah dari API client (10s), bot tidak mati setelah run selesai
+
+## Skills (AI Coding Standards)
+
+Skills adalah kumpulan standar coding yang dibaca agent on-demand saat mengerjakan task. Tidak di-load semua sekaligus (hemat token), hanya yang relevan.
+
+| Skill | Deskripsi |
+|-------|-----------|
+| `api-standards` | Response format, HTTP codes, URL naming, OWASP API |
+| `auth-standards` | JWT, password hashing, session, RBAC/IDOR |
+| `coding-standards` | SOLID, clean code, schema validation, N+1 |
+| `config-standards` | .env, database connection, CORS |
+| `dealtech-ui` | React components (shadcn/ui pattern) |
+| `deployment-standards` | Docker caching, Coolify, CI/CD |
+| `frontend-performance-seo` | Core Web Vitals, SEO, Accessibility |
+| `security-standards` | Rate limiting, headers, injection, file upload |
+| `cloudflare-turnstile` | Bot protection via Cloudflare Turnstile |
+| `license-dealone` | Integrasi license key DealOne API |
+| `project-structure` | Folder layout multi-stack |
+
+### Cara Pakai
+
+User cukup bilang di prompt:
+```
+"Buatkan REST API auth dengan JWT, baca skills"
+```
+
+Agent otomatis baca `auth-standards` dan `api-standards` lalu ikuti standarnya.
+
+### Update Skills
+
+```bash
+cd /srv/ai-platform/skills && git pull
+```
+
+Tidak perlu rebuild Docker — skills di-mount sebagai volume read-only.
 
 ## Arsitektur
 
@@ -228,6 +270,16 @@ Installer akan:
 - Konfigurasi Telegram bot + admin chat ID (opsional)
 - Setup SSL otomatis via Caddy
 - Konfigurasi disk alert dan scheduled backup
+
+### Setup Skills & MCP (opsional)
+
+```bash
+./setup-extras.sh
+```
+
+Script ini otomatis:
+- Clone `Deal-Tech/skills` ke `/srv/ai-platform/skills/`
+- Setup MCP Context7 untuk OpenClaw (jika terinstall)
 
 ## Update
 
