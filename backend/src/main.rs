@@ -35,8 +35,9 @@ async fn main() -> anyhow::Result<()> {
 
     // On startup: reset any runs stuck in processing/running_agent back to queued
     // (happens when backend restarts mid-run)
+    // Also extend timeout_at so they don't immediately get killed by stuck_run_recovery
     let reset_count = sqlx::query_scalar::<_, i64>(
-        "UPDATE agent_runs SET status='queued', started_at=NULL \
+        "UPDATE agent_runs SET status='queued', started_at=NULL, timeout_at=NOW() + INTERVAL '10 minutes' \
          WHERE status IN ('processing','running_agent','preparing_workspace','collecting_diff','auto_push_or_pr') \
          AND finished_at IS NULL \
          RETURNING 1"

@@ -30,6 +30,9 @@ pub fn git_auth_env(token: &str) -> Vec<(String, String)> {
         ("GIT_CONFIG_COUNT".to_string(), "1".to_string()),
         ("GIT_CONFIG_KEY_0".to_string(), "http.extraHeader".to_string()),
         ("GIT_CONFIG_VALUE_0".to_string(), format!("Authorization: token {}", token)),
+        // Prevent git from hanging waiting for credentials in non-interactive env
+        ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
+        ("GIT_ASKPASS".to_string(), "echo".to_string()),
     ]
 }
 
