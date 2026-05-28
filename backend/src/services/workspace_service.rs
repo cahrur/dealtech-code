@@ -58,12 +58,12 @@ pub async fn prepare_workspace(
     repo_url: &str,
     github_token: Option<&str>,
 ) -> Result<PathBuf> {
-    // Use clean URL (no embedded token) + auth via env var to avoid token in ps aux
-    let clean_url = match github_token {
-        Some(_) => clean_github_url(repo_url),
+    // Use x-access-token in URL — http.extraHeader does not work with GitHub
+    let auth_url = match github_token {
+        Some(token) => inject_token_to_url(repo_url, token),
         None => repo_url.to_string(),
     };
-    let auth_env = github_token.map(git_auth_env).unwrap_or_default();
+    let clean_url = clean_github_url(repo_url); // for remote set-url (no token)
     let workspace_path = PathBuf::from(&config.workspaces_path)
         .join(team_slug)
         .join(project_slug);
@@ -78,7 +78,8 @@ pub async fn prepare_workspace(
         }
         let mut fetch_cmd = Command::new("git");
         fetch_cmd.args(["-C", workspace_path.to_str().unwrap(), "fetch", "origin"]);
-        for (k, v) in &auth_env { fetch_cmd.env(k, v); }
+        fetch_cmd.env("GIT_TERMINAL_PROMPT", "0");
+        fetch_cmd.env("GIT_ASKPASS", "echo");
         let fetch_result = tokio::time::timeout(
             tokio::time::Duration::from_secs(60),
             fetch_cmd.status()
@@ -102,8 +103,9 @@ pub async fn prepare_workspace(
             .await
             .map_err(|e| AppError::Internal(anyhow::anyhow!("mkdir: {}", e)))?;
         let mut clone_cmd = Command::new("git");
-        clone_cmd.args(["clone", "--depth=1", &clean_url, workspace_path.to_str().unwrap()]);
-        for (k, v) in &auth_env { clone_cmd.env(k, v); }
+        clone_cmd.args(["clone", "--depth=1", &auth_url, workspace_path.to_str().unwrap()]);
+        clone_cmd.env("GIT_TERMINAL_PROMPT", "0");
+        clone_cmd.env("GIT_ASKPASS", "echo");
         let clone_result = tokio::time::timeout(
             tokio::time::Duration::from_secs(120),
             clone_cmd.status()

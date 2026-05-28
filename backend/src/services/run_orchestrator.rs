@@ -117,6 +117,10 @@ async fn run_inner(
     let start_time = std::time::Instant::now();
     tracing::info!(run_id = %run_id, project = %project_slug, "run_inner started");
 
+    // Set started_at immediately so we can confirm run_inner is being called
+    let _ = sqlx::query("UPDATE agent_runs SET started_at=NOW() WHERE id=$1 AND started_at IS NULL")
+        .bind(run_id).execute(db.as_ref()).await;
+
     let run = sqlx::query_as::<_, AgentRun>("SELECT * FROM agent_runs WHERE id = $1")
         .bind(run_id).fetch_one(db.as_ref()).await?;
 
