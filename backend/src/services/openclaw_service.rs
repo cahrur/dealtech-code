@@ -562,14 +562,18 @@ pub fn sanitize_user_facing_response(raw: &str) -> String {
     // Extract <reply> content if present (highest priority)
     if let (Some(start), Some(end)) = (text.find("<reply>"), text.find("</reply>")) {
         if end > start + 7 {
-            text = text[start + 7..end].trim().to_string();
-            return text;
+            return text[start + 7..end].trim().to_string();
+        }
+    }
+    // Also try lowercase
+    if let (Some(start), Some(end)) = (text.find("<Reply>"), text.find("</Reply>")) {
+        if end > start + 7 {
+            return text[start + 7..end].trim().to_string();
         }
     }
 
-    // Strip thinking/reasoning blocks that leaked
-    // Remove <thinking>...</thinking>, <scratchpad>...</scratchpad>, etc.
-    let thinking_tags = ["thinking", "scratchpad", "analysis", "reasoning"];
+    // Strip thinking/reasoning blocks
+    let thinking_tags = ["thinking", "scratchpad", "analysis", "reasoning", "internal"];
     for tag in &thinking_tags {
         let open = format!("<{}>", tag);
         let close = format!("</{}>", tag);
@@ -579,6 +583,67 @@ pub fn sanitize_user_facing_response(raw: &str) -> String {
             } else {
                 break;
             }
+        }
+    }
+
+    // AGGRESSIVE: If response starts with thinking meta-commentary, strip it
+    // Common patterns: "OK, I...", "Let me...", "Actually...", "So ...", "Alright..."
+    let thinking_starters = [
+        "OK, I ", "Ok, I ", "OK I ", "Alright,", "Alright ",
+        "Let me ", "Actually,", "Actually ", "So,", "So ",
+        "Now I ", "Now, ", "Now let", "Hmm", "Wait",
+        "I now have", "I think ", "I need to", "I should",
+        "Based on my analysis", "After my analysis",
+        "I've analyzed", "I've reviewed", "I've read",
+    ];
+    let first_line = text.lines().next().unwrap_or("");
+    let starts_with_thinking = thinking_starters.iter().any(|s| first_line.starts_with(s));
+
+    if starts_with_thinking && text.len() > 500 {
+        // Find where actual content starts - look for structured content markers
+        let content_markers = [
+            "
+
+**", "
+
+##", "
+
+# ", "
+
+1.", "
+
+- **",
+            "
+
+Berdasarkan", "
+
+Based on my",
+            "
+
+Hasil", "
+
+Kesimpulan", "
+
+Temuan",
+            "
+
+Berikut", "
+
+Here",
+        ];
+        let mut best_pos: Option<usize> = None;
+        for marker in &content_markers {
+            if let Some(pos) = text.find(marker) {
+                // Skip the newline prefix
+                let actual_pos = pos + 2;
+                match best_pos {
+                    None => best_pos = Some(actual_pos),
+                    Some(bp) => if actual_pos < bp { best_pos = Some(actual_pos); }
+                }
+            }
+        }
+        if let Some(pos) = best_pos {
+            text = text[pos..].trim().to_string();
         }
     }
 
