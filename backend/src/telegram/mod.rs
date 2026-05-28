@@ -882,12 +882,14 @@ async fn cmd_pr(
         let num = pr_number.map(|n| format!("#{}", n)).unwrap_or_else(|| "-".to_string());
         let branch = branch_name.as_deref().unwrap_or("-");
         let prompt_short: String = prompt.chars().take(50).collect();
+        // Escape underscore agar tidak break Telegram Markdown italic parser
+        let prompt_escaped = prompt_short.replace('_', "\\_");
         let url = pr_url.as_deref().unwrap_or("-");
         reply.push_str(&format!(
             "\n🟢 PR {} — `{}`\n\
             💬 _{}_\n\
             🔗 {}\n",
-            num, branch, prompt_short, url
+            num, branch, prompt_escaped, url
         ));
         let _ = run_id; // suppress unused warning
     }

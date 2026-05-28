@@ -4,6 +4,8 @@ use sqlx::PgPool;
 use std::sync::Arc;
 use uuid::Uuid;
 
+use crate::services::run_orchestrator::notify_telegram;
+
 /// Worker that runs every 60 seconds to recover stuck runs.
 /// Queries for runs that have exceeded their timeout_at and marks them as failed.
 pub async fn run(db: Arc<PgPool>, mut redis: ConnectionManager) {
@@ -20,10 +22,11 @@ async fn recover_stuck_runs(db: &PgPool, redis: &mut ConnectionManager) -> anyho
     struct StuckRun {
         id: Uuid,
         session_id: Uuid,
+        telegram_chat_id: Option<i64>,
     }
 
     let stuck_runs = sqlx::query_as::<_, StuckRun>(
-        "SELECT id, session_id FROM agent_runs \
+        "SELECT id, session_id, telegram_chat_id FROM agent_runs \
          WHERE status IN ('running_agent','processing','queued') \
          AND timeout_at < NOW()"
     )
@@ -49,6 +52,18 @@ async fn recover_stuck_runs(db: &PgPool, redis: &mut ConnectionManager) -> anyho
         });
         let channel = format!("session:{}", run.session_id);
         let _: Result<(), _> = redis.publish(channel, payload.to_string()).await;
+
+        // Notify Telegram user so they're not left hanging
+        if let Some(chat_id) = run.telegram_chat_id {
+            // Clear active run key in Redis
+            let key = format!("tg:active_run:{}", chat_id);
+            let _: Result<(), _> = redis.del(&key).await;
+            notify_telegram(
+                &std::env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default(),
+                chat_id,
+                "⏰ Run kamu tadi timeout dan dihentikan otomatis. Silakan coba lagi.",
+            ).await;
+        }
     }
 
     Ok(())
