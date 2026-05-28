@@ -51,7 +51,10 @@ struct TelegramDbUser {
 
 pub async fn start_polling(config: Arc<Config>, db: PgPool, redis: ConnectionManager) {
     tracing::info!("Telegram bot polling started");
-    let client = Client::new();
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_default();
     let mut offset: i64 = 0;
 
     loop {
