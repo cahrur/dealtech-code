@@ -1311,6 +1311,14 @@ async fn send_message_md(
             tokio::time::sleep(tokio::time::Duration::from_secs(wait)).await;
             continue;
         }
+        // If Telegram rejects Markdown (400), fallback to plain text
+        if resp.status() == reqwest::StatusCode::BAD_REQUEST {
+            let plain_body = serde_json::json!({
+                "chat_id": chat_id,
+                "text": text,
+            });
+            let _ = client.post(&url).json(&plain_body).send().await;
+        }
         break;
     }
     Ok(())
