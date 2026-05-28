@@ -1310,7 +1310,8 @@ async fn send_message_md(
     let mut retries = 0u32;
     loop {
         let resp = client.post(&url).json(&body).send().await?;
-        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        let status = resp.status();
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
             retries += 1;
             if retries > 5 {
                 anyhow::bail!("Telegram rate limit exceeded after 5 retries");
@@ -1324,13 +1325,26 @@ async fn send_message_md(
             tokio::time::sleep(tokio::time::Duration::from_secs(wait)).await;
             continue;
         }
+        if status.is_success() {
+            break;
+        }
         // If Telegram rejects Markdown (400), fallback to plain text
-        if resp.status() == reqwest::StatusCode::BAD_REQUEST {
+        if status == reqwest::StatusCode::BAD_REQUEST {
+            tracing::warn!(chat_id = %chat_id, "send_message_md: Markdown rejected, falling back to plain text");
             let plain_body = serde_json::json!({
                 "chat_id": chat_id,
                 "text": text,
             });
-            let _ = client.post(&url).json(&plain_body).send().await;
+            let fallback_resp = client.post(&url).json(&plain_body).send().await?;
+            if !fallback_resp.status().is_success() {
+                let fb_text = fallback_resp.text().await.unwrap_or_default();
+                tracing::error!(chat_id = %chat_id, response = %fb_text, "send_message_md: plain text fallback also failed");
+                anyhow::bail!("Telegram sendMessage failed: {}", fb_text);
+            }
+        } else {
+            let err_text = resp.text().await.unwrap_or_default();
+            tracing::error!(chat_id = %chat_id, status = %status, response = %err_text, "send_message_md: unexpected status");
+            anyhow::bail!("Telegram sendMessage failed with status {}: {}", status, err_text);
         }
         break;
     }
