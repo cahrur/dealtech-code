@@ -30,7 +30,7 @@ pub async fn create_run(
     let run = sqlx::query_as::<_, AgentRun>(
         "INSERT INTO agent_runs
          (id, session_id, project_id, user_id, prompt, status, auto_mode, openclaw_agent_id, openclaw_session_key, model, timeout_at, telegram_chat_id)
-         VALUES ($1,$2,$3,$4,$5,'queued',$6,$7,$8,$9, NOW() + INTERVAL '10 minutes', $10) RETURNING *",
+         VALUES ($1,$2,$3,$4,$5,'queued',$6,$7,$8,$9, NOW() + INTERVAL '20 minutes', $10) RETURNING *",
     )
     .bind(run_id).bind(session_id).bind(project_id).bind(user_id)
     .bind(&req.prompt).bind(&auto_mode).bind(openclaw_agent_id).bind(&session_key).bind(&model)
@@ -262,7 +262,7 @@ async fn run_inner(
     };
 
     let agent_response = match tokio::time::timeout(
-        tokio::time::Duration::from_secs(600),
+        tokio::time::Duration::from_secs(1200),
         openclaw_service::run_agent_full(&config, &input),
     ).await {
         Ok(Ok(r)) => {
@@ -275,10 +275,10 @@ async fn run_inner(
             return finish_with_reply(db.as_ref(), &mut redis, run_id, session_id, &reply, true, &config.telegram_bot_token).await;
         }
         Err(_elapsed) => {
-            tracing::error!(run_id = %run_id, "OpenClaw call timed out after 10 minutes");
-            sqlx::query("UPDATE agent_runs SET error_message='Run timed out after 10 minutes' WHERE id=$1")
+            tracing::error!(run_id = %run_id, "OpenClaw call timed out after 20 minutes");
+            sqlx::query("UPDATE agent_runs SET error_message='Run timed out after 20 minutes' WHERE id=$1")
                 .bind(run_id).execute(db.as_ref()).await?;
-            let reply = "Run timed out after 10 minutes. Silakan coba lagi dengan prompt yang lebih sederhana.";
+            let reply = "Run timed out after 20 minutes. Silakan coba lagi dengan prompt yang lebih sederhana.";
             return finish_with_reply(db.as_ref(), &mut redis, run_id, session_id, reply, true, &config.telegram_bot_token).await;
         }
     };
