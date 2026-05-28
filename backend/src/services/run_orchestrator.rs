@@ -114,8 +114,8 @@ async fn run_inner(
     repo_url: String,
     policy_config: PolicyConfig,
 ) -> anyhow::Result<()> {
-    // Improvement 5: Track run duration
     let start_time = std::time::Instant::now();
+    tracing::info!(run_id = %run_id, project = %project_slug, "run_inner started");
 
     let run = sqlx::query_as::<_, AgentRun>("SELECT * FROM agent_runs WHERE id = $1")
         .bind(run_id).fetch_one(db.as_ref()).await?;
@@ -558,17 +558,19 @@ async fn emit(
 
 /// Send a Telegram message directly via Bot API (fire-and-forget).
 pub async fn notify_telegram(bot_token: &str, chat_id: i64, text: &str) {
-    // Reuse a single client across all calls — avoids TCP connection overhead
     static TG_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    let client = TG_CLIENT.get_or_init(reqwest::Client::new);
+    let client = TG_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_default()
+    });
     let url = format!("https://api.telegram.org/bot{}/sendMessage", bot_token);
 
-    // Split into 4000-char chunks to stay under Telegram's 4096-char limit
     let mut remaining = text;
     let mut first = true;
     loop {
         if remaining.is_empty() { break; }
-        // Small delay between chunks to avoid rate limiting
         if !first {
             tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
         }
