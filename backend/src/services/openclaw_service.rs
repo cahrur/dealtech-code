@@ -164,6 +164,17 @@ SELALU:
 - Riwayat percakapan = konteks sesi ini saja
 </task_rules>
 
+<output_format>
+WAJIB: Wrap jawaban akhir yang ditujukan ke user dalam tag <reply>...</reply>.
+Hanya isi di dalam <reply> yang akan dikirim ke user.
+Apapun di luar tag <reply> TIDAK akan terlihat oleh user.
+Jangan pernah output internal reasoning/thinking/analysis tanpa wrap <reply>.
+Contoh:
+<reply>
+Sudah saya fix bug di file X. Masalahnya adalah Y, solusinya Z.
+</reply>
+</output_format>
+
 <skills>
 Baca SKILL.md jika task butuh standar tertentu atau user minta "baca skills":
 - api-standards (/app/skills/api-standards/SKILL.md): Response format, HTTP codes, OWASP API
@@ -571,33 +582,52 @@ pub fn sanitize_user_facing_response(raw: &str) -> String {
         }
     }
 
-    // Strip lines that look like internal reasoning (common patterns)
+    // If response is very long (>2000 chars) and has no <reply> tag,
+    // it's likely internal reasoning that leaked. Try to find the actual conclusion.
+    if text.len() > 2000 {
+        // Look for common conclusion markers
+        let conclusion_markers = [
+            "Kesimpulan:", "Hasil:", "Summary:", "Jadi,", "Solusi:",
+            "Yang perlu diperbaiki:", "Fix:", "Done!", "Selesai",
+            "Sudah saya", "Berikut", "Ini hasilnya",
+        ];
+        for marker in &conclusion_markers {
+            if let Some(idx) = text.rfind(marker) {
+                // Take from the conclusion marker onwards
+                let candidate = text[idx..].trim().to_string();
+                if candidate.len() > 50 && candidate.len() < text.len() / 2 {
+                    text = candidate;
+                    break;
+                }
+            }
+        }
+    }
+
+    // Strip lines that look like internal reasoning
     let lines: Vec<&str> = text.lines().collect();
     let mut cleaned_lines: Vec<&str> = Vec::new();
-    let mut in_thinking = false;
     for line in &lines {
         let trimmed = line.trim();
-        // Detect thinking patterns
+        // Skip obvious thinking patterns
         if trimmed.starts_with("OK, I think") ||
-           trimmed.starts_with("Let me ") ||
-           trimmed.starts_with("Now, line ") ||
-           trimmed.starts_with("If the method") ||
-           trimmed.starts_with("That would be the bug. But") ||
            trimmed.starts_with("OK, so ") ||
-           trimmed.starts_with("So ") && trimmed.contains("is called with") ||
-           trimmed.starts_with("But what if") ||
-           trimmed.starts_with("I'd need to read") ||
-           trimmed.starts_with("The critical question is:") {
-            in_thinking = true;
+           trimmed.starts_with("Let me think") ||
+           trimmed.starts_with("Let me re-read") ||
+           trimmed.starts_with("Let me check") ||
+           trimmed.starts_with("Actually, wait") ||
+           trimmed.starts_with("Actually, let me") ||
+           trimmed.starts_with("Hmm, but wait") ||
+           trimmed.starts_with("But wait") ||
+           trimmed.starts_with("I'd need to") ||
+           trimmed.starts_with("The critical question") ||
+           trimmed.starts_with("That would be the bug") ||
+           (trimmed.starts_with("So ") && trimmed.contains("is called with")) ||
+           (trimmed.starts_with("If ") && trimmed.contains("method's logic")) ||
+           trimmed.starts_with("OK so let me") ||
+           trimmed.starts_with("OK so I've") {
             continue;
         }
-        if in_thinking && trimmed.is_empty() {
-            in_thinking = false;
-            continue;
-        }
-        if !in_thinking {
-            cleaned_lines.push(line);
-        }
+        cleaned_lines.push(line);
     }
     text = cleaned_lines.join("\n").trim().to_string();
 
@@ -1109,7 +1139,8 @@ pub fn build_agent_instructions(
          <task_rules>\n\
          - Chat biasa → jawab langsung, singkat, bahasa yang sama dengan user\n\
          - Coding task → kerja di workspace, tulis ke filesystem, summarize singkat\n\
-         - Wrap final answer dalam <reply>...</reply> jika memungkinkan\n\
+         - WAJIB wrap jawaban akhir dalam <reply>...</reply>. Hanya isi <reply> yang dikirim ke user.\n\
+         - Jangan output thinking/reasoning di luar tag <reply>.\n\
          - GitHub credentials dikelola platform — jangan minta token/SSH key dari user\n\
          </task_rules>"
     )
