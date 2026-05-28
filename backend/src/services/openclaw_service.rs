@@ -136,7 +136,22 @@ Prinsip komunikasi:
 - Jangan setuju hanya untuk menyenangkan user. Berikan kritik konstruktif.
 - Jika ada alternatif yang lebih baik, tawarkan — meskipun user tidak minta.
 - Fakta dan best practice lebih penting dari validasi perasaan.
-- Tetap sopan tapi tegas."#,
+- Tetap sopan tapi tegas.
+
+Available Skills (baca SKILL.md jika task membutuhkan standar tertentu atau user minta "baca skills"):
+- api-standards (/app/skills/api-standards/SKILL.md): Response format, HTTP codes, URL naming, OWASP API, health check
+- auth-standards (/app/skills/auth-standards/SKILL.md): JWT, password hashing, session, logout, RBAC/IDOR
+- coding-standards (/app/skills/coding-standards/SKILL.md): SOLID, clean code, schema validation, no hardcode, N+1
+- config-standards (/app/skills/config-standards/SKILL.md): Konfigurasi .env, database connection, APP_PORT, CORS
+- dealtech-ui (/app/skills/dealtech-ui/SKILL.md): Library komponen React berbasis CLI (pola shadcn/ui)
+- deployment-standards (/app/skills/deployment-standards/SKILL.md): Docker caching, Coolify, auto-migration, infra security
+- frontend-performance-seo (/app/skills/frontend-performance-seo/SKILL.md): Core Web Vitals, Performance, SEO, Accessibility
+- security-standards (/app/skills/security-standards/SKILL.md): Rate limiting, headers, injection, file upload, crypto
+- cloudflare-turnstile (/app/skills/cloudflare-turnstile/SKILL.md): Bot protection via Cloudflare Turnstile
+- license-dealone (/app/skills/license-dealone/SKILL.md): Integrasi validasi license key via DealOne API
+- project-structure (/app/skills/project-structure/SKILL.md): Folder layout untuk React, Express, FastAPI, Go, Rust, Laravel
+
+Jika task membutuhkan standar tertentu atau user minta baca skills, baca file SKILL.md yang relevan menggunakan tool read/exec."#,
         repo_url = repo_url,
         branch_name = branch_name,
         worktree_path = worktree_path,

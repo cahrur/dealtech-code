@@ -42,6 +42,7 @@ services:
       - /srv/ai-platform/workspaces:/srv/ai-platform/workspaces
       - /srv/ai-platform/worktrees:/srv/ai-platform/worktrees
       - /srv/ai-platform/logs:/srv/ai-platform/logs
+      - /srv/ai-platform/skills:/app/skills:ro
     depends_on:
       postgres:
         condition: service_healthy
