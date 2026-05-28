@@ -60,6 +60,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(workers::stuck_run_recovery::run(
         db_arc,
         redis.clone(),
+        config_arc.clone(),
     ));
 
     tokio::spawn(workers::disk_alert_worker::run(
