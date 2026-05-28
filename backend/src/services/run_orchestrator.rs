@@ -614,32 +614,15 @@ fn convert_markdown_for_telegram(text: &str) -> String {
             else if line.starts_with("## ") { &line[3..] }
             else if line.starts_with("# ") { &line[2..] }
             else { line };
-        // Convert **bold** → *bold* (must do before single *)
-        let line = convert_double_to_single(line, "**", "*");
+        // Convert **bold** → *bold* (simple replace, safe for UTF-8/emoji)
+        let line = line.replace("**", "*");
         // Convert __italic__ → _italic_
-        let line = convert_double_to_single(&line, "__", "_");
-        // Strip ~~strikethrough~~ markers
+        let line = line.replace("__", "_");
+        // Strip ~~strikethrough~~
         let line = line.replace("~~", "");
         result.push_str(&line);
         result.push('\n');
     }
-    // Remove trailing newline added by last iteration
     if result.ends_with('\n') { result.pop(); }
-    result
-}
-
-fn convert_double_to_single(text: &str, double: &str, single: &str) -> String {
-    let mut result = String::with_capacity(text.len());
-    let mut chars = text.as_bytes();
-    let d = double.as_bytes();
-    while !chars.is_empty() {
-        if chars.starts_with(d) {
-            result.push_str(single);
-            chars = &chars[d.len()..];
-        } else {
-            result.push(chars[0] as char);
-            chars = &chars[1..];
-        }
-    }
     result
 }
