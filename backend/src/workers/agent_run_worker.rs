@@ -152,18 +152,20 @@ async fn process_queued(
             let cfg2 = config.clone();
             let run_id = run.id;
             let sem_clone = semaphore.clone();
+            tracing::info!(run_id = %run_id, "worker: spawning task");
             tokio::spawn(async move {
-                // Improvement 2: Acquire semaphore permit before running
+                tracing::info!(run_id = %run_id, "worker: task started, acquiring semaphore");
                 let _permit = match &sem_clone {
                     Some(sem) => Some(sem.acquire().await.expect("semaphore closed")),
                     None => None,
                 };
+                tracing::info!(run_id = %run_id, "worker: semaphore acquired, calling execute_run");
                 run_orchestrator::execute_run(
                     db2, redis2, cfg2, run_id,
-                    run.user_id.to_string(), p.slug, p.repo_url,
+                    "default".to_string(), p.slug, p.repo_url,
                     policy_config,
                 ).await;
-                // Permit is dropped here, releasing the semaphore
+                tracing::info!(run_id = %run_id, "worker: execute_run finished");
             });
         }
     }
