@@ -135,7 +135,7 @@ async fn run_inner(
 
     if concurrent_count > 0 {
         let reply = "Masih ada run yang sedang berjalan di sesi ini. Tunggu sebentar lalu coba lagi.";
-        return finish_with_reply(db.as_ref(), &mut redis, run_id, session_id, reply, false).await;
+        return finish_with_reply(db.as_ref(), &mut redis, run_id, session_id, reply, false, &config.telegram_bot_token).await;
     }
 
     // Persist user message immediately so reopening a session still shows it
@@ -176,7 +176,7 @@ async fn run_inner(
                 "Tidak bisa mengakses repository `{}`. Pastikan URL repo benar dan credentials sudah dikonfigurasi.\n\nDetail: {}",
                 repo_url, e
             );
-            return finish_with_reply(db.as_ref(), &mut redis, run_id, session_id, &reply, false).await;
+            return finish_with_reply(db.as_ref(), &mut redis, run_id, session_id, &reply, false, &config.telegram_bot_token).await;
         }
     };
 
@@ -196,7 +196,7 @@ async fn run_inner(
         Ok(b) => b,
         Err(e) => {
             let reply = format!("Gagal menyiapkan branch untuk sesi ini. Detail: {}", e);
-            return finish_with_reply(db.as_ref(), &mut redis, run_id, session_id, &reply, false).await;
+            return finish_with_reply(db.as_ref(), &mut redis, run_id, session_id, &reply, false, &config.telegram_bot_token).await;
         }
     };
 
@@ -207,7 +207,7 @@ async fn run_inner(
         Ok(w) => w,
         Err(e) => {
             let reply = format!("Gagal membuat branch kerja `{}`. Detail: {}", branch_name, e);
-            return finish_with_reply(db.as_ref(), &mut redis, run_id, session_id, &reply, false).await;
+            return finish_with_reply(db.as_ref(), &mut redis, run_id, session_id, &reply, false, &config.telegram_bot_token).await;
         }
     };
 
@@ -268,14 +268,14 @@ async fn run_inner(
         Ok(Err(e)) => {
             tracing::error!("OpenClaw call failed: {:#}", e);
             let reply = "Agent tidak bisa diproses saat ini. Silakan coba lagi.".to_string();
-            return finish_with_reply(db.as_ref(), &mut redis, run_id, session_id, &reply, true).await;
+            return finish_with_reply(db.as_ref(), &mut redis, run_id, session_id, &reply, true, &config.telegram_bot_token).await;
         }
         Err(_elapsed) => {
             tracing::error!(run_id = %run_id, "OpenClaw call timed out after 10 minutes");
             sqlx::query("UPDATE agent_runs SET error_message='Run timed out after 10 minutes' WHERE id=$1")
                 .bind(run_id).execute(db.as_ref()).await?;
             let reply = "Run timed out after 10 minutes. Silakan coba lagi dengan prompt yang lebih sederhana.";
-            return finish_with_reply(db.as_ref(), &mut redis, run_id, session_id, reply, true).await;
+            return finish_with_reply(db.as_ref(), &mut redis, run_id, session_id, reply, true, &config.telegram_bot_token).await;
         }
     };
     let agent_reply = agent_response.reply.clone();
@@ -490,6 +490,7 @@ async fn finish_with_reply(
     session_id: Uuid,
     reply: &str,
     is_failure: bool,
+    bot_token: &str,
 ) -> anyhow::Result<()> {
     let _ = crate::services::session_service::add_message(db, session_id, "assistant", reply).await;
     let status = if is_failure { "failed_agent" } else { "completed" };
@@ -522,6 +523,8 @@ async fn finish_with_reply(
             .arg(&key)
             .query_async(redis)
             .await;
+        // Send the reply/error text to Telegram so user isn't left hanging
+        notify_telegram(bot_token, cid, reply).await;
     }
 
     Ok(())

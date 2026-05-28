@@ -6,7 +6,6 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::config::Config;
-use crate::domain::policy::PolicyConfig;
 use crate::services::run_orchestrator;
 
 #[derive(Debug, Deserialize)]
@@ -367,7 +366,7 @@ async fn cmd_status(
         ));
     }
 
-    send_message(client, &config.telegram_bot_token, chat_id, &reply).await?;
+    send_message_md(client, &config.telegram_bot_token, chat_id, &reply).await?;
     Ok(())
 }
 
@@ -845,7 +844,7 @@ async fn cmd_diff(
                     )
                 }
             };
-            send_message(client, &config.telegram_bot_token, chat_id, &body).await?;
+            send_message_md(client, &config.telegram_bot_token, chat_id, &body).await?;
         }
     }
     Ok(())
@@ -899,7 +898,7 @@ async fn cmd_pr(
         let _ = run_id; // suppress unused warning
     }
 
-    send_message(client, &config.telegram_bot_token, chat_id, &reply).await?;
+    send_message_md(client, &config.telegram_bot_token, chat_id, &reply).await?;
     Ok(())
 }
 
@@ -935,7 +934,7 @@ async fn cmd_help(
             /backup — Backup database (kirim via Telegram)");
     }
 
-    send_message(client, &config.telegram_bot_token, chat_id, &reply).await?;
+    send_message_md(client, &config.telegram_bot_token, chat_id, &reply).await?;
     Ok(())
 }
 
@@ -1130,32 +1129,14 @@ async fn handle_regular_message(
         db, session_id, project_id, tg_user.user_id, req, &openclaw_agent_id, Some(chat_id),
     ).await?;
 
-    // Load policy
-    let policy_config = {
-        let row = sqlx::query_scalar::<_, serde_json::Value>(
-            "SELECT policy FROM project_policies WHERE project_id = $1"
-        ).bind(project_id).fetch_optional(db).await?;
-        match row {
-            Some(val) => serde_json::from_value::<PolicyConfig>(val).unwrap_or_default(),
-            None => PolicyConfig::default(),
-        }
-    };
-
-    // Execute run
-    let db_arc = Arc::new(db.clone());
-    let run_id = run.id;
-    run_orchestrator::execute_run(
-        db_arc.clone(), redis, config.clone().into(), run_id,
-        "default".to_string(), project_slug, repo_url, policy_config,
-    ).await;
-
-    // Get the assistant reply from messages
-    let reply = sqlx::query_scalar::<_, String>(
-        "SELECT content FROM messages WHERE session_id = $1 AND role = 'assistant' ORDER BY created_at DESC LIMIT 1"
-    ).bind(session_id).fetch_optional(db).await?.unwrap_or_else(|| "Selesai.".to_string());
-
-    // Send reply, split if too long
-    send_long_message(client, &config.telegram_bot_token, chat_id, &reply).await?;
+    // Trigger worker immediately via Redis pub/sub (worker handles execution + Telegram reply)
+    let mut r = redis;
+    let payload = serde_json::json!({"run_id": run.id.to_string()});
+    let _: std::result::Result<(), _> = redis::cmd("PUBLISH")
+        .arg("agent_run:queued")
+        .arg(payload.to_string())
+        .query_async(&mut r)
+        .await;
 
     Ok(())
 }
@@ -1242,6 +1223,41 @@ async fn send_message(
     let body = serde_json::json!({
         "chat_id": chat_id,
         "text": text,
+    });
+
+    let mut retries = 0u32;
+    loop {
+        let resp = client.post(&url).json(&body).send().await?;
+        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            retries += 1;
+            if retries > 5 {
+                anyhow::bail!("Telegram rate limit exceeded after 5 retries");
+            }
+            let wait = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(retries as u64 * 2);
+            tokio::time::sleep(tokio::time::Duration::from_secs(wait)).await;
+            continue;
+        }
+        break;
+    }
+    Ok(())
+}
+
+async fn send_message_md(
+    client: &Client,
+    token: &str,
+    chat_id: i64,
+    text: &str,
+) -> anyhow::Result<()> {
+    let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
+    let body = serde_json::json!({
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "Markdown",
     });
 
     let mut retries = 0u32;
