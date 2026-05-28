@@ -51,14 +51,20 @@ struct TelegramDbUser {
 
 pub async fn start_polling(config: Arc<Config>, db: PgPool, redis: ConnectionManager) {
     tracing::info!("Telegram bot polling started");
-    let client = Client::builder()
+    // polling_client: 35s timeout to accommodate long polling (get_updates timeout=30)
+    // api_client: 10s timeout for sendMessage and other API calls
+    let polling_client = Client::builder()
+        .timeout(std::time::Duration::from_secs(35))
+        .build()
+        .unwrap_or_default();
+    let api_client = Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .unwrap_or_default();
     let mut offset: i64 = 0;
 
     loop {
-        match get_updates(&client, &config.telegram_bot_token, offset).await {
+        match get_updates(&polling_client, &config.telegram_bot_token, offset).await {
             Ok(updates) => {
                 for update in updates {
                     offset = update.update_id + 1;
@@ -66,7 +72,7 @@ pub async fn start_polling(config: Arc<Config>, db: PgPool, redis: ConnectionMan
                         let db = db.clone();
                         let redis = redis.clone();
                         let config = config.clone();
-                        let client = client.clone();
+                        let client = api_client.clone();
                         tokio::spawn(async move {
                             if let Err(e) = handle_message(&client, &config, &db, redis, &msg).await {
                                 tracing::error!(error = %e, "Telegram message handler error");
@@ -80,7 +86,6 @@ pub async fn start_polling(config: Arc<Config>, db: PgPool, redis: ConnectionMan
                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
             }
         }
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
     }
 }
 
