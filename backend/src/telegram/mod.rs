@@ -629,7 +629,7 @@ async fn cmd_newproject(
 
     // Check if slug already exists for this user
     let existing: Option<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM projects p \
+        "SELECT p.id FROM projects p \
          INNER JOIN project_members pm ON pm.project_id = p.id \
          WHERE pm.user_id = $1 AND p.slug = $2"
     )
