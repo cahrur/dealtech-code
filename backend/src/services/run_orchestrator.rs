@@ -562,6 +562,26 @@ pub async fn notify_telegram(bot_token: &str, chat_id: i64, text: &str) {
     static TG_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     let client = TG_CLIENT.get_or_init(reqwest::Client::new);
     let url = format!("https://api.telegram.org/bot{}/sendMessage", bot_token);
-    let body = serde_json::json!({ "chat_id": chat_id, "text": text, "parse_mode": "Markdown" });
-    let _ = client.post(&url).json(&body).send().await;
+
+    // Split into 4000-char chunks to stay under Telegram's 4096-char limit
+    let mut remaining = text;
+    let mut first = true;
+    loop {
+        if remaining.is_empty() { break; }
+        // Small delay between chunks to avoid rate limiting
+        if !first {
+            tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+        }
+        first = false;
+        let end = remaining.len().min(4000);
+        let split_at = if end < remaining.len() {
+            remaining[..end].rfind('\n').unwrap_or(end)
+        } else {
+            end
+        };
+        let chunk = &remaining[..split_at];
+        let body = serde_json::json!({ "chat_id": chat_id, "text": chunk, "parse_mode": "Markdown" });
+        let _ = client.post(&url).json(&body).send().await;
+        remaining = remaining[split_at..].trim_start();
+    }
 }

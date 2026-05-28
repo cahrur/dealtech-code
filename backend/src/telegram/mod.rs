@@ -447,7 +447,7 @@ async fn cmd_retry(
     tracing::info!(last_run_id = %last_id, "Retrying run via Telegram");
 
     // Get session and project info
-    let session_id = get_or_create_session(db, tg_user, project_id).await?;
+    let session_id = get_or_create_session(db, redis, tg_user, project_id).await?;
     let project = match crate::services::project_service::get(db, project_id, tg_user.user_id).await {
         Ok(p) => p,
         Err(_) => {
@@ -767,11 +767,16 @@ async fn cmd_runs(
         let branch_short = branch.as_deref().unwrap_or("-");
         let cost_str = cost.map(|c| format!("${:.4}", c)).unwrap_or_else(|| "-".to_string());
         let prompt_short = prompt.as_deref().unwrap_or("");
+        let prompt_display = if prompt_short.len() >= 60 {
+            format!("{}...", prompt_short)
+        } else {
+            prompt_short.to_string()
+        };
         lines.push(format!(
-            "{} [{}] {}\n   branch: {} | commit: {} | cost: {}\n   \"{}...\"\n",
+            "{} [{}] {}\n   branch: {} | commit: {} | cost: {}\n   \"{}\"\n",
             status_icon, short_id, status,
             branch_short, commit, cost_str,
-            prompt_short
+            prompt_display
         ));
     }
 
@@ -1067,7 +1072,7 @@ async fn handle_regular_message(
     client: &Client,
     config: &Config,
     db: &PgPool,
-    redis: ConnectionManager,
+    mut redis: ConnectionManager,
     tg_user: &TelegramDbUser,
     chat_id: i64,
     text: &str,
@@ -1106,7 +1111,7 @@ async fn handle_regular_message(
         "SELECT slug, repo_url, openclaw_agent_id FROM projects WHERE id = $1"
     ).bind(project_id).fetch_optional(db).await?;
 
-    let (project_slug, repo_url, openclaw_agent_id) = match project {
+    let (_project_slug, _repo_url, openclaw_agent_id) = match project {
         Some(p) => p,
         None => {
             send_message(client, &config.telegram_bot_token, chat_id,
@@ -1116,7 +1121,7 @@ async fn handle_regular_message(
     };
 
     // Auto-create or reuse today's coding session (checks Redis pinned session first)
-    let session_id = get_or_create_session(db, tg_user, project_id).await?;
+    let session_id = get_or_create_session(db, &mut redis, tg_user, project_id).await?;
 
     // Create run request
     let req = crate::domain::agent_run::CreateRunRequest {
@@ -1143,10 +1148,35 @@ async fn handle_regular_message(
 
 async fn get_or_create_session(
     db: &PgPool,
+    redis: &mut ConnectionManager,
     tg_user: &TelegramDbUser,
     project_id: Uuid,
 ) -> anyhow::Result<Uuid> {
-    // Check for existing session today for this telegram user + project (fresh context per day)
+    let pin_key = format!("tg:pinned_session:{}:{}", tg_user.user_id, project_id);
+
+    // Check Redis for pinned session — cleared by /newsession to force a fresh one
+    let pinned: Option<String> = redis::cmd("GET")
+        .arg(&pin_key)
+        .query_async(redis)
+        .await
+        .unwrap_or(None);
+
+    if let Some(sid_str) = pinned {
+        if let Ok(sid) = sid_str.parse::<Uuid>() {
+            let exists = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM coding_sessions WHERE id = $1)"
+            )
+            .bind(sid)
+            .fetch_one(db)
+            .await
+            .unwrap_or(false);
+            if exists {
+                return Ok(sid);
+            }
+        }
+    }
+
+    // Check for existing session today for this user + project
     let today_session = sqlx::query_scalar::<_, Uuid>(
         "SELECT id FROM coding_sessions \
          WHERE project_id = $1 AND user_id = $2 \
@@ -1159,6 +1189,10 @@ async fn get_or_create_session(
     .await?;
 
     if let Some(sid) = today_session {
+        // Pin so /newsession can clear it next time
+        let _: std::result::Result<(), _> = redis::cmd("SETEX")
+            .arg(&pin_key).arg(86400u64).arg(sid.to_string())
+            .query_async(redis).await;
         return Ok(sid);
     }
 
@@ -1168,12 +1202,13 @@ async fn get_or_create_session(
     sqlx::query(
         "INSERT INTO coding_sessions (id, project_id, user_id, title) VALUES ($1, $2, $3, $4)"
     )
-    .bind(session_id)
-    .bind(project_id)
-    .bind(tg_user.user_id)
-    .bind(&title)
-    .execute(db)
-    .await?;
+    .bind(session_id).bind(project_id).bind(tg_user.user_id).bind(&title)
+    .execute(db).await?;
+
+    // Pin the new session in Redis (24h TTL)
+    let _: std::result::Result<(), _> = redis::cmd("SETEX")
+        .arg(&pin_key).arg(86400u64).arg(session_id.to_string())
+        .query_async(redis).await;
 
     Ok(session_id)
 }
