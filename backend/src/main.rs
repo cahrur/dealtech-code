@@ -33,6 +33,22 @@ async fn main() -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("Bootstrap admin key failed: {}", e))?;
 
+    // On startup: reset any runs stuck in processing/running_agent back to queued
+    // (happens when backend restarts mid-run)
+    let reset_count = sqlx::query_scalar::<_, i64>(
+        "UPDATE agent_runs SET status='queued', started_at=NULL \
+         WHERE status IN ('processing','running_agent','preparing_workspace','collecting_diff','auto_push_or_pr') \
+         AND finished_at IS NULL \
+         RETURNING 1"
+    )
+    .fetch_all(&db)
+    .await
+    .map(|rows| rows.len())
+    .unwrap_or(0);
+    if reset_count > 0 {
+        tracing::warn!(count = reset_count, "Reset stuck runs to queued on startup");
+    }
+
     let state = AppState::new(db.clone(), redis.clone(), config.clone());
 
     let db_arc = Arc::new(db.clone());
