@@ -99,7 +99,18 @@ async fn get_updates(client: &Client, token: &str, offset: i64) -> anyhow::Resul
         .timeout(std::time::Duration::from_secs(35))
         .send()
         .await?;
-    let body: TelegramResponse<Vec<Update>> = resp.json().await?;
+    let status = resp.status();
+    let text = resp.text().await?;
+    tracing::debug!(status = %status, body_len = %text.len(), "get_updates raw response");
+    let body: TelegramResponse<Vec<Update>> = serde_json::from_str(&text)
+        .map_err(|e| {
+            tracing::error!(error = %e, body = %&text[..text.len().min(200)], "get_updates JSON parse error");
+            e
+        })?;
+    let count = body.result.as_ref().map(|r| r.len()).unwrap_or(0);
+    if count > 0 {
+        tracing::info!(count = %count, offset = %offset, "get_updates received updates");
+    }
     Ok(body.result.unwrap_or_default())
 }
 
@@ -113,6 +124,8 @@ async fn handle_message(
     let chat_id = msg.chat.id;
     let telegram_id = msg.from.as_ref().map(|u| u.id).unwrap_or(chat_id);
     let text = msg.text.as_deref().unwrap_or("");
+
+    tracing::info!(chat_id = %chat_id, telegram_id = %telegram_id, text = %text, "handle_message called");
 
     // Check whitelist
     let tg_user = sqlx::query_as::<_, TelegramDbUser>(
