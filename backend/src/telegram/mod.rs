@@ -822,34 +822,23 @@ async fn cmd_diff(
             let sha_display = if sha_short.len() >= 8 { &sha_short[..8] } else { sha_short };
             let branch = branch_name.as_deref().unwrap_or("-");
 
-            let body = match diff_stat {
+            // Header pakai Markdown, diff content kirim plain text chunked
+            // (diff punya +/-/*/_/` yang break Telegram Markdown parser)
+            let header = format!(
+                "📄 *Diff run terakhir*\n🌿 Branch: `{}`\n🔖 Commit: `{}`\n🆔 Run: `{}`",
+                branch, sha_display, &run_id.to_string()[..8]
+            );
+            send_message_md(client, &config.telegram_bot_token, chat_id, &header).await?;
+
+            match diff_stat {
                 Some(ref stat) if !stat.trim().is_empty() => {
-                    // Truncate if too long for Telegram (max 4096 chars)
-                    let stat_trimmed = if stat.len() > 3000 {
-                        format!("{}\n...(terpotong)", &stat[..3000])
-                    } else {
-                        stat.clone()
-                    };
-                    format!(
-                        "📄 *Diff run terakhir*\n\
-                        🌿 Branch: `{}`\n\
-                        🔖 Commit: `{}`\n\
-                        🆔 Run: `{}`\n\n\
-                        ```\n{}```",
-                        branch, sha_display, &run_id.to_string()[..8], stat_trimmed
-                    )
+                    send_long_message(client, &config.telegram_bot_token, chat_id, stat).await?;
                 }
                 _ => {
-                    format!(
-                        "📄 *Diff run terakhir*\n\
-                        🌿 Branch: `{}`\n\
-                        🔖 Commit: `{}`\n\n\
-                        _(diff stat tidak tersedia untuk run ini)_",
-                        branch, sha_display
-                    )
+                    send_message(client, &config.telegram_bot_token, chat_id,
+                        "(diff stat tidak tersedia untuk run ini)").await?;
                 }
-            };
-            send_message_md(client, &config.telegram_bot_token, chat_id, &body).await?;
+            }
         }
     }
     Ok(())
