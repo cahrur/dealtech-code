@@ -79,7 +79,12 @@ pub async fn prepare_workspace(
         let mut fetch_cmd = Command::new("git");
         fetch_cmd.args(["-C", workspace_path.to_str().unwrap(), "fetch", "origin"]);
         for (k, v) in &auth_env { fetch_cmd.env(k, v); }
-        let status = fetch_cmd.status().await
+        let fetch_result = tokio::time::timeout(
+            tokio::time::Duration::from_secs(60),
+            fetch_cmd.status()
+        ).await
+            .map_err(|_| AppError::Internal(anyhow::anyhow!("git fetch timed out after 60s")))?;
+        let status = fetch_result
             .map_err(|e| AppError::Internal(anyhow::anyhow!("git fetch: {}", e)))?;
         if !status.success() {
             return Err(AppError::Internal(anyhow::anyhow!("git fetch failed")));
@@ -97,12 +102,17 @@ pub async fn prepare_workspace(
             .await
             .map_err(|e| AppError::Internal(anyhow::anyhow!("mkdir: {}", e)))?;
         let mut clone_cmd = Command::new("git");
-        clone_cmd.args(["clone", &clean_url, workspace_path.to_str().unwrap()]);
+        clone_cmd.args(["clone", "--depth=1", &clean_url, workspace_path.to_str().unwrap()]);
         for (k, v) in &auth_env { clone_cmd.env(k, v); }
-        let status = clone_cmd.status().await
+        let clone_result = tokio::time::timeout(
+            tokio::time::Duration::from_secs(120),
+            clone_cmd.status()
+        ).await
+            .map_err(|_| AppError::Internal(anyhow::anyhow!("git clone timed out after 120s")))?;
+        let status = clone_result
             .map_err(|e| AppError::Internal(anyhow::anyhow!("git clone: {}", e)))?;
         if !status.success() {
-            return Err(AppError::Internal(anyhow::anyhow!("git clone failed")));
+            return Err(AppError::Internal(anyhow::anyhow!("git clone failed — cek apakah token GitHub punya akses ke repo ini")));
         }
         // Empty repo has no HEAD — create initial commit so worktrees work
         let has_head = Command::new("git")
