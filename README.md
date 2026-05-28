@@ -2,6 +2,21 @@
 
 Platform AI coding agent yang memungkinkan tim developer berkolaborasi dengan AI untuk mengerjakan proyek coding langsung di repository GitHub. Kirim prompt dari Android app atau Telegram, agent AI bekerja otomatis — edit file, commit, push ke branch, dan buat PR.
 
+## Kenapa Dealtech Code?
+
+Membangun sistem teknologi biasanya butuh tim besar, waktu berminggu-minggu, dan koordinasi yang rumit. Dengan Dealtech Code, prosesnya disederhanakan menjadi **3 langkah**:
+
+### 1. Analisa
+Jelaskan apa yang ingin dibangun — fitur, kebutuhan bisnis, atau masalah yang ingin diselesaikan. Agent memahami konteks dan mengajukan pertanyaan jika ada yang kurang jelas.
+
+### 2. Planning
+Agent merancang arsitektur, memilih tech stack yang sesuai, dan menyusun langkah implementasi. Kamu review dan approve sebelum eksekusi.
+
+### 3. Development
+Agent menulis kode, commit, push ke branch, dan buat PR — langsung production-ready mengikuti standar keamanan (OWASP) dan best practice (SOLID, clean code).
+
+**Hasilnya:** Dari ide ke aplikasi siap deploy, cukup dengan percakapan. Kamu fokus pada *apa* yang mau dibangun, agent mengerjakan *bagaimana* membangunnya.
+
 ## Spesifikasi Server
 
 | Komponen | Minimum | Rekomendasi |
