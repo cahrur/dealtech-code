@@ -69,10 +69,18 @@ pub async fn prepare_workspace(
         .join(project_slug);
 
     if workspace_path.exists() {
-        // Update remote URL to clean URL (no token)
-        if github_token.is_some() {
+        // Check if it's actually a valid git repo (not a partial/failed clone)
+        let git_dir = workspace_path.join(".git");
+        if !git_dir.exists() {
+            tracing::warn!(path = %workspace_path.display(), "workspace exists but not a git repo, re-cloning");
+            let _ = tokio::fs::remove_dir_all(&workspace_path).await;
+            // Fall through to clone below
+        } else {
+        // Update remote URL to use auth token
+        if let Some(ref token) = github_token {
+            let auth_url_for_remote = inject_token_to_url(repo_url, token);
             let _ = Command::new("git")
-                .args(["-C", workspace_path.to_str().unwrap(), "remote", "set-url", "origin", &clean_url])
+                .args(["-C", workspace_path.to_str().unwrap(), "remote", "set-url", "origin", &auth_url_for_remote])
                 .status()
                 .await;
         }
@@ -98,7 +106,10 @@ pub async fn prepare_workspace(
             .args(["-C", workspace_path.to_str().unwrap(), "pull", "--ff-only", "origin", "main"])
             .status()
             .await;
-    } else {
+        } // close inner else (valid git repo branch)
+    } // close outer if workspace_path.exists()
+
+    if !workspace_path.exists() {
         tokio::fs::create_dir_all(&workspace_path)
             .await
             .map_err(|e| AppError::Internal(anyhow::anyhow!("mkdir: {}", e)))?;
