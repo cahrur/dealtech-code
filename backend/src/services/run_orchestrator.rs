@@ -571,7 +571,11 @@ pub async fn notify_telegram(bot_token: &str, chat_id: i64, text: &str) {
     });
     let url = format!("https://api.telegram.org/bot{}/sendMessage", bot_token);
 
-    let mut remaining = text;
+    // Convert CommonMark **bold** → *bold* for Telegram legacy Markdown
+    // Also strip heading markers (# ## ###) that Telegram doesn't support
+    let converted = convert_markdown_for_telegram(text);
+
+    let mut remaining: &str = &converted;
     let mut first = true;
     loop {
         if remaining.is_empty() { break; }
@@ -586,8 +590,56 @@ pub async fn notify_telegram(bot_token: &str, chat_id: i64, text: &str) {
             end
         };
         let chunk = &remaining[..split_at];
-        let body = serde_json::json!({ "chat_id": chat_id, "text": chunk, "parse_mode": "Markdown" });
-        let _ = client.post(&url).json(&body).send().await;
+        // Try with Markdown first, fall back to plain text if Telegram rejects
+        let body_md = serde_json::json!({ "chat_id": chat_id, "text": chunk, "parse_mode": "Markdown" });
+        let resp = client.post(&url).json(&body_md).send().await;
+        let ok = resp.map(|r| r.status().is_success()).unwrap_or(false);
+        if !ok {
+            // Fallback: send as plain text (no parse_mode)
+            let body_plain = serde_json::json!({ "chat_id": chat_id, "text": chunk });
+            let _ = client.post(&url).json(&body_plain).send().await;
+        }
         remaining = remaining[split_at..].trim_start();
     }
+}
+
+/// Convert CommonMark/GitHub Markdown to Telegram legacy Markdown.
+/// Telegram legacy Markdown: *bold*, _italic_, `code`, ```pre```
+/// Does NOT support: **bold**, __italic__, # headings, ~~strikethrough~~
+fn convert_markdown_for_telegram(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    for line in text.lines() {
+        // Strip heading markers
+        let line = if line.starts_with("### ") { &line[4..] }
+            else if line.starts_with("## ") { &line[3..] }
+            else if line.starts_with("# ") { &line[2..] }
+            else { line };
+        // Convert **bold** → *bold* (must do before single *)
+        let line = convert_double_to_single(line, "**", "*");
+        // Convert __italic__ → _italic_
+        let line = convert_double_to_single(&line, "__", "_");
+        // Strip ~~strikethrough~~ markers
+        let line = line.replace("~~", "");
+        result.push_str(&line);
+        result.push('\n');
+    }
+    // Remove trailing newline added by last iteration
+    if result.ends_with('\n') { result.pop(); }
+    result
+}
+
+fn convert_double_to_single(text: &str, double: &str, single: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut chars = text.as_bytes();
+    let d = double.as_bytes();
+    while !chars.is_empty() {
+        if chars.starts_with(d) {
+            result.push_str(single);
+            chars = &chars[d.len()..];
+        } else {
+            result.push(chars[0] as char);
+            chars = &chars[1..];
+        }
+    }
+    result
 }
