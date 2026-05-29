@@ -26,6 +26,21 @@ struct TelegramMessage {
     from: Option<TelegramUser>,
     chat: TelegramChat,
     text: Option<String>,
+    caption: Option<String>,
+    photo: Option<Vec<TelegramPhotoSize>>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct TelegramPhotoSize {
+    file_id: String,
+    #[allow(dead_code)]
+    file_unique_id: String,
+    #[allow(dead_code)]
+    width: i32,
+    #[allow(dead_code)]
+    height: i32,
+    #[serde(default)]
+    file_size: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -144,13 +159,83 @@ async fn handle_message(
         }
     };
 
-    if text.starts_with('/') {
+    // Check if message has photo
+    let has_photo = msg.photo.as_ref().map(|p| !p.is_empty()).unwrap_or(false);
+
+    if has_photo {
+        let caption = msg.caption.as_deref().unwrap_or("Analisis gambar ini");
+        handle_photo_message(client, config, db, redis, &tg_user, chat_id, msg, caption).await?;
+    } else if text.starts_with('/') {
         handle_command(client, config, db, redis.clone(), &tg_user, chat_id, text).await?;
-    } else {
+    } else if !text.is_empty() {
         handle_regular_message(client, config, db, redis, &tg_user, chat_id, text).await?;
     }
 
     Ok(())
+}
+
+async fn handle_photo_message(
+    client: &Client,
+    config: &Config,
+    db: &PgPool,
+    redis: ConnectionManager,
+    tg_user: &TelegramDbUser,
+    chat_id: i64,
+    msg: &TelegramMessage,
+    caption: &str,
+) -> anyhow::Result<()> {
+    let photos = msg.photo.as_ref().unwrap();
+    // Get largest photo (last in array)
+    let photo = photos.last().unwrap();
+
+    // Download photo
+    let image_data = match download_telegram_photo(client, &config.telegram_bot_token, &photo.file_id).await {
+        Ok(data) => data,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to download photo");
+            send_message(client, &config.telegram_bot_token, chat_id,
+                "❌ Gagal download gambar. Coba lagi.").await?;
+            return Ok(());
+        }
+    };
+
+    // Encode to base64
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&image_data);
+    let image_context = format!("[Gambar dikirim oleh user, base64-encoded, {}KB]", image_data.len() / 1024);
+
+    // Build prompt with image reference
+    let prompt_with_image = format!(
+        "{}
+
+<attached_image>
+data:image/jpeg;base64,{}
+</attached_image>",
+        caption, b64
+    );
+
+    tracing::info!(chat_id = %chat_id, caption = %caption, image_size = image_data.len(), "Photo message received");
+
+    // Route to regular message handler with image-augmented prompt
+    handle_regular_message(client, config, db, redis, tg_user, chat_id, &prompt_with_image).await
+}
+
+async fn download_telegram_photo(client: &Client, token: &str, file_id: &str) -> anyhow::Result<Vec<u8>> {
+    // Step 1: getFile to get file_path
+    let url = format!("https://api.telegram.org/bot{}/getFile?file_id={}", token, file_id);
+    let resp = client.get(&url).send().await?;
+    let body: serde_json::Value = resp.json().await?;
+
+    let file_path = body["result"]["file_path"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("No file_path in getFile response"))?;
+
+    // Step 2: Download file
+    let download_url = format!("https://api.telegram.org/file/bot{}/{}", token, file_path);
+    let resp = client.get(&download_url).send().await?;
+    let bytes = resp.bytes().await?;
+
+    Ok(bytes.to_vec())
 }
 
 async fn handle_command(
