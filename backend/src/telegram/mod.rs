@@ -953,10 +953,10 @@ async fn cmd_cost(
     };
 
     // Per-project breakdown
-    let rows: Vec<(String, i64, f64, i64, i64)> = sqlx::query_as(
+    let rows: Vec<(String, i64, f64, i64, i64)> = match sqlx::query_as(
         &format!(
-            "SELECT p.name, COUNT(r.id), COALESCE(SUM(r.cost_usd), 0), \
-             COALESCE(SUM(r.tokens_input), 0), COALESCE(SUM(r.tokens_output), 0) \
+            "SELECT p.name, COUNT(r.id)::bigint, COALESCE(SUM(r.cost_usd), 0)::float8, \
+             COALESCE(SUM(r.tokens_input), 0)::bigint, COALESCE(SUM(r.tokens_output), 0)::bigint \
              FROM agent_runs r JOIN projects p ON r.project_id = p.id \
              WHERE r.user_id=$1 AND r.created_at > NOW() - INTERVAL '{}' \
              GROUP BY p.name ORDER BY SUM(r.cost_usd) DESC",
@@ -965,8 +965,15 @@ async fn cmd_cost(
     )
     .bind(tg_user.user_id)
     .fetch_all(db)
-    .await
-    .unwrap_or_default();
+    .await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "cmd_cost query failed");
+            send_message(client, &config.telegram_bot_token, chat_id,
+                &format!("❌ Error query cost: {}", e)).await?;
+            return Ok(());
+        }
+    };
 
     if rows.is_empty() {
         send_message(client, &config.telegram_bot_token, chat_id,
