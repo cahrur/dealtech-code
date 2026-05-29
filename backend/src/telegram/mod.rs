@@ -202,7 +202,6 @@ async fn handle_photo_message(
     // Encode to base64
     use base64::Engine;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&image_data);
-    let image_context = format!("[Gambar dikirim oleh user, base64-encoded, {}KB]", image_data.len() / 1024);
 
     // Build prompt with image reference
     let prompt_with_image = format!(
