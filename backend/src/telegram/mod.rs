@@ -177,6 +177,7 @@ async fn handle_command(
         "/backup" => cmd_backup(client, config, db, tg_user, chat_id).await?,
         "/newsession" => cmd_newsession(client, config, db, tg_user, chat_id, &mut redis).await?,
         "/runs" => cmd_runs(client, config, db, tg_user, chat_id).await?,
+        "/cost" => cmd_cost(client, config, db, tg_user, chat_id, &parts).await?,
         "/status" => cmd_status(client, config, db, tg_user, chat_id).await?,
         "/help" => cmd_help(client, config, db, &tg_user, chat_id).await?,
         "/adduser" => cmd_adduser(client, config, db, tg_user, chat_id, &parts).await?,
@@ -933,6 +934,82 @@ async fn cmd_pr(
     Ok(())
 }
 
+
+async fn cmd_cost(
+    client: &Client,
+    config: &Config,
+    db: &PgPool,
+    tg_user: &TelegramDbUser,
+    chat_id: i64,
+    parts: &[&str],
+) -> anyhow::Result<()> {
+    let period = parts.get(1).copied().unwrap_or("today");
+
+    let (interval_label, interval_sql) = match period {
+        "week" | "minggu" => ("7 hari terakhir", "7 days"),
+        "month" | "bulan" => ("30 hari terakhir", "30 days"),
+        "all" | "semua" => ("semua waktu", "100 years"),
+        _ => ("hari ini", "24 hours"),
+    };
+
+    // Per-project breakdown
+    let rows: Vec<(String, i64, f64, i64, i64)> = sqlx::query_as(
+        &format!(
+            "SELECT p.name, COUNT(r.id), COALESCE(SUM(r.cost_usd), 0), \
+             COALESCE(SUM(r.tokens_input), 0), COALESCE(SUM(r.tokens_output), 0) \
+             FROM agent_runs r JOIN projects p ON r.project_id = p.id \
+             WHERE r.user_id=$1 AND r.created_at > NOW() - INTERVAL '{}' \
+             GROUP BY p.name ORDER BY SUM(r.cost_usd) DESC",
+            interval_sql
+        )
+    )
+    .bind(tg_user.user_id)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+
+    if rows.is_empty() {
+        send_message(client, &config.telegram_bot_token, chat_id,
+            &format!("💰 Tidak ada penggunaan untuk periode: {}", interval_label)).await?;
+        return Ok(());
+    }
+
+    let mut total_cost: f64 = 0.0;
+    let mut total_runs: i64 = 0;
+    let mut total_input: i64 = 0;
+    let mut total_output: i64 = 0;
+    let mut lines = Vec::new();
+
+    for (name, runs, cost, input_tok, output_tok) in &rows {
+        total_cost += cost;
+        total_runs += runs;
+        total_input += input_tok;
+        total_output += output_tok;
+        lines.push(format!(
+            "  {} — {} runs, ${:.4} ({}/{}k tok)",
+            name, runs, cost, input_tok / 1000, output_tok / 1000
+        ));
+    }
+
+    let reply = format!(
+        "💰 *Cost Report* ({})
+
+        📊 Total: {} runs | ${:.4}
+        🔤 Tokens: {}k input / {}k output
+
+        📂 Per project:
+{}\n
+        _Gunakan: /cost today|week|month|all_",
+        interval_label,
+        total_runs, total_cost,
+        total_input / 1000, total_output / 1000,
+        lines.join("\n"),
+    );
+
+    send_message(client, &config.telegram_bot_token, chat_id, &reply).await?;
+    Ok(())
+}
+
 async fn cmd_help(
     client: &Client,
     config: &Config,
@@ -948,6 +1025,7 @@ async fn cmd_help(
         /project <slug> — Pilih project aktif\n\
         /newproject <nama> <repo_url> — Tambah project baru\n\
         /runs — Lihat 10 run terakhir\n\
+        /cost — Lihat penggunaan token & biaya\n\
         /diff — Lihat file yang diubah di run terakhir\n\
         /pr — Lihat PR terbaru project ini\n\
         /newsession — Mulai session baru (branch baru)\n\
