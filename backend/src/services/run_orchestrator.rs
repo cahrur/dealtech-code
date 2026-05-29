@@ -159,7 +159,7 @@ async fn run_inner(
         let key = format!("tg:active_run:{}", chat_id);
         let _: std::result::Result<(), _> = redis::cmd("SETEX")
             .arg(&key)
-            .arg(3700u64)
+            .arg(7500u64)
             .arg(run_id.to_string())
             .query_async(&mut redis)
             .await;
@@ -262,7 +262,7 @@ async fn run_inner(
     };
 
     let agent_response = match tokio::time::timeout(
-        tokio::time::Duration::from_secs(3600),
+        tokio::time::Duration::from_secs(7200),
         openclaw_service::run_agent_full(&config, &input),
     ).await {
         Ok(Ok(r)) => {
@@ -276,9 +276,9 @@ async fn run_inner(
         }
         Err(_elapsed) => {
             tracing::error!(run_id = %run_id, "OpenClaw call timed out after 60 minutes");
-            sqlx::query("UPDATE agent_runs SET error_message='Run timed out after 60 minutes' WHERE id=$1")
+            sqlx::query("UPDATE agent_runs SET error_message='Run timed out after 120 minutes' WHERE id=$1")
                 .bind(run_id).execute(db.as_ref()).await?;
-            let reply = "Run timed out after 60 minutes. Silakan coba lagi dengan prompt yang lebih sederhana.";
+            let reply = "Run timed out after 120 minutes. Silakan coba lagi dengan prompt yang lebih sederhana.";
             return finish_with_reply(db.as_ref(), &mut redis, run_id, session_id, reply, true, &config.telegram_bot_token).await;
         }
     };

@@ -943,6 +943,7 @@ async fn cmd_cost(
     chat_id: i64,
     parts: &[&str],
 ) -> anyhow::Result<()> {
+    tracing::info!(chat_id = chat_id, "cmd_cost called");
     let period = parts.get(1).copied().unwrap_or("today");
 
     let (interval_label, interval_sql) = match period {
