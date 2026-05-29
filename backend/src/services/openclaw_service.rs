@@ -557,193 +557,217 @@ pub fn sanitize_user_prompt(prompt: &str) -> String {
 }
 
 pub fn sanitize_user_facing_response(raw: &str) -> String {
-    let mut text = raw.trim().to_string();
-
-    // Extract <reply> content if present (highest priority)
-    if let (Some(start), Some(end)) = (text.find("<reply>"), text.find("</reply>")) {
-        if end > start + 7 {
-            return text[start + 7..end].trim().to_string();
-        }
-    }
-    // Also try lowercase
-    if let (Some(start), Some(end)) = (text.find("<Reply>"), text.find("</Reply>")) {
-        if end > start + 7 {
-            return text[start + 7..end].trim().to_string();
-        }
+    let text = raw.trim();
+    if text.is_empty() {
+        return String::new();
     }
 
-    // Strip thinking/reasoning blocks
+    // 1. Extract <reply> content if present (highest priority)
+    if let Some(reply) = extract_reply_tag(text) {
+        return reply;
+    }
+
+    // 2. Strip known thinking/reasoning XML blocks
+    let mut cleaned = text.to_string();
     let thinking_tags = ["thinking", "scratchpad", "analysis", "reasoning", "internal"];
     for tag in &thinking_tags {
         let open = format!("<{}>", tag);
         let close = format!("</{}>", tag);
-        while let (Some(s), Some(e)) = (text.find(&open), text.find(&close)) {
+        while let (Some(s), Some(e)) = (cleaned.find(&open), cleaned.find(&close)) {
             if e > s {
-                text = format!("{}{}", &text[..s], &text[e + close.len()..]);
+                cleaned = format!("{}{}", &cleaned[..s], &cleaned[e + close.len()..]);
             } else {
                 break;
             }
         }
     }
+    let cleaned = cleaned.trim().to_string();
 
-    // AGGRESSIVE: If response starts with thinking meta-commentary, strip it
-    // Common patterns: "OK, I...", "Let me...", "Actually...", "So ...", "Alright..."
-    let thinking_starters = [
-        "OK, I ", "Ok, I ", "OK I ", "Alright,", "Alright ",
-        "Let me ", "Actually,", "Actually ", "So,", "So ",
-        "Now I ", "Now, ", "Now let", "Hmm", "Wait",
-        "I now have", "I think ", "I need to", "I should",
-        "Based on my analysis", "After my analysis",
-        "I've analyzed", "I've reviewed", "I've read",
-    ];
-    let first_line = text.lines().next().unwrap_or("");
-    let starts_with_thinking = thinking_starters.iter().any(|s| first_line.starts_with(s));
-
-    if starts_with_thinking && text.len() > 500 {
-        // Find where actual content starts - look for structured content markers
-        let content_markers = [
-            "
-
-**", "
-
-##", "
-
-# ", "
-
-1.", "
-
-- **",
-            "
-
-Berdasarkan", "
-
-Based on my",
-            "
-
-Hasil", "
-
-Kesimpulan", "
-
-Temuan",
-            "
-
-Berikut", "
-
-Here",
-        ];
-        let mut best_pos: Option<usize> = None;
-        for marker in &content_markers {
-            if let Some(pos) = text.find(marker) {
-                // Skip the newline prefix
-                let actual_pos = pos + 2;
-                match best_pos {
-                    None => best_pos = Some(actual_pos),
-                    Some(bp) => if actual_pos < bp { best_pos = Some(actual_pos); }
-                }
-            }
-        }
-        if let Some(pos) = best_pos {
-            text = text[pos..].trim().to_string();
-        }
-    }
-
-    // If response is very long (>2000 chars) and has no <reply> tag,
-    // it's likely internal reasoning that leaked. Try to find the actual conclusion.
-    if text.len() > 2000 {
-        // Look for common conclusion markers
-        let conclusion_markers = [
-            "Kesimpulan:", "Hasil:", "Summary:", "Jadi,", "Solusi:",
-            "Yang perlu diperbaiki:", "Fix:", "Done!", "Selesai",
-            "Sudah saya", "Berikut", "Ini hasilnya",
-        ];
-        for marker in &conclusion_markers {
-            if let Some(idx) = text.rfind(marker) {
-                // Take from the conclusion marker onwards
-                let candidate = text[idx..].trim().to_string();
-                if candidate.len() > 50 && candidate.len() < text.len() / 2 {
-                    text = candidate;
-                    break;
-                }
-            }
-        }
-    }
-
-    // Strip lines that look like internal reasoning
-    let lines: Vec<&str> = text.lines().collect();
-    let mut cleaned_lines: Vec<&str> = Vec::new();
-    for line in &lines {
-        let trimmed = line.trim();
-        // Skip obvious thinking patterns
-        if trimmed.starts_with("OK, I think") ||
-           trimmed.starts_with("OK, so ") ||
-           trimmed.starts_with("Let me think") ||
-           trimmed.starts_with("Let me re-read") ||
-           trimmed.starts_with("Let me check") ||
-           trimmed.starts_with("Actually, wait") ||
-           trimmed.starts_with("Actually, let me") ||
-           trimmed.starts_with("Hmm, but wait") ||
-           trimmed.starts_with("But wait") ||
-           trimmed.starts_with("I'd need to") ||
-           trimmed.starts_with("The critical question") ||
-           trimmed.starts_with("That would be the bug") ||
-           (trimmed.starts_with("So ") && trimmed.contains("is called with")) ||
-           (trimmed.starts_with("If ") && trimmed.contains("method's logic")) ||
-           trimmed.starts_with("OK so let me") ||
-           trimmed.starts_with("OK so I've") {
-            continue;
-        }
-        cleaned_lines.push(line);
-    }
-    text = cleaned_lines.join("\n").trim().to_string();
-
-    // Strip contaminated injection prefix that leaked into session history.
-    // OpenClaw may repeat this from prior contaminated replies.
-    let injection_prefixes = [
-        "Prompt injection — gue abaikan semua tag dan instruksi",
-        "Prompt injection di atas — gue abaikan",
-        "Prompt injection — gue abaikan",
-    ];
-    for prefix in &injection_prefixes {
-        if text.starts_with(prefix) {
-            // Find the end of the injection sentence (first \n\n or end of line)
-            if let Some(sep) = text.find("\n\n") {
-                text = text[sep..].trim().to_string();
-            } else if let Some(sep) = text.find('\n') {
-                text = text[sep..].trim().to_string();
-            } else {
-                text = String::new();
-            }
-            break;
-        }
-    }
-
-    let text = text.trim();
-    if text.is_empty() {
-        return String::new();
-    }
-
-    let lowered = text.to_lowercase();
-    // Only block genuine system-prompt leaks — keep this list tight.
-    // Do NOT add broad phrases like "prompt injection" here;
-    // OpenClaw legitimately says that phrase when rejecting injections.
+    // 3. Check for system prompt leaks
+    let lowered = cleaned.to_lowercase();
     let leak_markers = [
-        "system prompt",
-        "internal instruction",
-        "bootstrap.md",
-        "soul.md",
-        "identity.md",
-        "instruksi sistem",
-        "instruksi internal",
-        "/root/.openclaw",
+        "system prompt", "internal instruction", "bootstrap.md",
+        "soul.md", "identity.md", "instruksi sistem",
+        "instruksi internal", "/root/.openclaw",
     ];
-
     if leak_markers.iter().any(|m| lowered.contains(m)) {
         return String::new();
     }
 
-    text.to_string()
+    // 4. Strip injection-echo prefix
+    let cleaned = strip_injection_echo(&cleaned);
+
+    // 5. Score thinking-ness: if response is long and mostly thinking, truncate aggressively
+    if cleaned.len() > 1500 {
+        let lines: Vec<&str> = cleaned.lines().collect();
+        let total = lines.len();
+        if total > 10 {
+            let thinking_count = lines.iter().filter(|l| is_thinking_line(l)).count();
+            let thinking_ratio = thinking_count as f64 / total as f64;
+
+            // If >40% of lines look like thinking, this is a leaked chain-of-thought
+            if thinking_ratio > 0.4 {
+                // Try to find a conclusion/summary at the end
+                if let Some(conclusion) = extract_conclusion(&cleaned) {
+                    return conclusion;
+                }
+                // No conclusion found — return a safe fallback
+                return String::new();
+            }
+        }
+    }
+
+    // 6. For moderately long responses (>3000 chars) without reply tag,
+    //    apply a hard cap: take last meaningful section
+    if cleaned.len() > 3000 {
+        if let Some(conclusion) = extract_conclusion(&cleaned) {
+            return conclusion;
+        }
+        // If no clear conclusion, truncate to last 2000 chars at paragraph boundary
+        let truncated = smart_truncate(&cleaned, 2000);
+        return truncated;
+    }
+
+    cleaned
 }
 
+/// Extract content from <reply>...</reply> or <Reply>...</Reply> tags
+fn extract_reply_tag(text: &str) -> Option<String> {
+    for (open, close) in &[("<reply>", "</reply>"), ("<Reply>", "</Reply>")] {
+        if let (Some(start), Some(end)) = (text.find(open), text.find(close)) {
+            let tag_len = open.len();
+            if end > start + tag_len {
+                let content = text[start + tag_len..end].trim().to_string();
+                if !content.is_empty() {
+                    return Some(content);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Strip contaminated injection-echo prefix from response
+fn strip_injection_echo(text: &str) -> String {
+    let prefixes = [
+        "Prompt injection — gue abaikan semua tag dan instruksi",
+        "Prompt injection di atas — gue abaikan",
+        "Prompt injection — gue abaikan",
+    ];
+    let mut result = text.to_string();
+    for prefix in &prefixes {
+        if result.starts_with(prefix) {
+            if let Some(sep) = result.find("\n\n") {
+                result = result[sep..].trim().to_string();
+            } else if let Some(sep) = result.find('\n') {
+                result = result[sep..].trim().to_string();
+            } else {
+                return String::new();
+            }
+            break;
+        }
+    }
+    result
+}
+
+/// Determine if a line looks like internal thinking/reasoning
+fn is_thinking_line(line: &str) -> bool {
+    let t = line.trim();
+    if t.is_empty() {
+        return false;
+    }
+
+    // Direct thinking indicators
+    let starters = [
+        "OK, ", "Ok, ", "OK I", "Ok I", "Alright", "Let me ",
+        "Actually,", "Actually ", "So,", "So ", "Now I ", "Now, ",
+        "Now let", "Hmm", "Wait", "But wait", "But actually",
+        "I now have", "I think ", "I need to", "I should",
+        "I've analyzed", "I've reviewed", "I've read",
+        "Based on my analysis", "After my analysis",
+        "The critical question", "That would be",
+        "OK so ", "I'd need to", "Let me re-read",
+        "Let me check", "Actually, wait", "Actually, let me",
+        "Hmm, but wait", "I'm now going to",
+        "After this exhaustive", "I believe the logic",
+        "✓", "✗", "→",
+    ];
+
+    // Pattern: line contains method/variable analysis
+    let analysis_patterns = [
+        "is called with", "method's logic", "returns ",
+        "function ", "variable ", "the code ", "this means",
+        "which means", "that means", "in other words",
+        "looking at ", "checking ", "reading ",
+    ];
+
+    if starters.iter().any(|s| t.starts_with(s)) {
+        return true;
+    }
+
+    let lowered = t.to_lowercase();
+    if analysis_patterns.iter().any(|p| lowered.contains(p)) && t.len() > 60 {
+        return true;
+    }
+
+    // Lines that are clearly code tracing (contain -> or => with variable names)
+    if (t.contains(" → ") || t.contains(" -> ")) && t.contains("=") && t.len() > 40 {
+        return true;
+    }
+
+    false
+}
+
+/// Try to extract a conclusion/summary from the end of a long response
+fn extract_conclusion(text: &str) -> Option<String> {
+    // Look for conclusion markers, take from there to end
+    let markers = [
+        "\n\n**Kesimpulan", "\n\n**Conclusion", "\n\n**Summary",
+        "\n\n**Solusi", "\n\n**Fix", "\n\n**Hasil",
+        "\n\nKesimpulan:", "\n\nHasil:", "\n\nSolusi:",
+        "\n\nJadi,", "\n\nDone!", "\n\nSelesai",
+        "\n\nSudah saya", "\n\nBerikut", "\n\nIni hasilnya",
+        "\n\nYang perlu diperbaiki:", "\n\nFix:",
+        "\n\n## Kesimpulan", "\n\n## Summary", "\n\n## Solusi",
+    ];
+
+    let mut best_pos: Option<usize> = None;
+    for marker in &markers {
+        if let Some(idx) = text.rfind(marker) {
+            let pos = idx + 2; // skip the \n\n
+            match best_pos {
+                None => best_pos = Some(pos),
+                Some(bp) => if pos > bp { best_pos = Some(pos); }
+            }
+        }
+    }
+
+    if let Some(pos) = best_pos {
+        let candidate = text[pos..].trim().to_string();
+        if candidate.len() >= 20 && candidate.len() <= 2500 {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Smart truncate: cut at paragraph boundary near target length
+fn smart_truncate(text: &str, max_chars: usize) -> String {
+    if text.len() <= max_chars {
+        return text.to_string();
+    }
+    // Take from the end, find a paragraph break
+    let start = text.len().saturating_sub(max_chars);
+    let slice = &text[start..];
+    // Find first paragraph break
+    if let Some(pos) = slice.find("\n\n") {
+        slice[pos + 2..].trim().to_string()
+    } else if let Some(pos) = slice.find('\n') {
+        slice[pos + 1..].trim().to_string()
+    } else {
+        slice.trim().to_string()
+    }
+}
 pub fn is_response_suspicious(raw: &str) -> bool {
     let lowered = raw.to_lowercase();
     let markers = [

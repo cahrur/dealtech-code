@@ -587,9 +587,23 @@ async fn cmd_cancel(
     let run_id = match run_id_str.as_deref().and_then(|s| uuid::Uuid::parse_str(s).ok()) {
         Some(id) => id,
         None => {
-            send_message(client, &config.telegram_bot_token, chat_id,
-                "Tidak ada run yang sedang berjalan.").await?;
-            return Ok(());
+            // Fallback: check DB for active run (Redis key may have expired)
+            let row = sqlx::query_scalar::<_, uuid::Uuid>(
+                "SELECT id FROM agent_runs WHERE user_id=$1 AND telegram_chat_id=$2                  AND status IN ('queued','processing','running_agent','preparing_workspace','collecting_diff','auto_push_or_pr')                  ORDER BY created_at DESC LIMIT 1"
+            )
+            .bind(tg_user.user_id)
+            .bind(chat_id)
+            .fetch_optional(db)
+            .await?;
+
+            match row {
+                Some(id) => id,
+                None => {
+                    send_message(client, &config.telegram_bot_token, chat_id,
+                        "Tidak ada run yang sedang berjalan.").await?;
+                    return Ok(());
+                }
+            }
         }
     };
 

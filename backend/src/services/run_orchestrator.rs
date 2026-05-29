@@ -159,7 +159,7 @@ async fn run_inner(
         let key = format!("tg:active_run:{}", chat_id);
         let _: std::result::Result<(), _> = redis::cmd("SETEX")
             .arg(&key)
-            .arg(700u64)
+            .arg(3700u64)
             .arg(run_id.to_string())
             .query_async(&mut redis)
             .await;
