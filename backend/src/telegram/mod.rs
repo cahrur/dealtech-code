@@ -78,6 +78,19 @@ pub async fn start_polling(config: Arc<Config>, db: PgPool, redis: ConnectionMan
         .unwrap_or_default();
     let mut offset: i64 = 0;
 
+    // Persistent scan-result deliverer: survives backend restarts.
+    // Worker pushes finished chat_ids to the `scan:delivery` Redis list; this
+    // task drains it and sends the report. If the backend restarts mid-scan,
+    // the result stays queued in Redis and is delivered once we're back up.
+    {
+        let deliver_client = api_client.clone();
+        let deliver_config = config.clone();
+        let deliver_redis = redis.clone();
+        tokio::spawn(async move {
+            scan_result_deliverer(deliver_client, deliver_config, deliver_redis).await;
+        });
+    }
+
     loop {
         match get_updates(&polling_client, &config.telegram_bot_token, offset).await {
             Ok(updates) => {
@@ -1217,58 +1230,79 @@ async fn cmd_scan(
         .await
         .unwrap_or(());
 
-    // Subscribe to result in background
-    let bot_token = config.telegram_bot_token.clone();
-    let client_clone = client.clone();
-    let mut redis_clone = redis.clone();
-
-    tokio::spawn(async move {
-        // Poll for result (max 30 min)
-        let result_key = format!("scan:result:{}", chat_id);
-        let scan_key = format!("scan:active:{}", chat_id);
-        let max_wait = 1800; // 30 minutes
-        let mut waited = 0u64;
-
-        loop {
-            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-            waited += 5;
-
-            let result: Option<String> = redis::cmd("GET")
-                .arg(&result_key)
-                .query_async(&mut redis_clone)
-                .await
-                .unwrap_or(None);
-
-            if let Some(data) = result {
-                // Clean up
-                let _: () = redis::cmd("DEL").arg(&result_key)
-                    .query_async(&mut redis_clone).await.unwrap_or(());
-                let _: () = redis::cmd("DEL").arg(&scan_key)
-                    .query_async(&mut redis_clone).await.unwrap_or(());
-
-                // Parse and format report
-                let report = format_scan_report(&data);
-                if report.is_empty() {
-                    let _ = send_message(&client_clone, &bot_token, chat_id,
-                        "✅ Scan selesai!\n\nTidak ditemukan vulnerability.\n\n\
-                        ⚠️ Note: Automated scanner hanya mendeteksi ~30-40% vulnerability.").await;
-                } else {
-                    let _ = send_long_message(&client_clone, &bot_token, chat_id, &report).await;
-                }
-                break;
-            }
-
-            if waited >= max_wait {
-                let _: () = redis::cmd("DEL").arg(&scan_key)
-                    .query_async(&mut redis_clone).await.unwrap_or(());
-                let _ = send_message(&client_clone, &bot_token, chat_id,
-                    "⏰ Scan timeout (30 menit). Target mungkin terlalu besar atau tidak responsif.").await;
-                break;
-            }
-        }
-    });
+    // Delivery is handled by the persistent scan_result_deliverer task (see
+    // start_polling). The worker pushes the chat_id to `scan:delivery` when the
+    // scan finishes, so results survive backend restarts.
 
     Ok(())
+}
+
+// Persistent scan-result deliverer. Drains the `scan:delivery` Redis list
+// (chat_ids pushed by the host worker when a scan finishes) and sends the
+// formatted report. Because it reads from Redis rather than per-request memory,
+// results survive a backend restart/crash that happens mid-scan.
+async fn scan_result_deliverer(
+    client: Client,
+    config: Arc<Config>,
+    mut redis: ConnectionManager,
+) {
+    tracing::info!("Scan result deliverer started");
+    loop {
+        // BRPOP blocks up to 30s; returns [list_name, value] on hit.
+        let popped: Option<(String, String)> = redis::cmd("BRPOP")
+            .arg("scan:delivery")
+            .arg(30)
+            .query_async(&mut redis)
+            .await
+            .unwrap_or(None);
+
+        let chat_id_str = match popped {
+            Some((_, v)) => v,
+            None => continue, // timeout, loop again
+        };
+
+        let chat_id: i64 = match chat_id_str.trim().parse() {
+            Ok(id) => id,
+            Err(_) => {
+                tracing::warn!(value = %chat_id_str, "deliverer: bad chat_id");
+                continue;
+            }
+        };
+
+        let result_key = format!("scan:result:{}", chat_id);
+        let scan_key = format!("scan:active:{}", chat_id);
+
+        let data: Option<String> = redis::cmd("GET")
+            .arg(&result_key)
+            .query_async(&mut redis)
+            .await
+            .unwrap_or(None);
+
+        let data = match data {
+            Some(d) => d,
+            None => {
+                tracing::warn!(chat_id = %chat_id, "deliverer: no result payload");
+                continue;
+            }
+        };
+
+        let report = format_scan_report(&data);
+        if report.is_empty() {
+            let _ = send_message(&client, &config.telegram_bot_token, chat_id,
+                "✅ Scan selesai!\n\nTidak ditemukan vulnerability.\n\n\
+                ⚠️ Note: Automated scanner hanya mendeteksi ~30-40% vulnerability.").await;
+        } else {
+            let _ = send_long_message(&client, &config.telegram_bot_token, chat_id, &report).await;
+        }
+
+        // Clean up markers
+        let _: () = redis::cmd("DEL").arg(&result_key)
+            .query_async(&mut redis).await.unwrap_or(());
+        let _: () = redis::cmd("DEL").arg(&scan_key)
+            .query_async(&mut redis).await.unwrap_or(());
+
+        tracing::info!(chat_id = %chat_id, "deliverer: report sent");
+    }
 }
 
 fn format_scan_report(data: &str) -> String {

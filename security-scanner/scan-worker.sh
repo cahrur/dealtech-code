@@ -78,8 +78,9 @@ while true; do
     # NOTE: redis-cli -x appends stdin as the LAST arg, so set value first, then EXPIRE
     echo "$RESULT_JSON" | $REDIS_CLI -x SET "scan:result:${CHAT_ID}" >/dev/null 2>&1
     $REDIS_CLI EXPIRE "scan:result:${CHAT_ID}" 3600 >/dev/null 2>&1
-    $REDIS_CLI DEL "scan:active:${CHAT_ID}" >/dev/null 2>&1
     $REDIS_CLI DEL "$RUNNING_KEY" >/dev/null 2>&1
+    # Signal the backend deliverer (persists across backend restarts)
+    $REDIS_CLI LPUSH "scan:delivery" "${CHAT_ID}" >/dev/null 2>&1
 
     FCOUNT=$(echo "$RESULT" | grep -vc '^$' 2>/dev/null || echo 0)
     log "Scan done: url=$URL findings=$FCOUNT"
