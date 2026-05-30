@@ -588,6 +588,14 @@ install_security_scanner() {
   nuclei -update-templates -silent 2>/dev/null || nuclei -ut -silent 2>/dev/null || true
   log "Nuclei templates updated"
 
+  # Install sqlmap (active SQL-injection testing for the `sqli` scan mode)
+  if command -v sqlmap &>/dev/null; then
+    log "sqlmap already installed: $(sqlmap --version 2>/dev/null | head -1)"
+  else
+    info "Installing sqlmap..."
+    apt-get install -y -qq sqlmap >/dev/null 2>&1 && log "sqlmap installed" || warn "sqlmap install failed (sqli mode will be unavailable)"
+  fi
+
   # Setup scanner symlink
   if [[ -f "$SCANNER_DIR/scan.sh" ]]; then
     chmod +x "$SCANNER_DIR/scan.sh" "$SCANNER_DIR/lib/"*.sh 2>/dev/null || true

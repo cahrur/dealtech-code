@@ -1140,10 +1140,12 @@ async fn cmd_scan(
             • recon — Reconnaissance only\n\
             • cves — Known CVEs\n\
             • misconfig — Misconfigurations\n\
-            • exposure — Exposed files/panels\n\n\
+            • exposure — Exposed files/panels\n\
+            • sqli — Active SQL injection test (sqlmap)\n\n\
             Contoh:\n\
             /scan https://myapp.com\n\
-            /scan https://myapp.com full").await?;
+            /scan https://myapp.com full\n\
+            /scan https://myapp.com/page?id=1 sqli").await?;
         return Ok(());
     }
 
@@ -1154,10 +1156,10 @@ async fn cmd_scan(
     }
 
     let mode = parts.get(2).unwrap_or(&"quick").trim();
-    let valid_modes = ["quick", "full", "recon", "cves", "misconfig", "exposure"];
+    let valid_modes = ["quick", "full", "recon", "cves", "misconfig", "exposure", "sqli"];
     if !valid_modes.contains(&mode) {
         send_message(client, &config.telegram_bot_token, chat_id,
-            &format!("❌ Mode tidak valid: {}\nPilih: quick, full, recon, cves, misconfig, exposure", mode)).await?;
+            &format!("❌ Mode tidak valid: {}\nPilih: quick, full, recon, cves, misconfig, exposure, sqli", mode)).await?;
         return Ok(());
     }
 

@@ -30,6 +30,46 @@ template_args() {
     esac
 }
 
+# Active SQL-injection scan via sqlmap. Crawls + tests forms and URL params,
+# then emits findings in the same JSON shape nuclei produces so the backend
+# formatter handles both uniformly. sqlmap is light on RAM (~150-200MB).
+run_sqli_scan() {
+    local url="$1"
+    local budget="$2"
+    local outdir
+    outdir=$(mktemp -d /tmp/sqlmap-XXXXXX)
+    local logf="$outdir/run.log"
+
+    timeout -k 30 "$budget" sqlmap -u "$url" \
+        --batch --level=2 --risk=1 \
+        --random-agent --timeout=10 --retries=1 --threads=4 \
+        --flush-session \
+        --output-dir="$outdir" >"$logf" 2>&1 || true
+
+    # Parse sqlmap's injection-point summary into JSONL findings.
+    awk -v url="$url" '
+        /sqlmap identified the following injection point/ {insum=1}
+        insum && /^Parameter:/ {
+            if (param != "") emit();
+            param=$0; sub(/^Parameter: */,"",param); types="";
+        }
+        insum && /Type:/ {
+            t=$0; sub(/^[ \t]*Type: */,"",t);
+            types = (types=="" ? t : types "; " t);
+        }
+        /back-end DBMS:/ { dbms=$0; sub(/.*back-end DBMS: */,"",dbms); }
+        END { if (param != "") emit(); }
+        function emit() {
+            gsub(/\\/,"",param); gsub(/"/,"",param);
+            gsub(/\\/,"",types); gsub(/"/,"",types);
+            gsub(/\\/,"",dbms);  gsub(/"/,"",dbms);
+            printf "{\"info\":{\"name\":\"SQL Injection - %s\",\"severity\":\"critical\",\"description\":\"Types: %s | DBMS: %s\"},\"matched-at\":\"%s\",\"template-id\":\"sqlmap-sqli\"}\n", param, types, dbms, url;
+        }
+    ' "$logf"
+
+    rm -rf "$outdir"
+}
+
 log "Scan worker started"
 
 while true; do
@@ -59,16 +99,21 @@ while true; do
 
     TARGS=$(template_args "$MODE")
 
-    # Run nuclei with a hard wall-clock budget so a throttling/slow target
-    # cannot hang the single-scan queue. timeout sends SIGTERM at the budget,
-    # SIGKILL 30s later. Partial results captured so far are still returned.
     SCAN_BUDGET=900  # 15 minutes
     [ "$MODE" = "full" ] && SCAN_BUDGET=1800  # 30 minutes for full scans
-    RESULT=$(timeout -k 30 "$SCAN_BUDGET" nuclei -u "$URL" $TARGS \
-        -severity "$SEVERITY" \
-        -silent -no-color -jsonl -omit-raw \
-        -c 25 -rl 150 -timeout 10 -retries 1 \
-        2>/dev/null || true)
+
+    if [ "$MODE" = "sqli" ]; then
+        # Active SQL-injection testing via sqlmap (separate code path)
+        RESULT=$(run_sqli_scan "$URL" "$SCAN_BUDGET")
+    else
+        # Signature-based scanning via nuclei. Hard wall-clock budget so a
+        # throttling/slow target cannot hang the single-scan queue.
+        RESULT=$(timeout -k 30 "$SCAN_BUDGET" nuclei -u "$URL" $TARGS \
+            -severity "$SEVERITY" \
+            -silent -no-color -jsonl -omit-raw \
+            -c 25 -rl 150 -timeout 10 -retries 1 \
+            2>/dev/null || true)
+    fi
 
     # Build result JSON
     if [ -z "$RESULT" ]; then
