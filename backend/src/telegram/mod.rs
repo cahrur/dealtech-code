@@ -1373,8 +1373,19 @@ fn format_scan_report(data: &str) -> String {
     report.push_str("\n━━━━━━━━━━━━━━━━━━━━\n\n");
     report.push_str(&finding_lines.join("\n\n"));
     report.push_str("\n\n━━━━━━━━━━━━━━━━━━━━\n");
-    report.push_str("⚠️ Mode signature (quick/full/cves/misconfig/exposure) cek misconfig, CVE, exposed files — BUKAN SQL injection.\n");
-    report.push_str("💡 Untuk uji SQL injection: /scan <url>?param=nilai sqli");
+    // Footer hint depends on what was scanned. If this report already contains
+    // an active SQLi finding (sqlmap), the signature-mode disclaimer would be
+    // contradictory — so only show the "use sqli mode" hint for nuclei scans.
+    let has_sqli = findings.iter().any(|f| {
+        f["template-id"].as_str() == Some("sqlmap-sqli")
+    });
+    if has_sqli {
+        report.push_str("⚠️ SQL injection terdeteksi — perbaiki dengan parameterized query / prepared statement.\n");
+        report.push_str("💡 Untuk cek misconfig/CVE/header: /scan <url> full");
+    } else {
+        report.push_str("⚠️ Mode signature (quick/full/cves/misconfig/exposure) cek misconfig, CVE, exposed files — BUKAN SQL injection.\n");
+        report.push_str("💡 Untuk uji SQL injection: /scan <url>?param=nilai sqli  (tanpa param pun bisa, auto-crawl)");
+    }
 
     report
 }

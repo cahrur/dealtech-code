@@ -56,26 +56,59 @@ run_sqli_scan() {
         --flush-session \
         --output-dir="$outdir" >"$logf" 2>&1 || true
 
-    # Parse sqlmap's injection-point summary into JSONL findings.
-    awk -v url="$url" '
-        /sqlmap identified the following injection point/ {insum=1}
-        insum && /^Parameter:/ {
-            if (param != "") emit();
-            param=$0; sub(/^Parameter: */,"",param); types="";
-        }
-        insum && /Type:/ {
-            t=$0; sub(/^[ \t]*Type: */,"",t);
-            types = (types=="" ? t : types "; " t);
-        }
-        /back-end DBMS:/ { dbms=$0; sub(/.*back-end DBMS: */,"",dbms); }
-        END { if (param != "") emit(); }
-        function emit() {
-            gsub(/\\/,"",param); gsub(/"/,"",param);
-            gsub(/\\/,"",types); gsub(/"/,"",types);
-            gsub(/\\/,"",dbms);  gsub(/"/,"",dbms);
-            printf "{\"info\":{\"name\":\"SQL Injection - %s\",\"severity\":\"critical\",\"description\":\"Types: %s | DBMS: %s\"},\"matched-at\":\"%s\",\"template-id\":\"sqlmap-sqli\"}\n", param, types, dbms, url;
-        }
-    ' "$logf"
+    # Get the back-end DBMS (single global value) from the log.
+    local dbms
+    dbms=$(grep -m1 "back-end DBMS:" "$logf" 2>/dev/null | sed 's/.*back-end DBMS: *//')
+
+    # sqlmap writes a results CSV listing EVERY vulnerable URL+param it found
+    # (including the real injectable endpoint discovered during --crawl).
+    local csv
+    csv=$(find "$outdir" -name "results-*.csv" 2>/dev/null | head -1)
+
+    if [ -n "$csv" ] && [ -s "$csv" ]; then
+        awk -F',' -v dbms="$dbms" '
+            NR==1 { next }
+            NF>=3 {
+                turl=$1; place=$2; param=$3; tech=$4;
+                full="";
+                for (i=1;i<=length(tech);i++){
+                    c=substr(tech,i,1);
+                    if (c=="B") nm="boolean-based blind";
+                    else if (c=="E") nm="error-based";
+                    else if (c=="U") nm="UNION query";
+                    else if (c=="S") nm="stacked queries";
+                    else if (c=="T") nm="time-based blind";
+                    else if (c=="Q") nm="inline query";
+                    else nm="";
+                    if (nm!="") full=(full=="" ? nm : full "; " nm);
+                }
+                if (full=="") full="confirmed";
+                gsub(/"/,"",param); gsub(/"/,"",turl); gsub(/"/,"",dbms);
+                printf "{\"info\":{\"name\":\"SQL Injection - %s (%s)\",\"severity\":\"critical\",\"description\":\"Types: %s | DBMS: %s\"},\"matched-at\":\"%s\",\"template-id\":\"sqlmap-sqli\"}\n", param, place, full, dbms, turl;
+            }
+        ' "$csv"
+    else
+        # Fallback: parse the log summary (e.g. if CSV not produced).
+        awk -v url="$url" '
+            /sqlmap identified the following injection point/ {insum=1}
+            insum && /^Parameter:/ {
+                if (param != "") emit();
+                param=$0; sub(/^Parameter: */,"",param); types="";
+            }
+            insum && /Type:/ {
+                t=$0; sub(/^[ \t]*Type: */,"",t);
+                types = (types=="" ? t : types "; " t);
+            }
+            /back-end DBMS:/ { dbms=$0; sub(/.*back-end DBMS: */,"",dbms); }
+            END { if (param != "") emit(); }
+            function emit() {
+                gsub(/\\/,"",param); gsub(/"/,"",param);
+                gsub(/\\/,"",types); gsub(/"/,"",types);
+                gsub(/\\/,"",dbms);  gsub(/"/,"",dbms);
+                printf "{\"info\":{\"name\":\"SQL Injection - %s\",\"severity\":\"critical\",\"description\":\"Types: %s | DBMS: %s\"},\"matched-at\":\"%s\",\"template-id\":\"sqlmap-sqli\"}\n", param, types, dbms, url;
+            }
+        ' "$logf"
+    fi
 
     rm -rf "$outdir"
 }
