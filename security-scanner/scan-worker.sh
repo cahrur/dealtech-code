@@ -113,6 +113,71 @@ run_sqli_scan() {
     rm -rf "$outdir"
 }
 
+# --- Active XSS testing via dalfox --------------------------------------
+# dalfox mines parameters from the page and injects real XSS payloads.
+# Works with or without an explicit ?param= (it discovers params itself).
+# NOTE: dalfox v2.9.0 --format json is broken (emits [{}]), so we parse its
+# reliable plain [POC] stdout instead. [V]=verified (DOM-triggered, high),
+# [R]=reflected (medium).
+run_xss_scan() {
+    local url="$1"
+    local budget="$2"
+    local outdir logf
+    outdir=$(mktemp -d /tmp/dalfox-XXXXXX)
+    logf="$outdir/out.log"
+
+    timeout -k 30 "$budget" dalfox url "$url" \
+        --no-color --no-spinner --skip-bav \
+        --timeout 15 --worker 30 --delay 50 \
+        >"$logf" 2>&1 || true
+
+    if [ -s "$logf" ]; then
+        grep -E '^[[:space:]]*\[POC\]\[[VR]\]' "$logf" 2>/dev/null \
+          | sed -E 's/^[[:space:]]*\[POC\]\[([^]]*)\]\[([^]]*)\]\[([^]]*)\] (.*)$/\1|\2|\3|\4/' \
+          | awk -F'|' '
+              { key=$1"|"$3; if (seen[key]++) next;
+                if ($1=="V"){sev="high";gn="verified"} else {sev="medium";gn="reflected"}
+                gsub(/\\/,"",$3); gsub(/"/,"",$3);
+                gsub(/\\/,"",$4); gsub(/"/,"",$4);
+                printf "{\"info\":{\"name\":\"XSS (%s) - %s\",\"severity\":\"%s\",\"description\":\"Method: %s | Type: %s\"},\"matched-at\":\"%s\",\"template-id\":\"dalfox-xss\"}\n", gn,$3,sev,$2,$3,$4;
+              }'
+    fi
+    rm -rf "$outdir"
+}
+
+# --- TLS/SSL configuration audit via testssl.sh -------------------------
+# Checks cert validity, weak ciphers/protocols (TLS 1.0/1.1, SSLv3),
+# known flaws (Heartbleed, ROBOT, etc). Only LOW+ severities are kept.
+run_tls_scan() {
+    local url="$1"
+    local budget="$2"
+    local outdir jf
+    outdir=$(mktemp -d /tmp/testssl-XXXXXX)
+    jf="$outdir/out.json"
+
+    timeout -k 30 "$budget" testssl.sh \
+        --quiet --color 0 --jsonfile "$jf" \
+        --severity LOW \
+        --openssl-timeout 10 --socket-timeout 10 \
+        -p -S -U \
+        "$url" >/dev/null 2>&1 || true
+
+    if [ -s "$jf" ]; then
+        jq -c --arg url "$url" '
+            (if type=="array" then . else [.] end)[]
+            | select(.severity != null)
+            | select(.severity | ascii_upcase | test("LOW|MEDIUM|HIGH|CRITICAL"))
+            | {info:{
+                  name:("TLS/SSL: " + (.id // "issue")),
+                  severity:(.severity | ascii_downcase),
+                  description:((.finding // "") | .[0:160])
+               },
+               "matched-at":$url,
+               "template-id":("testssl-" + (.id // "tls"))}' "$jf" 2>/dev/null
+    fi
+    rm -rf "$outdir"
+}
+
 log "Scan worker started"
 
 while true; do
@@ -150,6 +215,12 @@ while true; do
     if [ "$MODE" = "sqli" ]; then
         # Active SQL-injection testing via sqlmap (separate code path)
         RESULT=$(run_sqli_scan "$URL" "$SCAN_BUDGET")
+    elif [ "$MODE" = "xss" ]; then
+        # Active XSS testing via dalfox (separate code path)
+        RESULT=$(run_xss_scan "$URL" "$SCAN_BUDGET")
+    elif [ "$MODE" = "tls" ]; then
+        # TLS/SSL configuration audit via testssl.sh (separate code path)
+        RESULT=$(run_tls_scan "$URL" "$SCAN_BUDGET")
     else
         # Signature-based scanning via nuclei. Hard wall-clock budget so a
         # throttling/slow target cannot hang the single-scan queue.

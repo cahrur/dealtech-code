@@ -1141,7 +1141,9 @@ async fn cmd_scan(
             • cves — Known CVEs\n\
             • misconfig — Misconfigurations\n\
             • exposure — Exposed files/panels\n\
-            • sqli — Active SQL injection test (sqlmap)\n\n\
+            • sqli — Active SQL injection test (sqlmap)\n\
+            • xss — Active XSS test (dalfox)\n\
+            • tls — TLS/SSL config audit (testssl.sh)\n\n\
             Contoh:\n\
             /scan https://myapp.com\n\
             /scan https://myapp.com full\n\
@@ -1376,15 +1378,24 @@ fn format_scan_report(data: &str) -> String {
     // Footer hint depends on what was scanned. If this report already contains
     // an active SQLi finding (sqlmap), the signature-mode disclaimer would be
     // contradictory — so only show the "use sqli mode" hint for nuclei scans.
-    let has_sqli = findings.iter().any(|f| {
-        f["template-id"].as_str() == Some("sqlmap-sqli")
+    let tid = |id: &str| findings.iter().any(|f| {
+        f["template-id"].as_str().map(|t| t.starts_with(id)).unwrap_or(false)
     });
+    let has_sqli = tid("sqlmap-sqli");
+    let has_xss = tid("dalfox-xss");
+    let has_tls = tid("testssl-");
     if has_sqli {
         report.push_str("⚠️ SQL injection terdeteksi — perbaiki dengan parameterized query / prepared statement.\n");
-        report.push_str("💡 Untuk cek misconfig/CVE/header: /scan <url> full");
+        report.push_str("💡 Cek lainnya: /scan <url> full  |  /scan <url> xss  |  /scan <url> tls");
+    } else if has_xss {
+        report.push_str("⚠️ XSS terdeteksi — sanitasi/escape output & pakai Content-Security-Policy.\n");
+        report.push_str("💡 Cek lainnya: /scan <url> full  |  /scan <url>?param=nilai sqli  |  /scan <url> tls");
+    } else if has_tls {
+        report.push_str("⚠️ Masalah TLS/SSL terdeteksi — perbaiki cipher/protokol lemah & sertifikat.\n");
+        report.push_str("💡 Cek lainnya: /scan <url> full  |  /scan <url> xss  |  /scan <url>?param=nilai sqli");
     } else {
-        report.push_str("⚠️ Mode signature (quick/full/cves/misconfig/exposure) cek misconfig, CVE, exposed files — BUKAN SQL injection.\n");
-        report.push_str("💡 Untuk uji SQL injection: /scan <url>?param=nilai sqli  (tanpa param pun bisa, auto-crawl)");
+        report.push_str("⚠️ Mode signature (quick/full/cves/misconfig/exposure) cek misconfig, CVE, exposed files — BUKAN uji SQLi/XSS aktif.\n");
+        report.push_str("💡 Uji aktif: /scan <url> sqli  |  /scan <url> xss  |  /scan <url> tls");
     }
 
     report

@@ -596,6 +596,46 @@ install_security_scanner() {
     apt-get install -y -qq sqlmap >/dev/null 2>&1 && log "sqlmap installed" || warn "sqlmap install failed (sqli mode will be unavailable)"
   fi
 
+  # Install dalfox (active XSS testing for the `xss` scan mode).
+  # Pin v2.9.0: newer releases are built against GLIBC 2.38 and won't run on
+  # Ubuntu 22.04 (GLIBC 2.35). v2.9.0 is a static-friendly build that works.
+  if command -v dalfox &>/dev/null; then
+    log "dalfox already installed: $(dalfox version 2>&1 | tail -1)"
+  else
+    info "Installing dalfox (XSS scanner)..."
+    DALFOX_URL="https://github.com/hahwul/dalfox/releases/download/v2.9.0/dalfox_2.9.0_linux_amd64.tar.gz"
+    if curl -sL "$DALFOX_URL" -o "${TEMP_DIR}/dalfox.tar.gz" \
+       && tar xzf "${TEMP_DIR}/dalfox.tar.gz" -C "${TEMP_DIR}" 2>/dev/null; then
+      DALFOX_BIN=$(find "${TEMP_DIR}" -type f -name dalfox | head -1)
+      if [[ -n "$DALFOX_BIN" ]]; then
+        mv -f "$DALFOX_BIN" /usr/local/bin/dalfox && chmod +x /usr/local/bin/dalfox
+        log "dalfox installed"
+      else
+        warn "dalfox binary not found in archive (xss mode unavailable)"
+      fi
+    else
+      warn "dalfox install failed (xss mode will be unavailable)"
+    fi
+  fi
+
+  # Install testssl.sh (TLS/SSL config audit for the `tls` scan mode).
+  # Pure-bash tool; clone the repo and symlink the script.
+  if command -v testssl.sh &>/dev/null; then
+    log "testssl.sh already installed"
+  else
+    info "Installing testssl.sh (TLS auditor)..."
+    if [[ ! -d /opt/testssl.sh ]]; then
+      git clone --depth 1 -q https://github.com/drwetter/testssl.sh.git /opt/testssl.sh 2>/dev/null || true
+    fi
+    if [[ -f /opt/testssl.sh/testssl.sh ]]; then
+      chmod +x /opt/testssl.sh/testssl.sh
+      ln -sf /opt/testssl.sh/testssl.sh /usr/local/bin/testssl.sh
+      log "testssl.sh installed"
+    else
+      warn "testssl.sh install failed (tls mode will be unavailable)"
+    fi
+  fi
+
   # Setup scanner symlink
   if [[ -f "$SCANNER_DIR/scan.sh" ]]; then
     chmod +x "$SCANNER_DIR/scan.sh" "$SCANNER_DIR/lib/"*.sh 2>/dev/null || true
@@ -895,9 +935,9 @@ print_summary() {
   echo "     b. Edit .env: TELEGRAM_BOT_TOKEN=<token> dan TELEGRAM_ENABLED=true"
   echo "     c. Restart: cd $PLATFORM_DIR && docker compose up -d --no-deps backend"
   echo "     d. Daftarkan admin pertama ke whitelist:"
-  echo "        docker exec ai-platform-postgres-1 psql -U postgres -d aicode -c \\""
+  echo "        docker exec ai-platform-postgres-1 psql -U postgres -d aicode -c \""
   echo "        INSERT INTO telegram_users (telegram_id, user_id, name)"
-  echo "        VALUES (<telegram_id>, '<user_id_dari_DB>', '<nama>');\\""
+  echo "        VALUES (<telegram_id>, '<user_id_dari_DB>', '<nama>');\""
   echo ""
   echo "  6. Setup Swap (WAJIB untuk VPS RAM <= 4GB):"
   echo "     fallocate -l 2G /swapfile"
