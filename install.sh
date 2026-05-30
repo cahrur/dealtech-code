@@ -563,6 +563,42 @@ install_nodejs_9router() {
   command -v 9router &>/dev/null && log "9router installed" || warn "9router not found in PATH"
 }
 
+# ─── Install Security Scanner (Nuclei) ────────────────────────────────────────
+install_security_scanner() {
+  section "Installing Security Scanner (Nuclei)"
+  local NUCLEI_VERSION="3.3.7"
+  local SCANNER_DIR="$REPO_DIR/security-scanner"
+
+  if command -v nuclei &>/dev/null; then
+    log "Nuclei already installed: $(nuclei -version 2>&1 | grep -oP 'v[\d.]+' | head -1)"
+  else
+    info "Installing Nuclei v${NUCLEI_VERSION}..."
+    local TEMP_DIR=$(mktemp -d)
+    local NUCLEI_URL="https://github.com/projectdiscovery/nuclei/releases/download/v${NUCLEI_VERSION}/nuclei_${NUCLEI_VERSION}_linux_amd64.zip"
+    curl -sL "$NUCLEI_URL" -o "${TEMP_DIR}/nuclei.zip"
+    unzip -q "${TEMP_DIR}/nuclei.zip" -d "${TEMP_DIR}"
+    mv "${TEMP_DIR}/nuclei" /usr/local/bin/nuclei
+    chmod +x /usr/local/bin/nuclei
+    rm -rf "${TEMP_DIR}"
+    log "Nuclei installed: v${NUCLEI_VERSION}"
+  fi
+
+  # Update templates
+  info "Updating Nuclei templates..."
+  nuclei -update-templates -silent 2>/dev/null || nuclei -ut -silent 2>/dev/null || true
+  log "Nuclei templates updated"
+
+  # Setup scanner symlink
+  if [[ -f "$SCANNER_DIR/scan.sh" ]]; then
+    chmod +x "$SCANNER_DIR/scan.sh" "$SCANNER_DIR/lib/"*.sh 2>/dev/null || true
+    ln -sf "$SCANNER_DIR/scan.sh" /usr/local/bin/secscan
+    mkdir -p "$SCANNER_DIR/results"
+    log "Security scanner ready: secscan <url>"
+  else
+    warn "Scanner scripts not found at $SCANNER_DIR — skipping symlink"
+  fi
+}
+
 # ─── Install OpenClaw Gateway ─────────────────────────────────────────────────
 install_openclaw() {
   section "Installing OpenClaw Gateway"
@@ -850,6 +886,7 @@ main() {
   install_nodejs_9router
   install_openclaw
   install_hermes
+  install_security_scanner
   create_dirs
   write_env
   write_compose
