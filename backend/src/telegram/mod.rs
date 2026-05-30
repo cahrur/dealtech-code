@@ -1324,6 +1324,8 @@ fn format_scan_report(data: &str) -> String {
     let mut low = 0u32;
     let mut info = 0u32;
     let mut finding_lines: Vec<String> = Vec::new();
+    // Collapse duplicate findings (same name+template repeated across many URLs)
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for f in findings {
         let name = f["info"]["name"].as_str().unwrap_or("Unknown");
@@ -1332,6 +1334,12 @@ fn format_scan_report(data: &str) -> String {
             .or_else(|| f["host"].as_str())
             .unwrap_or("N/A");
         let template_id = f["template-id"].as_str().unwrap_or("unknown");
+
+        // Dedupe: same name + template = same issue type, show once
+        let key = format!("{}|{}", name, template_id);
+        if !seen.insert(key) {
+            continue;
+        }
 
         match sev {
             "critical" => critical += 1,

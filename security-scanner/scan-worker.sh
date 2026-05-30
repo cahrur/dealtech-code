@@ -94,7 +94,7 @@ while true; do
 
     log "Scan start: url=$URL mode=$MODE chat_id=$CHAT_ID"
 
-    SEVERITY="critical,high,medium"
+    SEVERITY="low,medium,high,critical"
     [ "$MODE" = "recon" ] && SEVERITY="info,low,medium,high,critical"
 
     TARGS=$(template_args "$MODE")
