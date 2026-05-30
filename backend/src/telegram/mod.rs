@@ -263,6 +263,7 @@ async fn handle_command(
         "/runs" => cmd_runs(client, config, db, tg_user, chat_id).await?,
         "/cost" => cmd_cost(client, config, db, tg_user, chat_id, &parts).await?,
         "/status" => cmd_status(client, config, db, tg_user, chat_id).await?,
+        "/scan" => cmd_scan(client, config, db, tg_user, chat_id, &parts).await?,
         "/help" => cmd_help(client, config, db, &tg_user, chat_id).await?,
         "/adduser" => cmd_adduser(client, config, db, tg_user, chat_id, &parts).await?,
         "/removeuser" => cmd_removeuser(client, config, db, tg_user, chat_id, &parts).await?,
@@ -1102,6 +1103,205 @@ async fn cmd_cost(
     Ok(())
 }
 
+async fn cmd_scan(
+    client: &Client,
+    config: &Config,
+    db: &PgPool,
+    tg_user: &TelegramDbUser,
+    chat_id: i64,
+    parts: &[&str],
+) -> anyhow::Result<()> {
+    // Usage: /scan <url> [mode]
+    // Modes: quick (default), full, recon, cves, misconfig, exposure
+    let url = parts.get(1).unwrap_or(&"").trim();
+    if url.is_empty() {
+        send_message(client, &config.telegram_bot_token, chat_id,
+            "🔒 Security Scanner\n\n\
+            Gunakan: /scan <url> [mode]\n\n\
+            Mode:\n\
+            • quick — Top critical checks (default, ~2-5 min)\n\
+            • full — Semua templates (~15-30 min)\n\
+            • recon — Reconnaissance only\n\
+            • cves — Known CVEs\n\
+            • misconfig — Misconfigurations\n\
+            • exposure — Exposed files/panels\n\n\
+            Contoh:\n\
+            /scan https://myapp.com\n\
+            /scan https://myapp.com full").await?;
+        return Ok(());
+    }
+
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        send_message(client, &config.telegram_bot_token, chat_id,
+            "❌ URL harus dimulai dengan http:// atau https://").await?;
+        return Ok(());
+    }
+
+    let mode = parts.get(2).unwrap_or(&"quick").trim();
+    let valid_modes = ["quick", "full", "recon", "cves", "misconfig", "exposure"];
+    if !valid_modes.contains(&mode) {
+        send_message(client, &config.telegram_bot_token, chat_id,
+            &format!("❌ Mode tidak valid: {}\nPilih: quick, full, recon, cves, misconfig, exposure", mode)).await?;
+        return Ok(());
+    }
+
+    send_message(client, &config.telegram_bot_token, chat_id,
+        &format!("🔒 Memulai security scan...\n\n🎯 Target: {}\n📋 Mode: {}\n\n⏳ Ini bisa memakan waktu beberapa menit.", url, mode)).await?;
+
+    // Run nuclei scan in background
+    let scan_url = url.to_string();
+    let scan_mode = mode.to_string();
+    let bot_token = config.telegram_bot_token.clone();
+    let client_clone = client.clone();
+
+    tokio::spawn(async move {
+        let result = run_security_scan(&scan_url, &scan_mode).await;
+        match result {
+            Ok(report) => {
+                if report.is_empty() {
+                    let _ = send_message(&client_clone, &bot_token, chat_id,
+                        "✅ Scan selesai!\n\nTidak ditemukan vulnerability.\n\n\
+                        ⚠️ Note: Automated scanner hanya mendeteksi ~30-40% vulnerability. \
+                        Pertimbangkan manual testing untuk business logic flaws.").await;
+                } else {
+                    let _ = send_long_message(&client_clone, &bot_token, chat_id, &report).await;
+                }
+            }
+            Err(e) => {
+                let _ = send_message(&client_clone, &bot_token, chat_id,
+                    &format!("❌ Scan gagal: {}", e)).await;
+            }
+        }
+    });
+
+    Ok(())
+}
+
+async fn run_security_scan(url: &str, mode: &str) -> anyhow::Result<String> {
+    let severity = match mode {
+        "recon" => "info,low,medium,high,critical",
+        _ => "critical,high,medium",
+    };
+
+    let mut args = vec![
+        "-u".to_string(), url.to_string(),
+        "-severity".to_string(), severity.to_string(),
+        "-silent".to_string(),
+        "-no-color".to_string(),
+        "-jsonl".to_string(),
+    ];
+
+    match mode {
+        "quick" => {
+            args.extend_from_slice(&[
+                "-tags".to_string(), "cve,rce,sqli,xss,lfi,ssrf,redirect,exposure".to_string(),
+                "-rate-limit".to_string(), "100".to_string(),
+                "-timeout".to_string(), "10".to_string(),
+            ]);
+        }
+        "full" => {
+            args.extend_from_slice(&[
+                "-rate-limit".to_string(), "50".to_string(),
+                "-timeout".to_string(), "15".to_string(),
+            ]);
+        }
+        "recon" => {
+            args.extend_from_slice(&[
+                "-tags".to_string(), "tech,dns,waf".to_string(),
+                "-rate-limit".to_string(), "150".to_string(),
+            ]);
+        }
+        "cves" => {
+            args.extend_from_slice(&[
+                "-tags".to_string(), "cve".to_string(),
+                "-rate-limit".to_string(), "75".to_string(),
+            ]);
+        }
+        "misconfig" => {
+            args.extend_from_slice(&[
+                "-tags".to_string(), "misconfig,misconfiguration".to_string(),
+                "-rate-limit".to_string(), "100".to_string(),
+            ]);
+        }
+        "exposure" => {
+            args.extend_from_slice(&[
+                "-tags".to_string(), "exposure,panel,token,config".to_string(),
+                "-rate-limit".to_string(), "100".to_string(),
+            ]);
+        }
+        _ => {}
+    }
+
+    let output = tokio::process::Command::new("nuclei")
+        .args(&args)
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to run nuclei: {}. Is it installed?", e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+
+    if lines.is_empty() {
+        return Ok(String::new());
+    }
+
+    // Parse JSONL output and format report
+    let mut report = format!("🔒 *Security Scan Report*\n\n🎯 Target: {}\n📋 Mode: {}\n\n", url, mode);
+    let mut critical = 0u32;
+    let mut high = 0u32;
+    let mut medium = 0u32;
+    let mut low = 0u32;
+    let mut info = 0u32;
+    let mut findings: Vec<String> = Vec::new();
+
+    for line in &lines {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            let name = v["info"]["name"].as_str().unwrap_or("Unknown");
+            let sev = v["info"]["severity"].as_str().unwrap_or("unknown");
+            let matched = v["matched-at"].as_str()
+                .or_else(|| v["host"].as_str())
+                .unwrap_or("N/A");
+            let template_id = v["template-id"].as_str().unwrap_or("unknown");
+
+            match sev {
+                "critical" => critical += 1,
+                "high" => high += 1,
+                "medium" => medium += 1,
+                "low" => low += 1,
+                _ => info += 1,
+            }
+
+            let icon = match sev {
+                "critical" => "🔴",
+                "high" => "🟠",
+                "medium" => "🟡",
+                "low" => "🔵",
+                _ => "⚪",
+            };
+
+            findings.push(format!(
+                "{} [{}] {}\n   Template: {}\n   URL: {}",
+                icon, sev.to_uppercase(), name, template_id, matched
+            ));
+        }
+    }
+
+    let total = critical + high + medium + low + info;
+    report.push_str(&format!("📊 Total: {} finding(s)\n", total));
+    if critical > 0 { report.push_str(&format!("🔴 Critical: {}\n", critical)); }
+    if high > 0 { report.push_str(&format!("🟠 High: {}\n", high)); }
+    if medium > 0 { report.push_str(&format!("🟡 Medium: {}\n", medium)); }
+    if low > 0 { report.push_str(&format!("🔵 Low: {}\n", low)); }
+    if info > 0 { report.push_str(&format!("⚪ Info: {}\n", info)); }
+
+    report.push_str("\n━━━━━━━━━━━━━━━━━━━━\n\n");
+    report.push_str(&findings.join("\n\n"));
+    report.push_str("\n\n━━━━━━━━━━━━━━━━━━━━\n");
+    report.push_str("⚠️ Automated scanner hanya mendeteksi ~30-40% vulnerability.");
+
+    Ok(report)
+}
+
 async fn cmd_help(
     client: &Client,
     config: &Config,
@@ -1120,6 +1320,7 @@ async fn cmd_help(
         /cost — Lihat penggunaan token & biaya\n\
         /diff — Lihat file yang diubah di run terakhir\n\
         /pr — Lihat PR terbaru project ini\n\
+        /scan <url> [mode] — Security scan website\n\
         /newsession — Mulai session baru (branch baru)\n\
         /retry — Ulangi run terakhir yang gagal\n\
         /cancel — Batalkan run yang sedang berjalan\n\
