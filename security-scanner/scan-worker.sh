@@ -59,8 +59,12 @@ while true; do
 
     TARGS=$(template_args "$MODE")
 
-    # Run nuclei (swap absorbs the template-load memory spike)
-    RESULT=$(nuclei -u "$URL" $TARGS \
+    # Run nuclei with a hard wall-clock budget so a throttling/slow target
+    # cannot hang the single-scan queue. timeout sends SIGTERM at the budget,
+    # SIGKILL 30s later. Partial results captured so far are still returned.
+    SCAN_BUDGET=900  # 15 minutes
+    [ "$MODE" = "full" ] && SCAN_BUDGET=1800  # 30 minutes for full scans
+    RESULT=$(timeout -k 30 "$SCAN_BUDGET" nuclei -u "$URL" $TARGS \
         -severity "$SEVERITY" \
         -silent -no-color -jsonl -omit-raw \
         -c 5 -rl 30 -timeout 15 -retries 1 \
