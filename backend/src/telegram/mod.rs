@@ -1373,7 +1373,8 @@ fn format_scan_report(data: &str) -> String {
     report.push_str("\n━━━━━━━━━━━━━━━━━━━━\n\n");
     report.push_str(&finding_lines.join("\n\n"));
     report.push_str("\n\n━━━━━━━━━━━━━━━━━━━━\n");
-    report.push_str("⚠️ Automated scanner hanya mendeteksi ~30-40% vulnerability.");
+    report.push_str("⚠️ Mode signature (quick/full/cves/misconfig/exposure) cek misconfig, CVE, exposed files — BUKAN SQL injection.\n");
+    report.push_str("💡 Untuk uji SQL injection: /scan <url>?param=nilai sqli");
 
     report
 }

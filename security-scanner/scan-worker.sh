@@ -95,7 +95,9 @@ while true; do
     log "Scan start: url=$URL mode=$MODE chat_id=$CHAT_ID"
 
     SEVERITY="low,medium,high,critical"
-    [ "$MODE" = "recon" ] && SEVERITY="info,low,medium,high,critical"
+    case "$MODE" in
+        recon|full) SEVERITY="info,low,medium,high,critical" ;;
+    esac
 
     TARGS=$(template_args "$MODE")
 
