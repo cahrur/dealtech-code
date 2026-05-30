@@ -20,13 +20,13 @@ log() {
 # Template dirs per mode (swap covers the memory; no batching needed)
 template_args() {
     case "$1" in
-        quick)     echo "-t $TEMPLATES_DIR/cves -t $TEMPLATES_DIR/vulnerabilities -t $TEMPLATES_DIR/exposures" ;;
+        quick)     echo "-t $TEMPLATES_DIR/exposures -t $TEMPLATES_DIR/misconfiguration" ;;
         full)      echo "-t $TEMPLATES_DIR" ;;
         recon)     echo "-t $TEMPLATES_DIR/technologies" ;;
         cves)      echo "-t $TEMPLATES_DIR/cves" ;;
         misconfig) echo "-t $TEMPLATES_DIR/misconfiguration" ;;
         exposure)  echo "-t $TEMPLATES_DIR/exposures -t $TEMPLATES_DIR/exposed-panels" ;;
-        *)         echo "-t $TEMPLATES_DIR/cves -t $TEMPLATES_DIR/exposures" ;;
+        *)         echo "-t $TEMPLATES_DIR/exposures -t $TEMPLATES_DIR/misconfiguration" ;;
     esac
 }
 
@@ -67,7 +67,7 @@ while true; do
     RESULT=$(timeout -k 30 "$SCAN_BUDGET" nuclei -u "$URL" $TARGS \
         -severity "$SEVERITY" \
         -silent -no-color -jsonl -omit-raw \
-        -c 5 -rl 30 -timeout 15 -retries 1 \
+        -c 25 -rl 150 -timeout 10 -retries 1 \
         2>/dev/null || true)
 
     # Build result JSON
