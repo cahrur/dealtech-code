@@ -1352,9 +1352,22 @@ async fn cmd_scanstatus(
             if let Ok(info) = serde_json::from_str::<serde_json::Value>(&data) {
                 let url = info["url"].as_str().unwrap_or("unknown");
                 let mode = info["mode"].as_str().unwrap_or("unknown");
-                let started = info["started_at"].as_str().unwrap_or("unknown");
+                let started_secs = info["started_at"].as_str()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default().as_secs();
+                let elapsed = now_secs.saturating_sub(started_secs);
+                let elapsed_str = if started_secs == 0 {
+                    "tidak diketahui".to_string()
+                } else if elapsed < 60 {
+                    format!("{} detik lalu", elapsed)
+                } else {
+                    format!("{} menit {} detik lalu", elapsed / 60, elapsed % 60)
+                };
                 send_message(client, &config.telegram_bot_token, chat_id,
-                    &format!("🔄 Scan sedang berjalan\n\n🎯 Target: {}\n📋 Mode: {}\n⏰ Mulai: {}", url, mode, started)).await?;
+                    &format!("🔄 Scan sedang berjalan\n\n🎯 Target: {}\n📋 Mode: {}\n⏱ Mulai: {}", url, mode, elapsed_str)).await?;
             } else {
                 send_message(client, &config.telegram_bot_token, chat_id,
                     "🔄 Ada scan yang sedang berjalan.").await?;
