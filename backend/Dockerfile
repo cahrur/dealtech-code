@@ -17,8 +17,16 @@ RUN touch src/main.rs && cargo build --release
 # ── Stage 3: runtime ───────────────────────────────────────────────────────────
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y \
-    ca-certificates curl git \
+    ca-certificates curl git unzip \
     && rm -rf /var/lib/apt/lists/*
+
+# Install Nuclei
+RUN curl -sL https://github.com/projectdiscovery/nuclei/releases/download/v3.3.7/nuclei_3.3.7_linux_amd64.zip -o /tmp/nuclei.zip \
+    && unzip -q /tmp/nuclei.zip -d /tmp \
+    && mv /tmp/nuclei /usr/local/bin/nuclei \
+    && chmod +x /usr/local/bin/nuclei \
+    && rm -rf /tmp/nuclei.zip \
+    && nuclei -update-templates -silent 2>/dev/null || true
 # NOTE: runs as root — required for docker.sock access (container management)
 # For production hardening: use tecnativa/docker-socket-proxy to restrict docker API
 WORKDIR /app
