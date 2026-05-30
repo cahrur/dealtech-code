@@ -40,9 +40,19 @@ run_sqli_scan() {
     outdir=$(mktemp -d /tmp/sqlmap-XXXXXX)
     local logf="$outdir/run.log"
 
+    # Smart mode: if the URL already has a query parameter (?x=y), test it
+    # directly (fast, ~10-30s). Otherwise auto-crawl the site to discover
+    # injectable URLs/forms on its own (no manual parameter needed, ~1-3 min).
+    local extra_args
+    if printf '%s' "$url" | grep -q '?[^=]*='; then
+        extra_args="--level=2 --risk=1"
+    else
+        extra_args="--crawl=2 --forms --level=1 --risk=1"
+    fi
+
     timeout -k 30 "$budget" sqlmap -u "$url" \
-        --batch --level=2 --risk=1 \
-        --random-agent --timeout=10 --retries=1 --threads=4 \
+        --batch $extra_args \
+        --random-agent --timeout=10 --retries=1 --threads=5 \
         --flush-session \
         --output-dir="$outdir" >"$logf" 2>&1 || true
 
