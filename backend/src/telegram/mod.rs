@@ -263,7 +263,9 @@ async fn handle_command(
         "/runs" => cmd_runs(client, config, db, tg_user, chat_id).await?,
         "/cost" => cmd_cost(client, config, db, tg_user, chat_id, &parts).await?,
         "/status" => cmd_status(client, config, db, tg_user, chat_id).await?,
-        "/scan" => cmd_scan(client, config, db, tg_user, chat_id, &parts).await?,
+        "/scan" => cmd_scan(client, config, db, tg_user, chat_id, &parts, redis.clone()).await?,
+        "/scanstatus" => cmd_scanstatus(client, config, chat_id, &mut redis).await?,
+        "/cancelscan" => cmd_cancelscan(client, config, chat_id, &mut redis).await?,
         "/help" => cmd_help(client, config, db, &tg_user, chat_id).await?,
         "/adduser" => cmd_adduser(client, config, db, tg_user, chat_id, &parts).await?,
         "/removeuser" => cmd_removeuser(client, config, db, tg_user, chat_id, &parts).await?,
@@ -1110,6 +1112,7 @@ async fn cmd_scan(
     tg_user: &TelegramDbUser,
     chat_id: i64,
     parts: &[&str],
+    mut redis: ConnectionManager,
 ) -> anyhow::Result<()> {
     // Usage: /scan <url> [mode]
     // Modes: quick (default), full, recon, cves, misconfig, exposure
@@ -1145,31 +1148,122 @@ async fn cmd_scan(
         return Ok(());
     }
 
-    send_message(client, &config.telegram_bot_token, chat_id,
-        &format!("🔒 Memulai security scan...\n\n🎯 Target: {}\n📋 Mode: {}\n\n⏳ Ini bisa memakan waktu beberapa menit.", url, mode)).await?;
+    // Prevent the same chat from queueing two scans at once
+    let active_self: Option<String> = redis::cmd("GET")
+        .arg(format!("scan:active:{}", chat_id))
+        .query_async(&mut redis)
+        .await
+        .unwrap_or(None);
+    if active_self.is_some() {
+        send_message(client, &config.telegram_bot_token, chat_id,
+            "⚠️ Kamu sudah punya scan yang sedang berjalan atau mengantri.\n\
+            Gunakan /scanstatus untuk cek, atau /cancelscan untuk membatalkan.").await?;
+        return Ok(());
+    }
 
-    // Run nuclei scan in background
-    let scan_url = url.to_string();
-    let scan_mode = mode.to_string();
+    // Check if another scan is already running (single-scan policy)
+    let running_for: Option<String> = redis::cmd("GET")
+        .arg("scan:running")
+        .query_async(&mut redis)
+        .await
+        .unwrap_or(None);
+    let queue_len: i64 = redis::cmd("LLEN")
+        .arg("scan:queue")
+        .query_async(&mut redis)
+        .await
+        .unwrap_or(0);
+
+    if running_for.is_some() {
+        // Position = scans already queued ahead + the one currently running
+        let position = queue_len + 1;
+        send_message(client, &config.telegram_bot_token, chat_id,
+            &format!("⏳ Ada scan lain yang sedang berjalan.\n\n\
+            🎯 Target kamu: {}\n📋 Mode: {}\n🔢 Posisi antrian: #{}\n\n\
+            Scan kamu akan diproses otomatis setelah antrian selesai. \
+            Aku kabari kalau sudah jalan dan setelah selesai.", url, mode, position)).await?;
+    } else {
+        send_message(client, &config.telegram_bot_token, chat_id,
+            &format!("🔒 Memulai security scan...\n\n🎯 Target: {}\n📋 Mode: {}\n\n⏳ Ini bisa memakan waktu beberapa menit.", url, mode)).await?;
+    }
+
+    // Store scan state in Redis
+    let scan_key = format!("scan:active:{}", chat_id);
+    let scan_info = serde_json::json!({
+        "url": url,
+        "mode": mode,
+        "started_at": format!("{}", std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default().as_secs()),
+        "status": "running"
+    });
+    let _: () = redis::cmd("SET")
+        .arg(&scan_key)
+        .arg(scan_info.to_string())
+        .arg("EX").arg(3600)
+        .query_async(&mut redis)
+        .await
+        .unwrap_or(());
+
+    // Push scan job to queue (worker on host picks it up)
+    let job = serde_json::json!({
+        "url": url,
+        "mode": mode,
+        "chat_id": chat_id
+    });
+    let _: () = redis::cmd("LPUSH")
+        .arg("scan:queue")
+        .arg(job.to_string())
+        .query_async(&mut redis)
+        .await
+        .unwrap_or(());
+
+    // Subscribe to result in background
     let bot_token = config.telegram_bot_token.clone();
     let client_clone = client.clone();
+    let mut redis_clone = redis.clone();
 
     tokio::spawn(async move {
-        let result = run_security_scan(&scan_url, &scan_mode).await;
-        match result {
-            Ok(report) => {
+        // Poll for result (max 30 min)
+        let result_key = format!("scan:result:{}", chat_id);
+        let scan_key = format!("scan:active:{}", chat_id);
+        let max_wait = 1800; // 30 minutes
+        let mut waited = 0u64;
+
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            waited += 5;
+
+            let result: Option<String> = redis::cmd("GET")
+                .arg(&result_key)
+                .query_async(&mut redis_clone)
+                .await
+                .unwrap_or(None);
+
+            if let Some(data) = result {
+                // Clean up
+                let _: () = redis::cmd("DEL").arg(&result_key)
+                    .query_async(&mut redis_clone).await.unwrap_or(());
+                let _: () = redis::cmd("DEL").arg(&scan_key)
+                    .query_async(&mut redis_clone).await.unwrap_or(());
+
+                // Parse and format report
+                let report = format_scan_report(&data);
                 if report.is_empty() {
                     let _ = send_message(&client_clone, &bot_token, chat_id,
                         "✅ Scan selesai!\n\nTidak ditemukan vulnerability.\n\n\
-                        ⚠️ Note: Automated scanner hanya mendeteksi ~30-40% vulnerability. \
-                        Pertimbangkan manual testing untuk business logic flaws.").await;
+                        ⚠️ Note: Automated scanner hanya mendeteksi ~30-40% vulnerability.").await;
                 } else {
                     let _ = send_long_message(&client_clone, &bot_token, chat_id, &report).await;
                 }
+                break;
             }
-            Err(e) => {
+
+            if waited >= max_wait {
+                let _: () = redis::cmd("DEL").arg(&scan_key)
+                    .query_async(&mut redis_clone).await.unwrap_or(());
                 let _ = send_message(&client_clone, &bot_token, chat_id,
-                    &format!("❌ Scan gagal: {}", e)).await;
+                    "⏰ Scan timeout (30 menit). Target mungkin terlalu besar atau tidak responsif.").await;
+                break;
             }
         }
     });
@@ -1177,129 +1271,135 @@ async fn cmd_scan(
     Ok(())
 }
 
-async fn run_security_scan(url: &str, mode: &str) -> anyhow::Result<String> {
-    let severity = match mode {
-        "recon" => "info,low,medium,high,critical",
-        _ => "critical,high,medium",
+fn format_scan_report(data: &str) -> String {
+    let parsed: serde_json::Value = match serde_json::from_str(data) {
+        Ok(v) => v,
+        Err(_) => return String::new(),
     };
 
-    let mut args = vec![
-        "-u".to_string(), url.to_string(),
-        "-severity".to_string(), severity.to_string(),
-        "-silent".to_string(),
-        "-no-color".to_string(),
-        "-jsonl".to_string(),
-    ];
+    let findings = match parsed["findings"].as_array() {
+        Some(f) if !f.is_empty() => f,
+        _ => return String::new(),
+    };
 
-    match mode {
-        "quick" => {
-            args.extend_from_slice(&[
-                "-tags".to_string(), "cve,rce,sqli,xss,lfi,ssrf,redirect,exposure".to_string(),
-                "-rate-limit".to_string(), "100".to_string(),
-                "-timeout".to_string(), "10".to_string(),
-            ]);
-        }
-        "full" => {
-            args.extend_from_slice(&[
-                "-rate-limit".to_string(), "50".to_string(),
-                "-timeout".to_string(), "15".to_string(),
-            ]);
-        }
-        "recon" => {
-            args.extend_from_slice(&[
-                "-tags".to_string(), "tech,dns,waf".to_string(),
-                "-rate-limit".to_string(), "150".to_string(),
-            ]);
-        }
-        "cves" => {
-            args.extend_from_slice(&[
-                "-tags".to_string(), "cve".to_string(),
-                "-rate-limit".to_string(), "75".to_string(),
-            ]);
-        }
-        "misconfig" => {
-            args.extend_from_slice(&[
-                "-tags".to_string(), "misconfig,misconfiguration".to_string(),
-                "-rate-limit".to_string(), "100".to_string(),
-            ]);
-        }
-        "exposure" => {
-            args.extend_from_slice(&[
-                "-tags".to_string(), "exposure,panel,token,config".to_string(),
-                "-rate-limit".to_string(), "100".to_string(),
-            ]);
-        }
-        _ => {}
-    }
-
-    let output = tokio::process::Command::new("nuclei")
-        .args(&args)
-        .output()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to run nuclei: {}. Is it installed?", e))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let lines: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
-
-    if lines.is_empty() {
-        return Ok(String::new());
-    }
-
-    // Parse JSONL output and format report
-    let mut report = format!("🔒 *Security Scan Report*\n\n🎯 Target: {}\n📋 Mode: {}\n\n", url, mode);
     let mut critical = 0u32;
     let mut high = 0u32;
     let mut medium = 0u32;
     let mut low = 0u32;
     let mut info = 0u32;
-    let mut findings: Vec<String> = Vec::new();
+    let mut finding_lines: Vec<String> = Vec::new();
 
-    for line in &lines {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-            let name = v["info"]["name"].as_str().unwrap_or("Unknown");
-            let sev = v["info"]["severity"].as_str().unwrap_or("unknown");
-            let matched = v["matched-at"].as_str()
-                .or_else(|| v["host"].as_str())
-                .unwrap_or("N/A");
-            let template_id = v["template-id"].as_str().unwrap_or("unknown");
+    for f in findings {
+        let name = f["info"]["name"].as_str().unwrap_or("Unknown");
+        let sev = f["info"]["severity"].as_str().unwrap_or("unknown");
+        let matched = f["matched-at"].as_str()
+            .or_else(|| f["host"].as_str())
+            .unwrap_or("N/A");
+        let template_id = f["template-id"].as_str().unwrap_or("unknown");
 
-            match sev {
-                "critical" => critical += 1,
-                "high" => high += 1,
-                "medium" => medium += 1,
-                "low" => low += 1,
-                _ => info += 1,
-            }
-
-            let icon = match sev {
-                "critical" => "🔴",
-                "high" => "🟠",
-                "medium" => "🟡",
-                "low" => "🔵",
-                _ => "⚪",
-            };
-
-            findings.push(format!(
-                "{} [{}] {}\n   Template: {}\n   URL: {}",
-                icon, sev.to_uppercase(), name, template_id, matched
-            ));
+        match sev {
+            "critical" => critical += 1,
+            "high" => high += 1,
+            "medium" => medium += 1,
+            "low" => low += 1,
+            _ => info += 1,
         }
+
+        let icon = match sev {
+            "critical" => "🔴",
+            "high" => "🟠",
+            "medium" => "🟡",
+            "low" => "🔵",
+            _ => "⚪",
+        };
+
+        finding_lines.push(format!(
+            "{} [{}] {}\n   Template: {}\n   URL: {}",
+            icon, sev.to_uppercase(), name, template_id, matched
+        ));
     }
 
     let total = critical + high + medium + low + info;
-    report.push_str(&format!("📊 Total: {} finding(s)\n", total));
+    let mut report = format!("🔒 Security Scan Report\n\n📊 Total: {} finding(s)\n", total);
     if critical > 0 { report.push_str(&format!("🔴 Critical: {}\n", critical)); }
     if high > 0 { report.push_str(&format!("🟠 High: {}\n", high)); }
     if medium > 0 { report.push_str(&format!("🟡 Medium: {}\n", medium)); }
     if low > 0 { report.push_str(&format!("🔵 Low: {}\n", low)); }
     if info > 0 { report.push_str(&format!("⚪ Info: {}\n", info)); }
-
     report.push_str("\n━━━━━━━━━━━━━━━━━━━━\n\n");
-    report.push_str(&findings.join("\n\n"));
+    report.push_str(&finding_lines.join("\n\n"));
     report.push_str("\n\n━━━━━━━━━━━━━━━━━━━━\n");
     report.push_str("⚠️ Automated scanner hanya mendeteksi ~30-40% vulnerability.");
 
-    Ok(report)
+    report
+}
+
+async fn cmd_scanstatus(
+    client: &Client,
+    config: &Config,
+    chat_id: i64,
+    redis: &mut ConnectionManager,
+) -> anyhow::Result<()> {
+    let scan_key = format!("scan:active:{}", chat_id);
+    let scan_data: Option<String> = redis::cmd("GET")
+        .arg(&scan_key)
+        .query_async(redis)
+        .await
+        .unwrap_or(None);
+
+    match scan_data {
+        Some(data) => {
+            if let Ok(info) = serde_json::from_str::<serde_json::Value>(&data) {
+                let url = info["url"].as_str().unwrap_or("unknown");
+                let mode = info["mode"].as_str().unwrap_or("unknown");
+                let started = info["started_at"].as_str().unwrap_or("unknown");
+                send_message(client, &config.telegram_bot_token, chat_id,
+                    &format!("🔄 Scan sedang berjalan\n\n🎯 Target: {}\n📋 Mode: {}\n⏰ Mulai: {}", url, mode, started)).await?;
+            } else {
+                send_message(client, &config.telegram_bot_token, chat_id,
+                    "🔄 Ada scan yang sedang berjalan.").await?;
+            }
+        }
+        None => {
+            send_message(client, &config.telegram_bot_token, chat_id,
+                "✅ Tidak ada scan yang sedang berjalan.").await?;
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_cancelscan(
+    client: &Client,
+    config: &Config,
+    chat_id: i64,
+    redis: &mut ConnectionManager,
+) -> anyhow::Result<()> {
+    let scan_key = format!("scan:active:{}", chat_id);
+    let scan_data: Option<String> = redis::cmd("GET")
+        .arg(&scan_key)
+        .query_async(redis)
+        .await
+        .unwrap_or(None);
+
+    if scan_data.is_none() {
+        send_message(client, &config.telegram_bot_token, chat_id,
+            "✅ Tidak ada scan yang sedang berjalan.").await?;
+        return Ok(());
+    }
+
+    // Kill nuclei processes
+    let _ = tokio::process::Command::new("pkill")
+        .args(&["-f", "nuclei.*-u"])
+        .output()
+        .await;
+
+    // Clear Redis key
+    let _: () = redis::cmd("DEL").arg(&scan_key)
+        .query_async(redis).await.unwrap_or(());
+
+    send_message(client, &config.telegram_bot_token, chat_id,
+        "⛔ Scan dibatalkan.").await?;
+    Ok(())
 }
 
 async fn cmd_help(
@@ -1321,6 +1421,8 @@ async fn cmd_help(
         /diff — Lihat file yang diubah di run terakhir\n\
         /pr — Lihat PR terbaru project ini\n\
         /scan <url> [mode] — Security scan website\n\
+        /scanstatus — Cek status scan yang berjalan\n\
+        /cancelscan — Batalkan scan yang berjalan\n\
         /newsession — Mulai session baru (branch baru)\n\
         /retry — Ulangi run terakhir yang gagal\n\
         /cancel — Batalkan run yang sedang berjalan\n\

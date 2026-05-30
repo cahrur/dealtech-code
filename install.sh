@@ -597,6 +597,51 @@ install_security_scanner() {
   else
     warn "Scanner scripts not found at $SCANNER_DIR — skipping symlink"
   fi
+
+  # Ensure swap exists (Nuclei loads many templates; low-RAM VPS will OOM without swap)
+  if [[ $(free -m | awk '/^Swap:/{print $2}') -lt 1024 ]]; then
+    if [[ ! -f /swapfile ]]; then
+      info "Creating 2G swapfile (prevents Nuclei OOM on low-RAM VPS)..."
+      fallocate -l 2G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=2048 status=none
+      chmod 600 /swapfile
+      mkswap /swapfile >/dev/null 2>&1
+      swapon /swapfile 2>/dev/null || true
+      grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+      echo 'vm.swappiness=10' > /etc/sysctl.d/99-swap.conf
+      sysctl vm.swappiness=10 >/dev/null 2>&1 || true
+      log "Swap enabled (2G)"
+    fi
+  else
+    log "Swap already present — skipping"
+  fi
+
+  # Install scan worker as a systemd service (single-scan queue consumer)
+  if [[ -f "$SCANNER_DIR/scan-worker.sh" ]]; then
+    chmod +x "$SCANNER_DIR/scan-worker.sh"
+    cat > /etc/systemd/system/security-scan-worker.service <<EOF
+[Unit]
+Description=Security Scan Worker (Nuclei queue consumer)
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=${SCANNER_DIR}/scan-worker.sh
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/log/scan-worker.log
+StandardError=append:/var/log/scan-worker.log
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable security-scan-worker.service >/dev/null 2>&1 || true
+    systemctl restart security-scan-worker.service 2>/dev/null || true
+    log "Scan worker service enabled (security-scan-worker.service)"
+  else
+    warn "scan-worker.sh not found — skipping worker service"
+  fi
 }
 
 # ─── Install OpenClaw Gateway ─────────────────────────────────────────────────
