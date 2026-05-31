@@ -1229,12 +1229,14 @@ async fn cmd_scan(
             • sqli — Active SQL injection test (sqlmap)\n\
             • xss — Active XSS test (dalfox)\n\
             • tls — TLS/SSL config audit (testssl.sh)\n\
-            • deps — Dependency CVE + secret + IaC scan repo git (trivy)\n\n\
+            • deps — Dependency CVE + secret + IaC scan repo git (trivy)\n\
+            • discovery — Petakan subdomain & host hidup (subfinder+httpx)\n\n\
             Contoh:\n\
             /scan https://myapp.com\n\
             /scan https://myapp.com full\n\
             /scan https://myapp.com/page?id=1 sqli\n\
-            /scan https://github.com/user/repo deps").await?;
+            /scan https://github.com/user/repo deps\n\
+            /scan siwanu.com discovery").await?;
         return Ok(());
     }
 
@@ -1245,10 +1247,10 @@ async fn cmd_scan(
     }
 
     let mode = parts.get(2).unwrap_or(&"quick").trim();
-    let valid_modes = ["quick", "full", "recon", "cves", "misconfig", "exposure", "sqli", "xss", "tls", "deps"];
+    let valid_modes = ["quick", "full", "recon", "cves", "misconfig", "exposure", "sqli", "xss", "tls", "deps", "discovery"];
     if !valid_modes.contains(&mode) {
         send_message(client, &config.telegram_bot_token, chat_id,
-            &format!("❌ Mode tidak valid: {}\nPilih: quick, full, recon, cves, misconfig, exposure, sqli, xss, tls, deps", mode)).await?;
+            &format!("❌ Mode tidak valid: {}\nPilih: quick, full, recon, cves, misconfig, exposure, sqli, xss, tls, deps, discovery", mode)).await?;
         return Ok(());
     }
 

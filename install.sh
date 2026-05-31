@@ -656,6 +656,28 @@ install_security_scanner() {
     fi
   fi
 
+  # Install subfinder + httpx (attack-surface discovery for the `discovery`
+  # mode). ProjectDiscovery Go binaries: static, run fine on glibc 2.35.
+  for pdtool in subfinder httpx; do
+    if command -v "$pdtool" &>/dev/null; then
+      log "$pdtool already installed"
+      continue
+    fi
+    info "Installing $pdtool (attack-surface discovery)..."
+    case "$pdtool" in
+      subfinder) PD_VER="2.14.0" ;;
+      httpx)     PD_VER="1.9.0" ;;
+    esac
+    PD_URL="https://github.com/projectdiscovery/${pdtool}/releases/download/v${PD_VER}/${pdtool}_${PD_VER}_linux_amd64.zip"
+    if curl -sL "$PD_URL" -o "${TEMP_DIR}/${pdtool}.zip" \
+       && unzip -o -q "${TEMP_DIR}/${pdtool}.zip" "$pdtool" -d "${TEMP_DIR}" 2>/dev/null; then
+      mv -f "${TEMP_DIR}/${pdtool}" /usr/local/bin/${pdtool} && chmod +x /usr/local/bin/${pdtool}
+      log "$pdtool installed"
+    else
+      warn "$pdtool install failed (discovery mode partially unavailable)"
+    fi
+  done
+
   # Install testssl.sh (TLS/SSL config audit for the `tls` scan mode).
   # Pure-bash tool; clone the repo and symlink the script.
   if command -v testssl.sh &>/dev/null; then

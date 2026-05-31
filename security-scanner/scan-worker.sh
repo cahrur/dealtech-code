@@ -342,6 +342,53 @@ run_deps_scan() {
     rm -rf "$outdir"
 }
 
+# --- Attack-surface discovery via subfinder + httpx ---------------------
+# Takes a domain (or URL; host is extracted). subfinder enumerates subdomains,
+# httpx probes which are live (status, title, tech, server). Reported as INFO
+# findings so the user sees their real attack surface (forgotten staging/admin
+# /dev hosts). This is the recon step you run BEFORE scanning individual hosts.
+# Non-intrusive: only HTTP probing, no payloads.
+run_discovery_scan() {
+    local url="$1"
+    local budget="$2"
+    local outdir hosts live domain sub_budget
+    outdir=$(mktemp -d /tmp/disco-XXXXXX)
+    hosts="$outdir/hosts.txt"
+    live="$outdir/live.jsonl"
+
+    # Extract bare host from a URL or domain.
+    domain=$(printf '%s' "$url" | sed -E 's#^https?://##; s#/.*$##; s#:.*$##')
+
+    # Up to half the budget (max 180s) for subdomain enumeration.
+    sub_budget=$(( budget / 2 )); [ "$sub_budget" -gt 180 ] && sub_budget=180
+    [ "$sub_budget" -lt 30 ] && sub_budget=30
+
+    timeout -k 15 "$sub_budget" subfinder -d "$domain" -silent 2>/dev/null \
+        | sort -u | head -200 > "$hosts" || true
+    # Always include the domain itself.
+    printf '%s\n' "$domain" >> "$hosts"
+    sort -u "$hosts" -o "$hosts"
+
+    timeout -k 15 "$budget" httpx -l "$hosts" \
+        -silent -nc -json \
+        -status-code -title -tech-detect -web-server \
+        -timeout 8 -retries 1 2>/dev/null > "$live" || true
+
+    if [ -s "$live" ]; then
+        jq -c '
+            {info:{
+                name:("Live host: " + (.url // .input // "?")),
+                severity:"info",
+                description:(("status " + ((.status_code // 0)|tostring)
+                             + " | " + (.title // "")
+                             + " | " + (.webserver // "")
+                             + " | " + ((.tech // [])|join(",")))[0:200])},
+             "matched-at":(.url // .input // "?"),
+             "template-id":"discovery-live-host"}' "$live" 2>/dev/null
+    fi
+    rm -rf "$outdir"
+}
+
 log "Scan worker started"
 
 while true; do
@@ -394,6 +441,9 @@ while true; do
     elif [ "$MODE" = "deps" ]; then
         # Dependency/secret/IaC scan of a GIT REPO url via trivy (separate path)
         RESULT=$(run_deps_scan "$URL" "$SCAN_BUDGET")
+    elif [ "$MODE" = "discovery" ]; then
+        # Attack-surface discovery (subfinder + httpx), non-intrusive recon
+        RESULT=$(run_discovery_scan "$URL" "$SCAN_BUDGET")
     else
         # Signature-based scanning via nuclei. Hard wall-clock budget so a
         # throttling/slow target cannot hang the single-scan queue.
