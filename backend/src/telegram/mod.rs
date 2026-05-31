@@ -1400,6 +1400,23 @@ async fn scan_result_deliverer(
                 ⚠️ Note: Automated scanner hanya mendeteksi ~30-40% vulnerability.").await;
         } else {
             let _ = send_long_message(&client, &config.telegram_bot_token, chat_id, &report).await;
+            // Also send downloadable HTML + JSON reports (actionable/auditable).
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default().as_secs();
+            let html = build_html_report(&data);
+            if !html.is_empty() {
+                let _ = send_scan_document(&client, &config.telegram_bot_token, chat_id,
+                    html.into_bytes(), &format!("scan_report_{}.html", ts),
+                    "text/html", "📄 Report HTML (buka di browser)").await;
+            }
+            // Pretty-print JSON for the machine-readable export.
+            let json_pretty = serde_json::from_str::<serde_json::Value>(&data)
+                .ok().and_then(|v| serde_json::to_vec_pretty(&v).ok())
+                .unwrap_or_else(|| data.clone().into_bytes());
+            let _ = send_scan_document(&client, &config.telegram_bot_token, chat_id,
+                json_pretty, &format!("scan_report_{}.json", ts),
+                "application/json", "🗂 Report JSON (machine-readable)").await;
         }
 
         // Clean up markers
@@ -1410,6 +1427,61 @@ async fn scan_result_deliverer(
 
         tracing::info!(chat_id = %chat_id, "deliverer: report sent");
     }
+}
+
+// Build a downloadable HTML report from the raw scan result JSON.
+// Self-contained (inline CSS), grouped by severity, safe-escaped.
+fn build_html_report(data: &str) -> String {
+    fn esc(s: &str) -> String {
+        s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+         .replace('"', "&quot;")
+    }
+    let parsed: serde_json::Value = match serde_json::from_str(data) {
+        Ok(v) => v,
+        Err(_) => return String::new(),
+    };
+    let empty = vec![];
+    let findings = parsed["findings"].as_array().unwrap_or(&empty);
+    let order = ["critical", "high", "medium", "low", "info"];
+    let mut rows = String::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for sev in order {
+        for f in findings {
+            let fsev = f["info"]["severity"].as_str().unwrap_or("info");
+            if fsev != sev { continue; }
+            let name = f["info"]["name"].as_str().unwrap_or("Unknown");
+            let tid = f["template-id"].as_str().unwrap_or("unknown");
+            let key = format!("{}|{}", name, tid);
+            if !seen.insert(key) { continue; }
+            let matched = f["matched-at"].as_str()
+                .or_else(|| f["host"].as_str()).unwrap_or("N/A");
+            let desc = f["info"]["description"].as_str().unwrap_or("");
+            rows.push_str(&format!(
+                "<tr class=\"{}\"><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>\n",
+                esc(sev), esc(&sev.to_uppercase()), esc(name), esc(tid),
+                esc(matched), esc(desc)));
+        }
+    }
+    let total = seen.len();
+    format!(r####"<!DOCTYPE html><html lang="id"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Security Scan Report</title><style>
+body{{font-family:system-ui,Arial,sans-serif;margin:24px;color:#1a1a1a;background:#fafafa}}
+h1{{font-size:20px}} .meta{{color:#666;font-size:13px;margin-bottom:16px}}
+table{{border-collapse:collapse;width:100%;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.1)}}
+th,td{{padding:8px 10px;text-align:left;border-bottom:1px solid #eee;font-size:13px;vertical-align:top}}
+th{{background:#222;color:#fff;position:sticky;top:0}}
+td:first-child{{font-weight:700;white-space:nowrap}}
+tr.critical td:first-child{{color:#c0392b}} tr.high td:first-child{{color:#e67e22}}
+tr.medium td:first-child{{color:#b7950b}} tr.low td:first-child{{color:#2980b9}}
+tr.info td:first-child{{color:#7f8c8d}}
+</style></head><body>
+<h1>&#128274; Security Scan Report</h1>
+<div class="meta">Total temuan: <b>{}</b> &middot; Dibuat oleh Dealtech Code Scanner</div>
+<table><thead><tr><th>Severity</th><th>Nama</th><th>Template</th><th>Lokasi</th><th>Detail</th></tr></thead>
+<tbody>{}</tbody></table>
+<p class="meta">&#9888;&#65039; Automated scanner mendeteksi ~30-40% vulnerability. Hasil ini bukan jaminan aman; tetap perlu review manual.</p>
+</body></html>"####, total, rows)
 }
 
 fn format_scan_report(data: &str) -> String {
@@ -1967,6 +2039,32 @@ async fn send_message(
         }
         break;
     }
+    Ok(())
+}
+
+// Send an in-memory file as a Telegram document (used for scan report export).
+// Skips silently if too large for Telegram (50MB). Best-effort, never panics.
+async fn send_scan_document(
+    client: &Client,
+    token: &str,
+    chat_id: i64,
+    bytes: Vec<u8>,
+    file_name: &str,
+    mime: &str,
+    caption: &str,
+) -> anyhow::Result<()> {
+    if bytes.is_empty() || bytes.len() >= 50 * 1024 * 1024 {
+        return Ok(());
+    }
+    let url = format!("https://api.telegram.org/bot{}/sendDocument", token);
+    let part = reqwest::multipart::Part::bytes(bytes)
+        .file_name(file_name.to_string())
+        .mime_str(mime)?;
+    let form = reqwest::multipart::Form::new()
+        .text("chat_id", chat_id.to_string())
+        .text("caption", caption.to_string())
+        .part("document", part);
+    let _ = client.post(&url).multipart(form).send().await?;
     Ok(())
 }
 
