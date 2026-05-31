@@ -6,6 +6,12 @@
 
 set -uo pipefail
 
+# katana (used by xss auto-crawl) aborts with "could not get home directory:
+# $HOME is not defined" when launched by systemd (which provides no HOME).
+# Define it defensively so the crawler works regardless of launch context.
+export HOME="${HOME:-/root}"
+
+
 REDIS_CLI="docker exec -i ai-platform-redis-1 redis-cli"
 TEMPLATES_DIR="/root/nuclei-templates/http"
 SCAN_QUEUE="scan:queue"
@@ -115,21 +121,51 @@ run_sqli_scan() {
 
 # --- Active XSS testing via dalfox --------------------------------------
 # dalfox mines parameters from the page and injects real XSS payloads.
-# Works with or without an explicit ?param= (it discovers params itself).
+# Smart mode (like sqli): if the URL has a query parameter (?x=y), test it
+# directly (fast). Otherwise auto-crawl the site with katana to discover
+# parameterized URLs, then test them all via dalfox pipe mode -- so the user
+# does NOT need to know which parameter is vulnerable.
 # NOTE: dalfox v2.9.0 --format json is broken (emits [{}]), so we parse its
 # reliable plain [POC] stdout instead. [V]=verified (DOM-triggered, high),
 # [R]=reflected (medium).
 run_xss_scan() {
     local url="$1"
     local budget="$2"
-    local outdir logf
+    local outdir logf targets crawl_budget xss_budget
     outdir=$(mktemp -d /tmp/dalfox-XXXXXX)
     logf="$outdir/out.log"
+    targets="$outdir/targets.txt"
 
-    timeout -k 30 "$budget" dalfox url "$url" \
-        --no-color --no-spinner --skip-bav \
-        --timeout 15 --worker 30 --delay 50 \
-        >"$logf" 2>&1 || true
+    if printf '%s' "$url" | grep -q '?[^=]*='; then
+        # URL already has a parameter: test it directly (~30-90s).
+        timeout -k 30 "$budget" dalfox url "$url" \
+            --no-color --no-spinner --skip-bav \
+            --timeout 15 --worker 30 --delay 50 \
+            >"$logf" 2>&1 || true
+    else
+        # No parameter: crawl with katana to find injectable URLs, then pipe
+        # them into dalfox. Split budget: up to 1/3 (max 240s) for crawling.
+        crawl_budget=$(( budget / 3 )); [ "$crawl_budget" -gt 240 ] && crawl_budget=240
+        xss_budget=$(( budget - crawl_budget )); [ "$xss_budget" -lt 60 ] && xss_budget=60
+
+        timeout -k 15 "$crawl_budget" katana -u "$url" \
+            -d 2 -silent -nc 2>/dev/null \
+            | grep -E '\?[^=]*=' | sort -u | head -50 > "$targets" || true
+
+        if [ -s "$targets" ]; then
+            timeout -k 30 "$xss_budget" dalfox pipe \
+                --no-color --no-spinner --skip-bav \
+                --timeout 15 --worker 30 --delay 50 \
+                < "$targets" >"$logf" 2>&1 || true
+        else
+            # Crawl found no parameterized URLs; fall back to testing the URL
+            # itself (dalfox still mines params from the page DOM/forms).
+            timeout -k 30 "$xss_budget" dalfox url "$url" \
+                --no-color --no-spinner --skip-bav \
+                --timeout 15 --worker 30 --delay 50 \
+                >"$logf" 2>&1 || true
+        fi
+    fi
 
     if [ -s "$logf" ]; then
         grep -E '^[[:space:]]*\[POC\]\[[VR]\]' "$logf" 2>/dev/null \

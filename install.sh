@@ -618,6 +618,24 @@ install_security_scanner() {
     fi
   fi
 
+  # Install katana (crawler used by `xss` mode to auto-discover parameterized
+  # URLs when the user gives a bare domain -- no manual ?param= needed).
+  # ProjectDiscovery Go binary: statically linked, runs fine on glibc 2.35.
+  if command -v katana &>/dev/null; then
+    log "katana already installed: $(katana -version 2>&1 | tail -1)"
+  else
+    info "Installing katana (crawler for xss auto-discovery)..."
+    KATANA_VERSION="1.6.1"
+    KATANA_URL="https://github.com/projectdiscovery/katana/releases/download/v${KATANA_VERSION}/katana_${KATANA_VERSION}_linux_amd64.zip"
+    if curl -sL "$KATANA_URL" -o "${TEMP_DIR}/katana.zip" \
+       && unzip -o -q "${TEMP_DIR}/katana.zip" katana -d "${TEMP_DIR}" 2>/dev/null; then
+      mv -f "${TEMP_DIR}/katana" /usr/local/bin/katana && chmod +x /usr/local/bin/katana
+      log "katana installed"
+    else
+      warn "katana install failed (xss auto-crawl unavailable; xss still works with explicit ?param=)"
+    fi
+  fi
+
   # Install testssl.sh (TLS/SSL config audit for the `tls` scan mode).
   # Pure-bash tool; clone the repo and symlink the script.
   if command -v testssl.sh &>/dev/null; then
@@ -674,6 +692,7 @@ Requires=docker.service
 
 [Service]
 Type=simple
+Environment=HOME=/root
 ExecStart=${SCANNER_DIR}/scan-worker.sh
 Restart=always
 RestartSec=5
