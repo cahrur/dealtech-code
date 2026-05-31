@@ -1139,18 +1139,27 @@ async fn cmd_setauth(
     redis: &mut ConnectionManager,
 ) -> anyhow::Result<()> {
     let kind = parts.get(1).unwrap_or(&"").trim().to_lowercase();
-    // Everything after the type is the value (may contain spaces, e.g. headers).
-    let value = parts.get(2..).map(|p| p.join(" ")).unwrap_or_default();
-    let value = value.trim();
+    let is_refresh = kind == "refresh";
+    let refresh_url = if is_refresh {
+        parts.get(3).map(|s| s.trim().to_string()).unwrap_or_default()
+    } else { String::new() };
+    let value: String = if is_refresh {
+        parts.get(2).map(|s| s.trim().to_string()).unwrap_or_default()
+    } else {
+        parts.get(2..).map(|p| p.join(" ")).unwrap_or_default().trim().to_string()
+    };
 
-    if kind.is_empty() || value.is_empty() || !matches!(kind.as_str(), "cookie" | "bearer" | "header") {
+    let valid_kind = matches!(kind.as_str(), "cookie" | "bearer" | "header" | "refresh");
+    if !valid_kind || value.is_empty() {
         send_message(client, &config.telegram_bot_token, chat_id,
             "🔐 Set kredensial untuk authenticated scan (berlaku 2 jam)\n\n\
             Gunakan: /setauth <type> <value>\n\n\
             Type:\n\
             • cookie — /setauth cookie SESSIONID=abc123; role=admin\n\
             • bearer — /setauth bearer eyJhbGci...\n\
-            • header — /setauth header X-Api-Key: rahasia\n\n\
+            • header — /setauth header X-Api-Key: rahasia\n\
+            • refresh — /setauth refresh <refresh_token> [refresh_url]\n\
+               (tukar refresh→access token tiap scan; url default <target>/api/auth/refresh)\n\n\
             Setelah diset, /scan <url> <mode> otomatis pakai auth ini \
             (nuclei/dalfox/sqlmap). Hapus dengan /clearauth.\n\n\
             ⚠️ Nilai kredensial akan terlihat di history chat Telegram & \
@@ -1159,7 +1168,10 @@ async fn cmd_setauth(
         return Ok(());
     }
 
-    let payload = serde_json::json!({ "kind": kind, "value": value });
+    let mut payload = serde_json::json!({ "kind": kind, "value": value });
+    if is_refresh && !refresh_url.is_empty() {
+        payload["refresh_url"] = serde_json::json!(refresh_url);
+    }
     let key = format!("scan:auth:{}", chat_id);
     let _: () = redis::cmd("SET")
         .arg(&key)
@@ -1173,7 +1185,7 @@ async fn cmd_setauth(
         &format!("🔐 Auth tersimpan untuk scan kamu (berlaku 2 jam).\n\n\
         Type: {}\nValue: {}\n\n\
         Scan berikutnya otomatis pakai auth ini. /clearauth untuk hapus.",
-        kind, mask_secret(value))).await?;
+        kind, mask_secret(&value))).await?;
     Ok(())
 }
 

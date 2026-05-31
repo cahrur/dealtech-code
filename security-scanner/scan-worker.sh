@@ -42,6 +42,35 @@ template_args() {
 # Values may contain spaces/;/quotes, so we use bash ARRAYS to avoid word-
 # splitting / command injection. SECURITY: never log the value itself.
 NUCLEI_AUTH=(); KATANA_AUTH=(); DALFOX_AUTH=(); SQLMAP_AUTH=()
+# Exchange a refresh token for a fresh access token, following the project
+# auth-standards skill: POST <refresh_url> with the refresh token (sent both
+# as the httpOnly `refreshToken` cookie AND in the JSON body for resilience),
+# response JSON carries { accessToken }. On success we rewrite AUTH to bearer
+# so all tools use the fresh access token. Default url: <target>/api/auth/refresh.
+# SECURITY: tokens are never logged; JSON body built with jq (injection-safe).
+resolve_refresh_auth() {
+    [ "${AUTH_KIND:-}" = "refresh" ] || return
+    local refresh_url base resp access body
+    refresh_url="${AUTH_URL:-}"
+    if [ -z "$refresh_url" ]; then
+        base=$(printf '%s' "$URL" | sed -E 's#^(https?://[^/]+).*#\1#')
+        refresh_url="$base/api/auth/refresh"
+    fi
+    body=$(jq -nc --arg t "$AUTH_VALUE" '{refreshToken:$t}' 2>/dev/null)
+    resp=$(curl -s --max-time 20 -X POST "$refresh_url" \
+        -H "Content-Type: application/json" \
+        -H "Cookie: refreshToken=$AUTH_VALUE" \
+        --data "$body" 2>/dev/null)
+    access=$(printf '%s' "$resp" | jq -r '.accessToken // .access_token // .token // .data.accessToken // empty' 2>/dev/null)
+    if [ -n "$access" ]; then
+        AUTH_KIND="bearer"; AUTH_VALUE="$access"
+        log "Refresh exchange OK ($refresh_url)"
+    else
+        AUTH_KIND=""; AUTH_VALUE=""
+        log "Refresh exchange FAILED ($refresh_url) - scanning anonymous"
+    fi
+}
+
 build_auth_args() {
     NUCLEI_AUTH=(); KATANA_AUTH=(); DALFOX_AUTH=(); SQLMAP_AUTH=()
     [ -z "${AUTH_KIND:-}" ] && return
@@ -329,6 +358,8 @@ while true; do
     # Authenticated-scan creds (optional). Never logged.
     AUTH_KIND=$(echo "$JOB" | jq -r '.auth.kind // empty' 2>/dev/null)
     AUTH_VALUE=$(echo "$JOB" | jq -r '.auth.value // empty' 2>/dev/null)
+    AUTH_URL=$(echo "$JOB" | jq -r '.auth.refresh_url // empty' 2>/dev/null)
+    resolve_refresh_auth
     build_auth_args
 
     if [ -z "$URL" ] || [ -z "$CHAT_ID" ]; then
