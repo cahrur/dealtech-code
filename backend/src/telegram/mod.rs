@@ -1158,10 +1158,10 @@ async fn cmd_scan(
     }
 
     let mode = parts.get(2).unwrap_or(&"quick").trim();
-    let valid_modes = ["quick", "full", "recon", "cves", "misconfig", "exposure", "sqli"];
+    let valid_modes = ["quick", "full", "recon", "cves", "misconfig", "exposure", "sqli", "xss", "tls"];
     if !valid_modes.contains(&mode) {
         send_message(client, &config.telegram_bot_token, chat_id,
-            &format!("❌ Mode tidak valid: {}\nPilih: quick, full, recon, cves, misconfig, exposure, sqli", mode)).await?;
+            &format!("❌ Mode tidak valid: {}\nPilih: quick, full, recon, cves, misconfig, exposure, sqli, xss, tls", mode)).await?;
         return Ok(());
     }
 
