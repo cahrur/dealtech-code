@@ -142,6 +142,8 @@ JANGAN PERNAH:
 - Klaim sesuatu tentang kode tanpa membaca file yang exact terlebih dahulu
 - Bilang "file ini tidak punya X" tanpa verifikasi baris per baris
 - Asumsi vulnerability berdasarkan nama file atau pola umum tanpa baca isi
+- Spawn/delegasikan ke sub-agent, atau "yield"/menunggu "completion event". Run ini SINGLE-SHOT (satu giliran). Tidak ada giliran berikutnya untuk menunggu hasil sub-agent. Kerjakan SEMUA sendiri sampai tuntas di giliran ini.
+- Menjanjikan hasil nanti ("saya akan kabari", "menunggu hasil", "I'll wait"). Selesaikan sekarang juga, lalu bungkus jawaban final di <reply>.
 
 SELALU:
 - Gunakan parameterized query (bukan string concatenation)
@@ -597,6 +599,22 @@ pub fn sanitize_user_facing_response(raw: &str) -> String {
     // 4. Strip injection-echo prefix
     let cleaned = strip_injection_echo(&cleaned);
 
+    // 4b. Catch SHORT internal/yield narration that the length-gated filter
+    // below would miss. When the agent spawns sub-agents and "yields"
+    // ("I'll wait for completion events"), that intermediate text is not a
+    // final answer and must never reach the user. If a short reply (<=4
+    // non-empty lines) is entirely meta/thinking narration, blank it so the
+    // caller falls back to a proper response.
+    {
+        let nelines: Vec<&str> = cleaned.lines().filter(|l| !l.trim().is_empty()).collect();
+        if !nelines.is_empty() && nelines.len() <= 4 {
+            let thinking = nelines.iter().filter(|l| is_thinking_line(l)).count();
+            if thinking == nelines.len() {
+                return String::new();
+            }
+        }
+    }
+
     // 5. Score thinking-ness: if response is long and mostly thinking, truncate aggressively
     if cleaned.len() > 1500 {
         let lines: Vec<&str> = cleaned.lines().collect();
@@ -690,6 +708,10 @@ fn is_thinking_line(line: &str) -> bool {
         "Let me check", "Actually, wait", "Actually, let me",
         "Hmm, but wait", "I'm now going to",
         "After this exhaustive", "I believe the logic",
+        "Both sub-agents", "The sub-agents", "sub-agents are",
+        "I'll wait", "I will wait", "I'll wait for",
+        "I've gathered", "I've spawned", "I have spawned",
+        "waiting for", "rather than poll", "completion event",
         "✓", "✗", "→",
     ];
 
