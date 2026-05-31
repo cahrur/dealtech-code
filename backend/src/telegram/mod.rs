@@ -1594,6 +1594,8 @@ async fn cmd_help(
         /diff — Lihat file yang diubah di run terakhir\n\
         /pr — Lihat PR terbaru project ini\n\
         /scan <url> [mode] — Security scan website\n\
+        /setauth <type> <value> — Set login utk authenticated scan\n\
+        /clearauth — Hapus kredensial scan\n\
         /scanstatus — Cek status scan yang berjalan\n\
         /cancelscan — Batalkan scan yang berjalan\n\
         /newsession — Mulai session baru (branch baru)\n\
