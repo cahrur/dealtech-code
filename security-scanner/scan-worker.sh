@@ -36,6 +36,38 @@ template_args() {
     esac
 }
 
+# --- Authenticated-scan support ----------------------------------------
+# /setauth stores cookie/bearer/header creds; the backend forwards them in the
+# job as .auth.{kind,value}. We translate that into the right flags per tool.
+# Values may contain spaces/;/quotes, so we use bash ARRAYS to avoid word-
+# splitting / command injection. SECURITY: never log the value itself.
+NUCLEI_AUTH=(); KATANA_AUTH=(); DALFOX_AUTH=(); SQLMAP_AUTH=()
+build_auth_args() {
+    NUCLEI_AUTH=(); KATANA_AUTH=(); DALFOX_AUTH=(); SQLMAP_AUTH=()
+    [ -z "${AUTH_KIND:-}" ] && return
+    case "$AUTH_KIND" in
+        cookie)
+            NUCLEI_AUTH=(-H "Cookie: $AUTH_VALUE")
+            KATANA_AUTH=(-H "Cookie: $AUTH_VALUE")
+            DALFOX_AUTH=(--cookie "$AUTH_VALUE")
+            SQLMAP_AUTH=(--cookie="$AUTH_VALUE")
+            ;;
+        bearer)
+            NUCLEI_AUTH=(-H "Authorization: Bearer $AUTH_VALUE")
+            KATANA_AUTH=(-H "Authorization: Bearer $AUTH_VALUE")
+            DALFOX_AUTH=(--header "Authorization: Bearer $AUTH_VALUE")
+            SQLMAP_AUTH=(--headers="Authorization: Bearer $AUTH_VALUE")
+            ;;
+        header)
+            # value is already in "Name: Value" form
+            NUCLEI_AUTH=(-H "$AUTH_VALUE")
+            KATANA_AUTH=(-H "$AUTH_VALUE")
+            DALFOX_AUTH=(--header "$AUTH_VALUE")
+            SQLMAP_AUTH=(--headers="$AUTH_VALUE")
+            ;;
+    esac
+}
+
 # Active SQL-injection scan via sqlmap. Crawls + tests forms and URL params,
 # then emits findings in the same JSON shape nuclei produces so the backend
 # formatter handles both uniformly. sqlmap is light on RAM (~150-200MB).
@@ -58,6 +90,7 @@ run_sqli_scan() {
 
     timeout -k 30 "$budget" sqlmap -u "$url" \
         --batch $extra_args \
+        "${SQLMAP_AUTH[@]}" \
         --random-agent --timeout=10 --retries=1 --threads=5 \
         --flush-session \
         --output-dir="$outdir" >"$logf" 2>&1 || true
@@ -139,6 +172,7 @@ run_xss_scan() {
     if printf '%s' "$url" | grep -q '?[^=]*='; then
         # URL already has a parameter: test it directly (~30-90s).
         timeout -k 30 "$budget" dalfox url "$url" \
+            "${DALFOX_AUTH[@]}" \
             --no-color --no-spinner --skip-bav \
             --timeout 15 --worker 30 --delay 50 \
             >"$logf" 2>&1 || true
@@ -149,11 +183,13 @@ run_xss_scan() {
         xss_budget=$(( budget - crawl_budget )); [ "$xss_budget" -lt 60 ] && xss_budget=60
 
         timeout -k 15 "$crawl_budget" katana -u "$url" \
+            "${KATANA_AUTH[@]}" \
             -d 2 -silent -nc 2>/dev/null \
             | grep -E '\?[^=]*=' | sort -u | head -50 > "$targets" || true
 
         if [ -s "$targets" ]; then
             timeout -k 30 "$xss_budget" dalfox pipe \
+                "${DALFOX_AUTH[@]}" \
                 --no-color --no-spinner --skip-bav \
                 --timeout 15 --worker 30 --delay 50 \
                 < "$targets" >"$logf" 2>&1 || true
@@ -161,6 +197,7 @@ run_xss_scan() {
             # Crawl found no parameterized URLs; fall back to testing the URL
             # itself (dalfox still mines params from the page DOM/forms).
             timeout -k 30 "$xss_budget" dalfox url "$url" \
+                "${DALFOX_AUTH[@]}" \
                 --no-color --no-spinner --skip-bav \
                 --timeout 15 --worker 30 --delay 50 \
                 >"$logf" 2>&1 || true
@@ -289,6 +326,10 @@ while true; do
     URL=$(echo "$JOB" | jq -r '.url // empty' 2>/dev/null)
     MODE=$(echo "$JOB" | jq -r '.mode // "quick"' 2>/dev/null)
     CHAT_ID=$(echo "$JOB" | jq -r '.chat_id // empty' 2>/dev/null)
+    # Authenticated-scan creds (optional). Never logged.
+    AUTH_KIND=$(echo "$JOB" | jq -r '.auth.kind // empty' 2>/dev/null)
+    AUTH_VALUE=$(echo "$JOB" | jq -r '.auth.value // empty' 2>/dev/null)
+    build_auth_args
 
     if [ -z "$URL" ] || [ -z "$CHAT_ID" ]; then
         log "Invalid job skipped: $JOB"
@@ -298,7 +339,7 @@ while true; do
     # Mark globally running (used by backend to show queue status)
     $REDIS_CLI SET "$RUNNING_KEY" "$CHAT_ID" EX 3600 >/dev/null 2>&1
 
-    log "Scan start: url=$URL mode=$MODE chat_id=$CHAT_ID"
+    log "Scan start: url=$URL mode=$MODE chat_id=$CHAT_ID auth=$([ -n "${AUTH_KIND:-}" ] && echo "$AUTH_KIND" || echo none)"
 
     SEVERITY="low,medium,high,critical"
     case "$MODE" in
@@ -326,6 +367,7 @@ while true; do
         # Signature-based scanning via nuclei. Hard wall-clock budget so a
         # throttling/slow target cannot hang the single-scan queue.
         RESULT=$(timeout -k 30 "$SCAN_BUDGET" nuclei -u "$URL" $TARGS \
+            "${NUCLEI_AUTH[@]}" \
             -severity "$SEVERITY" \
             -silent -no-color -jsonl -omit-raw \
             -c 25 -rl 150 -timeout 10 -retries 1 \

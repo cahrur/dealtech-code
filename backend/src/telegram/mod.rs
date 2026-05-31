@@ -277,6 +277,8 @@ async fn handle_command(
         "/cost" => cmd_cost(client, config, db, tg_user, chat_id, &parts).await?,
         "/status" => cmd_status(client, config, db, tg_user, chat_id).await?,
         "/scan" => cmd_scan(client, config, db, tg_user, chat_id, &parts, redis.clone()).await?,
+        "/setauth" => cmd_setauth(client, config, chat_id, &parts, &mut redis).await?,
+        "/clearauth" => cmd_clearauth(client, config, chat_id, &mut redis).await?,
         "/scanstatus" => cmd_scanstatus(client, config, chat_id, &mut redis).await?,
         "/cancelscan" => cmd_cancelscan(client, config, chat_id, &mut redis).await?,
         "/help" => cmd_help(client, config, db, &tg_user, chat_id).await?,
@@ -1118,6 +1120,77 @@ async fn cmd_cost(
     Ok(())
 }
 
+// Mask a secret for display so the bot never echoes the real value back:
+// keep only the last 4 chars, e.g. "...a1b2". Empty/short -> fully masked.
+fn mask_secret(s: &str) -> String {
+    let n = s.chars().count();
+    if n <= 4 { "****".to_string() } else { format!("...{}", &s[s.len().saturating_sub(4)..]) }
+}
+
+// /setauth <type> <value...> — store scan auth for THIS chat in Redis (TTL 2h).
+// type: cookie | bearer | header   (header value form: "Name: Value")
+// SECURITY: the raw value is never echoed back (only masked) and is never
+// written to logs. Stored short-lived in Redis, auto-expires after 2h.
+async fn cmd_setauth(
+    client: &Client,
+    config: &Config,
+    chat_id: i64,
+    parts: &[&str],
+    redis: &mut ConnectionManager,
+) -> anyhow::Result<()> {
+    let kind = parts.get(1).unwrap_or(&"").trim().to_lowercase();
+    // Everything after the type is the value (may contain spaces, e.g. headers).
+    let value = parts.get(2..).map(|p| p.join(" ")).unwrap_or_default();
+    let value = value.trim();
+
+    if kind.is_empty() || value.is_empty() || !matches!(kind.as_str(), "cookie" | "bearer" | "header") {
+        send_message(client, &config.telegram_bot_token, chat_id,
+            "🔐 Set kredensial untuk authenticated scan (berlaku 2 jam)\n\n\
+            Gunakan: /setauth <type> <value>\n\n\
+            Type:\n\
+            • cookie — /setauth cookie SESSIONID=abc123; role=admin\n\
+            • bearer — /setauth bearer eyJhbGci...\n\
+            • header — /setauth header X-Api-Key: rahasia\n\n\
+            Setelah diset, /scan <url> <mode> otomatis pakai auth ini \
+            (nuclei/dalfox/sqlmap). Hapus dengan /clearauth.\n\n\
+            ⚠️ Nilai kredensial akan terlihat di history chat Telegram & \
+            tersimpan sementara di server. Jangan pakai kredensial produksi \
+            yang sensitif kalau tidak perlu.").await?;
+        return Ok(());
+    }
+
+    let payload = serde_json::json!({ "kind": kind, "value": value });
+    let key = format!("scan:auth:{}", chat_id);
+    let _: () = redis::cmd("SET")
+        .arg(&key)
+        .arg(payload.to_string())
+        .arg("EX").arg(7200) // 2 hours
+        .query_async(redis)
+        .await
+        .unwrap_or(());
+
+    send_message(client, &config.telegram_bot_token, chat_id,
+        &format!("🔐 Auth tersimpan untuk scan kamu (berlaku 2 jam).\n\n\
+        Type: {}\nValue: {}\n\n\
+        Scan berikutnya otomatis pakai auth ini. /clearauth untuk hapus.",
+        kind, mask_secret(value))).await?;
+    Ok(())
+}
+
+// /clearauth — remove stored scan auth for this chat.
+async fn cmd_clearauth(
+    client: &Client,
+    config: &Config,
+    chat_id: i64,
+    redis: &mut ConnectionManager,
+) -> anyhow::Result<()> {
+    let key = format!("scan:auth:{}", chat_id);
+    let _: () = redis::cmd("DEL").arg(&key).query_async(redis).await.unwrap_or(());
+    send_message(client, &config.telegram_bot_token, chat_id,
+        "🔓 Auth scan dihapus. Scan berikutnya jalan sebagai anonim.").await?;
+    Ok(())
+}
+
 async fn cmd_scan(
     client: &Client,
     config: &Config,
@@ -1192,17 +1265,28 @@ async fn cmd_scan(
         .await
         .unwrap_or(0);
 
+    // Load stored auth for this chat (if any) so the scan runs authenticated.
+    let auth_key = format!("scan:auth:{}", chat_id);
+    let auth_raw: Option<String> = redis::cmd("GET")
+        .arg(&auth_key)
+        .query_async(&mut redis)
+        .await
+        .unwrap_or(None);
+    let auth_val: Option<serde_json::Value> =
+        auth_raw.as_deref().and_then(|s| serde_json::from_str(s).ok());
+    let auth_note = if auth_val.is_some() { "\n🔐 Mode: authenticated" } else { "" };
+
     if running_for.is_some() {
         // Position = scans already queued ahead + the one currently running
         let position = queue_len + 1;
         send_message(client, &config.telegram_bot_token, chat_id,
             &format!("⏳ Ada scan lain yang sedang berjalan.\n\n\
-            🎯 Target kamu: {}\n📋 Mode: {}\n🔢 Posisi antrian: #{}\n\n\
+            🎯 Target kamu: {}\n📋 Mode: {}{}\n🔢 Posisi antrian: #{}\n\n\
             Scan kamu akan diproses otomatis setelah antrian selesai. \
-            Aku kabari kalau sudah jalan dan setelah selesai.", url, mode, position)).await?;
+            Aku kabari kalau sudah jalan dan setelah selesai.", url, mode, auth_note, position)).await?;
     } else {
         send_message(client, &config.telegram_bot_token, chat_id,
-            &format!("🔒 Memulai security scan...\n\n🎯 Target: {}\n📋 Mode: {}\n\n⏳ Ini bisa memakan waktu beberapa menit.", url, mode)).await?;
+            &format!("🔒 Memulai security scan...\n\n🎯 Target: {}\n📋 Mode: {}{}\n\n⏳ Ini bisa memakan waktu beberapa menit.", url, mode, auth_note)).await?;
     }
 
     // Store scan state in Redis
@@ -1223,12 +1307,15 @@ async fn cmd_scan(
         .await
         .unwrap_or(());
 
-    // Push scan job to queue (worker on host picks it up)
-    let job = serde_json::json!({
+    // Push scan job to queue (worker on host picks it up). Include auth when set.
+    let mut job = serde_json::json!({
         "url": url,
         "mode": mode,
         "chat_id": chat_id
     });
+    if let Some(a) = auth_val {
+        job["auth"] = a;
+    }
     let _: () = redis::cmd("LPUSH")
         .arg("scan:queue")
         .arg(job.to_string())
