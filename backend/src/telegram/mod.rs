@@ -1143,11 +1143,13 @@ async fn cmd_scan(
             • exposure — Exposed files/panels\n\
             • sqli — Active SQL injection test (sqlmap)\n\
             • xss — Active XSS test (dalfox)\n\
-            • tls — TLS/SSL config audit (testssl.sh)\n\n\
+            • tls — TLS/SSL config audit (testssl.sh)\n\
+            • deps — Dependency CVE + secret + IaC scan repo git (trivy)\n\n\
             Contoh:\n\
             /scan https://myapp.com\n\
             /scan https://myapp.com full\n\
-            /scan https://myapp.com/page?id=1 sqli").await?;
+            /scan https://myapp.com/page?id=1 sqli\n\
+            /scan https://github.com/user/repo deps").await?;
         return Ok(());
     }
 
@@ -1158,10 +1160,10 @@ async fn cmd_scan(
     }
 
     let mode = parts.get(2).unwrap_or(&"quick").trim();
-    let valid_modes = ["quick", "full", "recon", "cves", "misconfig", "exposure", "sqli", "xss", "tls"];
+    let valid_modes = ["quick", "full", "recon", "cves", "misconfig", "exposure", "sqli", "xss", "tls", "deps"];
     if !valid_modes.contains(&mode) {
         send_message(client, &config.telegram_bot_token, chat_id,
-            &format!("❌ Mode tidak valid: {}\nPilih: quick, full, recon, cves, misconfig, exposure, sqli, xss, tls", mode)).await?;
+            &format!("❌ Mode tidak valid: {}\nPilih: quick, full, recon, cves, misconfig, exposure, sqli, xss, tls, deps", mode)).await?;
         return Ok(());
     }
 
@@ -1384,7 +1386,11 @@ fn format_scan_report(data: &str) -> String {
     let has_sqli = tid("sqlmap-sqli");
     let has_xss = tid("dalfox-xss");
     let has_tls = tid("testssl-");
-    if has_sqli {
+    let has_deps = tid("trivy-");
+    if has_deps {
+        report.push_str("⚠️ Temuan dependency/secret/IaC dari repo — update library ke versi fixed, rotasi & cabut secret yang bocor, perbaiki misconfig.\n");
+        report.push_str("💡 Cek lainnya: /scan <url> full  |  /scan <url> xss  |  /scan <url> tls");
+    } else if has_sqli {
         report.push_str("⚠️ SQL injection terdeteksi — perbaiki dengan parameterized query / prepared statement.\n");
         report.push_str("💡 Cek lainnya: /scan <url> full  |  /scan <url> xss  |  /scan <url> tls");
     } else if has_xss {

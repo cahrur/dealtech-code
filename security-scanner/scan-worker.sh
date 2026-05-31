@@ -214,6 +214,68 @@ run_tls_scan() {
     rm -rf "$outdir"
 }
 
+# --- Dependency / secret / IaC scan via trivy --------------------------
+# Takes a GIT REPOSITORY URL (not an app URL). Finds: known-CVE dependencies
+# (Cargo.lock, package.json, go.mod, requirements.txt, ...), secrets committed
+# to the repo, and IaC misconfig (Dockerfile, compose, k8s). Covers OWASP A06
+# (vulnerable components) + A08 (supply chain) + leaked credentials.
+# NOTE: https git URL. Private repos need GITHUB_TOKEN exported in worker env.
+# SECURITY: we deliberately DO NOT emit the matched secret value, only the
+# rule id + file:line, so the report itself never leaks the credential.
+run_deps_scan() {
+    local url="$1"
+    local budget="$2"
+    local outdir jf
+    outdir=$(mktemp -d /tmp/trivy-XXXXXX)
+    jf="$outdir/out.json"
+
+    # Cache/DB live under $HOME/.cache/trivy (HOME exported at top of script).
+    timeout -k 30 "$budget" trivy repo "$url" \
+        --scanners vuln,secret,misconfig \
+        --severity LOW,MEDIUM,HIGH,CRITICAL \
+        --format json --quiet --no-progress \
+        --timeout "${budget}s" \
+        -o "$jf" >/dev/null 2>&1 || true
+
+    if [ -s "$jf" ]; then
+        jq -c '
+            def sev: (. // "UNKNOWN") | ascii_downcase
+                     | if . == "unknown" then "info" else . end;
+            (.Results // [])[] as $r
+            | (
+                ($r.Vulnerabilities // [])[]
+                | {info:{
+                      name:("CVE " + (.VulnerabilityID // "?") + " - " + (.PkgName // "pkg")),
+                      severity:(.Severity | sev),
+                      description:(((.Title // "Known vulnerability")
+                                    + " | installed " + (.InstalledVersion // "?")
+                                    + " | fixed " + (.FixedVersion // "none"))[0:200])},
+                   "matched-at":(($r.Target // "?") + " -> " + (.PkgName // "")),
+                   "template-id":("trivy-vuln-" + (.VulnerabilityID // "x"))}
+              ),
+              (
+                ($r.Secrets // [])[]
+                | {info:{
+                      name:("Secret leak - " + (.Title // .RuleID // "secret")),
+                      severity:(.Severity | sev),
+                      description:("Rule: " + (.RuleID // "?") + " | Category: " + (.Category // "?"))},
+                   "matched-at":(($r.Target // "?") + ":" + ((.StartLine // 0)|tostring)),
+                   "template-id":("trivy-secret-" + (.RuleID // "x"))}
+              ),
+              (
+                ($r.Misconfigurations // [])[]
+                | {info:{
+                      name:("Misconfig - " + (.Title // .ID // "issue")),
+                      severity:(.Severity | sev),
+                      description:(((.Description // .Message // "")|tostring)[0:200])},
+                   "matched-at":($r.Target // "?"),
+                   "template-id":("trivy-misconfig-" + (.ID // "x"))}
+              )
+        ' "$jf" 2>/dev/null
+    fi
+    rm -rf "$outdir"
+}
+
 log "Scan worker started"
 
 while true; do
@@ -257,6 +319,9 @@ while true; do
     elif [ "$MODE" = "tls" ]; then
         # TLS/SSL configuration audit via testssl.sh (separate code path)
         RESULT=$(run_tls_scan "$URL" "$SCAN_BUDGET")
+    elif [ "$MODE" = "deps" ]; then
+        # Dependency/secret/IaC scan of a GIT REPO url via trivy (separate path)
+        RESULT=$(run_deps_scan "$URL" "$SCAN_BUDGET")
     else
         # Signature-based scanning via nuclei. Hard wall-clock budget so a
         # throttling/slow target cannot hang the single-scan queue.

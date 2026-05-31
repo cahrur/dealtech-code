@@ -636,6 +636,26 @@ install_security_scanner() {
     fi
   fi
 
+  # Install trivy (dependency CVE + secret + IaC scan for the `deps` mode).
+  # Static Go binary; runs fine on glibc 2.35. Used as `trivy repo <git-url>`.
+  if command -v trivy &>/dev/null; then
+    log "trivy already installed: $(trivy --version 2>&1 | head -1)"
+  else
+    info "Installing trivy (dependency/secret/IaC scanner)..."
+    TRIVY_VERSION="0.70.0"
+    TRIVY_URL="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+    if curl -sL "$TRIVY_URL" -o "${TEMP_DIR}/trivy.tar.gz" \
+       && tar xzf "${TEMP_DIR}/trivy.tar.gz" -C "${TEMP_DIR}" trivy 2>/dev/null; then
+      mv -f "${TEMP_DIR}/trivy" /usr/local/bin/trivy && chmod +x /usr/local/bin/trivy
+      log "trivy installed"
+      # Pre-download the vuln DB so the first scan is not slow (best-effort).
+      HOME=/root trivy image --download-db-only >/dev/null 2>&1 || \
+        warn "trivy DB pre-download failed (first deps scan will fetch it)"
+    else
+      warn "trivy install failed (deps mode will be unavailable)"
+    fi
+  fi
+
   # Install testssl.sh (TLS/SSL config audit for the `tls` scan mode).
   # Pure-bash tool; clone the repo and symlink the script.
   if command -v testssl.sh &>/dev/null; then
