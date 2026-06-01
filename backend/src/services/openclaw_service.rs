@@ -215,7 +215,17 @@ pub async fn run_agent_full(config: &Config, input: &OpenClawRunInput) -> Result
         return Ok(resp);
     }
     tracing::warn!(cleaned_preview = %&cleaned[..cleaned.len().min(300)], "OpenClaw response not valid JSON, falling back to plain reply");
-    let reply = sanitize_user_facing_response(&raw);
+    let mut reply = sanitize_user_facing_response(&raw);
+    if reply.trim().is_empty() {
+        // Sanitizer blanked leaked thinking/investigation narration (no <reply>
+        // tag, mixed-language meta text). Don't ship raw thinking to the user —
+        // ask the model to turn the draft into a proper user-facing answer,
+        // mirroring the recovery path used by run_stream().
+        tracing::info!("telegram path: sanitized reply empty, attempting rewrite_user_facing");
+        if let Ok(rewritten) = rewrite_user_facing(config, input, &raw).await {
+            reply = sanitize_user_facing_response(&rewritten);
+        }
+    }
     let reply = if reply.trim().is_empty() {
         "Selesai diproses.".to_string()
     } else {
@@ -712,6 +722,8 @@ fn is_thinking_line(line: &str) -> bool {
         "I'll wait", "I will wait", "I'll wait for",
         "I've gathered", "I've spawned", "I have spawned",
         "waiting for", "rather than poll", "completion event",
+        // Indonesian mid-investigation starters (leaked thinking, not a final answer)
+        "Pertanyaannya", "Aku perlu", "Saya perlu", "Aku harus", "Saya harus",
         "✓", "✗", "→",
     ];
 
@@ -728,6 +740,23 @@ fn is_thinking_line(line: &str) -> bool {
     }
 
     let lowered = t.to_lowercase();
+
+    // High-confidence investigation/continuation phrases (any language),
+    // matched as substrings regardless of line length. These almost never
+    // appear in a polished final answer — they signal the agent is still
+    // mid-investigation, i.e. leaked thinking. Language-agnostic so it also
+    // catches Indonesian/English mixed narration the starter list misses.
+    let investigation_markers = [
+        "let me verify", "let me check", "let me read", "let me re-read",
+        "let me look at", "let me inspect", "i need to read",
+        "i need to check", "i need to verify", "i'll verify", "i'll check",
+        "perlu baca", "perlu verifikasi", "perlu cek dulu",
+        "aku perlu", "saya perlu",
+    ];
+    if investigation_markers.iter().any(|m| lowered.contains(m)) {
+        return true;
+    }
+
     if analysis_patterns.iter().any(|p| lowered.contains(p)) && t.len() > 60 {
         return true;
     }
@@ -1435,7 +1464,7 @@ fn extract_path_from_comment(line: &str, lang: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{fallback_plan_file_actions, is_push_request, is_write_request};
+    use super::{fallback_plan_file_actions, is_push_request, is_write_request, sanitize_user_facing_response};
 
     #[test]
     fn parses_readme_request_with_quotes() {
@@ -1475,5 +1504,29 @@ mod tests {
         let plan = fallback_plan_file_actions(prompt).expect("plan should exist");
         assert_eq!(plan.actions[0].path, "README.md");
         assert_eq!(plan.actions[0].content, "lorem ipsum");
+    }
+
+    #[test]
+    fn blanks_mixed_language_investigation_leak() {
+        // Exact shape of the leak reported by the user (#842): mid-investigation
+        // thinking, mixed Indonesian/English, no <reply> tag. Must NOT reach user.
+        let leaked = "Pertanyaannya berbeda dari yang kemarin: ini soal page Database Unit (bukan hasil import sales). Aku perlu baca UnitController::index untuk lihat query & filter apa yang membatasi tampilan.\n\nThe web page path is different from the JSON path — it uses ->get() (no pagination), but it DOES apply role-based project scoping. Let me verify the Unit model (soft deletes / global scopes) and how import maps rows→units (dedup vs 1:1).";
+        assert_eq!(sanitize_user_facing_response(leaked), "");
+    }
+
+    #[test]
+    fn keeps_legit_short_indonesian_reply() {
+        // A real finished answer must survive (no false positive).
+        let reply = "Sudah saya fix bug di UnitController. Masalahnya query pakai ->get() tanpa filter project, sekarang sudah ditambah scoping per role.";
+        assert_eq!(sanitize_user_facing_response(reply), reply);
+    }
+
+    #[test]
+    fn extracts_reply_tag_over_surrounding_thinking() {
+        let raw = "Let me check the model first. I need to read the controller.\n<reply>\nSelesai. Bug-nya di filter query, sudah diperbaiki.\n</reply>";
+        assert_eq!(
+            sanitize_user_facing_response(raw),
+            "Selesai. Bug-nya di filter query, sudah diperbaiki."
+        );
     }
 }
