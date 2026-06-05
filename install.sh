@@ -794,6 +794,93 @@ configure_openclaw() {
   pgrep -f openclaw > /dev/null && { pkill -f openclaw 2>/dev/null; sleep 2; nohup openclaw start > /srv/ai-platform/logs/openclaw.log 2>&1 & log "OpenClaw restarted"; }
 }
 
+# ─── Session auto-cleanup cron ───────────────────────────────────────────────
+setup_session_cleanup_cron() {
+  section "Setting up OpenClaw session auto-cleanup"
+  # Wait for OpenClaw to be ready
+  local retries=0
+  while ! pgrep -f openclaw > /dev/null && [[ $retries -lt 10 ]]; do
+    sleep 2
+    ((retries++))
+  done
+  if ! pgrep -f openclaw > /dev/null; then
+    warn "OpenClaw not running — skipping session cleanup cron setup"
+    return
+  fi
+
+  # Write the cleanup script that will be called by cron
+  cat > /usr/local/bin/openclaw-session-cleanup.sh <<'CLEANUP'
+#!/bin/bash
+# OpenClaw Session Auto-Cleanup
+# Deletes sessions inactive for more than 2 days
+# Keeps: active telegram session + main session
+set -euo pipefail
+
+SESSIONS_DIR="$HOME/.openclaw/agents/main/sessions"
+SESSIONS_FILE="$SESSIONS_DIR/sessions.json"
+
+if [[ ! -f "$SESSIONS_FILE" ]]; then
+  echo "No sessions.json found — nothing to clean"
+  exit 0
+fi
+
+# Backup
+BACKUP_FILE="${SESSIONS_FILE}.bak.$(date +%Y%m%d%H%M%S)"
+cp "$SESSIONS_FILE" "$BACKUP_FILE"
+
+python3 -c "
+import json, time
+
+with open('$SESSIONS_FILE') as f:
+    data = json.load(f)
+
+now = time.time() * 1000
+cutoff = now - (2 * 24 * 3600 * 1000)  # 2 days in ms
+
+to_delete = []
+for key, s in data.items():
+    updated = s.get('updatedAt', 0)
+    if updated < cutoff:
+        to_delete.append(key)
+
+for key in to_delete:
+    del data[key]
+
+with open('$SESSIONS_FILE', 'w') as f:
+    json.dump(data, f, indent=2)
+
+print(f'Deleted {len(to_delete)} inactive sessions (>2 days), {len(data)} remaining')
+"
+
+# Keep only last 3 backups
+ls -t "$SESSIONS_DIR"/sessions.json.bak.* 2>/dev/null | tail -n +4 | xargs rm -f 2>/dev/null || true
+echo "Session cleanup complete — $(date)"
+CLEANUP
+  chmod +x /usr/local/bin/openclaw-session-cleanup.sh
+
+  # Register cron job via OpenClaw CLI
+  # Schedule: daily at 3:00 AM Asia/Shanghai
+  openclaw cron add \
+    --name "session-cleanup-2day" \
+    --schedule-kind cron \
+    --schedule-expr "0 3 * * *" \
+    --schedule-tz "Asia/Shanghai" \
+    --session-target isolated \
+    --payload-kind agentTurn \
+    --payload-message "Run the session cleanup script: bash /usr/local/bin/openclaw-session-cleanup.sh — then report how many sessions were deleted." \
+    --payload-timeout 120 \
+    --delivery-mode none \
+    --description "Auto-delete OpenClaw sessions inactive >2 days. Daily 3AM." \
+    2>/dev/null && log "Session cleanup cron registered (daily 3:00 AM)" \
+    || warn "OpenClaw cron add failed — script installed at /usr/local/bin/openclaw-session-cleanup.sh (run manually or add cron later)"
+
+  # Also add a system crontab as fallback
+  if ! crontab -l 2>/dev/null | grep -q "openclaw-session-cleanup"; then
+    (crontab -l 2>/dev/null; echo "0 19 * * * /usr/local/bin/openclaw-session-cleanup.sh >> /var/log/openclaw-cleanup.log 2>&1") | crontab -
+    log "System crontab fallback added (daily 19:00 UTC = 03:00 Asia/Shanghai)"
+  fi
+}
+
 # ─── Install Hermes Agent ─────────────────────────────────────────────────────
 install_hermes() {
   section "Installing Hermes Agent"
@@ -1047,6 +1134,7 @@ main() {
   write_caddyfile
   write_9router_config
   configure_openclaw
+  setup_session_cleanup_cron
   setup_firewall
   write_backend_placeholder
   write_systemd
