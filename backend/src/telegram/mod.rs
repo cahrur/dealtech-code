@@ -833,16 +833,25 @@ async fn cmd_newsession(
         }
     };
 
-    // Set force_new_branch flag in Redis — consumed once by next run
-    let force_key = format!("tg:force_new_branch:{}:{}", tg_user.user_id, project_id);
+    // Force a fresh session+branch once on the next user message.
+    // Default behaviour should be session reuse; /newsession is the explicit reset.
+    let force_branch_key = format!("tg:force_new_branch:{}:{}", tg_user.user_id, project_id);
     let _: std::result::Result<(), _> = redis::cmd("SETEX")
-        .arg(&force_key)
+        .arg(&force_branch_key)
         .arg(86400u64)
         .arg("1")
         .query_async(redis)
         .await;
 
-    // Also clear any pinned session so get_or_create_session makes a fresh one
+    let force_session_key = format!("tg:force_new_session:{}:{}", tg_user.user_id, project_id);
+    let _: std::result::Result<(), _> = redis::cmd("SETEX")
+        .arg(&force_session_key)
+        .arg(86400u64)
+        .arg("1")
+        .query_async(redis)
+        .await;
+
+    // Clear the cached pin too so the next lookup cannot accidentally reuse stale state.
     let pin_key = format!("tg:pinned_session:{}:{}", tg_user.user_id, project_id);
     let _: std::result::Result<(), _> = redis::cmd("DEL")
         .arg(&pin_key)
@@ -2004,50 +2013,65 @@ async fn get_or_create_session(
     project_id: Uuid,
 ) -> anyhow::Result<Uuid> {
     let pin_key = format!("tg:pinned_session:{}:{}", tg_user.user_id, project_id);
+    let force_session_key = format!("tg:force_new_session:{}:{}", tg_user.user_id, project_id);
 
-    // Check Redis for pinned session — cleared by /newsession to force a fresh one
-    let pinned: Option<String> = redis::cmd("GET")
-        .arg(&pin_key)
+    // /newsession should be the only thing that rotates the coding session.
+    // Consume this one-shot flag first before checking any cached/default session.
+    let force_new_session: bool = redis::cmd("GETDEL")
+        .arg(&force_session_key)
         .query_async(redis)
         .await
-        .unwrap_or(None);
+        .unwrap_or(None::<String>)
+        .is_some();
 
-    if let Some(sid_str) = pinned {
-        if let Ok(sid) = sid_str.parse::<Uuid>() {
-            let exists = sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS(SELECT 1 FROM coding_sessions WHERE id = $1)"
-            )
-            .bind(sid)
-            .fetch_one(db)
+    if !force_new_session {
+        // Fast path: cached pinned session for this user+project.
+        let pinned: Option<String> = redis::cmd("GET")
+            .arg(&pin_key)
+            .query_async(redis)
             .await
-            .unwrap_or(false);
-            if exists {
-                return Ok(sid);
+            .unwrap_or(None);
+
+        if let Some(sid_str) = pinned {
+            if let Ok(sid) = sid_str.parse::<Uuid>() {
+                let exists = sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM coding_sessions WHERE id = $1 AND project_id = $2 AND user_id = $3)"
+                )
+                .bind(sid)
+                .bind(project_id)
+                .bind(tg_user.user_id)
+                .fetch_one(db)
+                .await
+                .unwrap_or(false);
+                if exists {
+                    return Ok(sid);
+                }
             }
+        }
+
+        // Fallback: reuse the latest existing session for this user+project,
+        // regardless of day. Daily rollover was causing unnecessary cold starts.
+        let existing_session = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM coding_sessions \
+             WHERE project_id = $1 AND user_id = $2 \
+             ORDER BY created_at DESC LIMIT 1"
+        )
+        .bind(project_id)
+        .bind(tg_user.user_id)
+        .fetch_optional(db)
+        .await?;
+
+        if let Some(sid) = existing_session {
+            let _: std::result::Result<(), _> = redis::cmd("SET")
+                .arg(&pin_key)
+                .arg(sid.to_string())
+                .query_async(redis)
+                .await;
+            return Ok(sid);
         }
     }
 
-    // Check for existing session today for this user + project
-    let today_session = sqlx::query_scalar::<_, Uuid>(
-        "SELECT id FROM coding_sessions \
-         WHERE project_id = $1 AND user_id = $2 \
-         AND created_at::date = CURRENT_DATE \
-         ORDER BY created_at DESC LIMIT 1"
-    )
-    .bind(project_id)
-    .bind(tg_user.user_id)
-    .fetch_optional(db)
-    .await?;
-
-    if let Some(sid) = today_session {
-        // Pin so /newsession can clear it next time
-        let _: std::result::Result<(), _> = redis::cmd("SETEX")
-            .arg(&pin_key).arg(86400u64).arg(sid.to_string())
-            .query_async(redis).await;
-        return Ok(sid);
-    }
-
-    // Create new session
+    // Create new session only when no reusable one exists, or after explicit /newsession.
     let session_id = Uuid::new_v4();
     let title = format!("Telegram - {} - {}", tg_user.name, chrono_today());
     sqlx::query(
@@ -2056,10 +2080,11 @@ async fn get_or_create_session(
     .bind(session_id).bind(project_id).bind(tg_user.user_id).bind(&title)
     .execute(db).await?;
 
-    // Pin the new session in Redis (24h TTL)
-    let _: std::result::Result<(), _> = redis::cmd("SETEX")
-        .arg(&pin_key).arg(86400u64).arg(session_id.to_string())
-        .query_async(redis).await;
+    let _: std::result::Result<(), _> = redis::cmd("SET")
+        .arg(&pin_key)
+        .arg(session_id.to_string())
+        .query_async(redis)
+        .await;
 
     Ok(session_id)
 }
