@@ -24,9 +24,9 @@ pub async fn create_run(
     let run_id = Uuid::new_v4();
     let auto_mode = req.auto_mode.unwrap_or_else(|| "auto_trusted".to_string());
     let model = req.model.clone().unwrap_or_default();
-    // Use run_id (not session_id) so each run gets its own isolated OpenClaw session.
-    // Sharing session_id caused OpenClaw to see stale system prompts from previous runs.
-    let session_key = format!("project_{}:run_{}", project_id, run_id);
+    // Stable OpenClaw session per coding session keeps continuity and avoids
+    // paying full cold-start context repeatedly on every run.
+    let session_key = format!("project_{}:session_{}", project_id, session_id);
     let run = sqlx::query_as::<_, AgentRun>(
         "INSERT INTO agent_runs
          (id, session_id, project_id, user_id, prompt, status, auto_mode, openclaw_agent_id, openclaw_session_key, model, timeout_at, telegram_chat_id)
@@ -165,6 +165,9 @@ async fn run_inner(
             .await;
     }
 
+    let route = openclaw_service::classify_prompt(&run.prompt);
+    tracing::info!(run_id = %run_id, route = ?route, "Prompt classified for run");
+
     // Prepare workspace — graceful error: tell user instead of crashing
     if let Some(chat_id) = run.telegram_chat_id {
         notify_telegram(&config.telegram_bot_token, chat_id,
@@ -234,12 +237,12 @@ async fn run_inner(
         &repo_url, &branch_name, &worktree_str, &git_status,
     );
 
-    // Fetch session history — cap at last 20 messages to avoid context bloat
-    // (unbounded history = higher cost + slower responses over time)
+    // Fetch session history — explicit history kept lean because stable
+    // session key already carries continuity inside OpenClaw.
     let history: Vec<(String, String)> = sqlx::query_as::<_, (String, String)>(
         "SELECT role, content FROM messages \
          WHERE session_id = $1 \
-         ORDER BY created_at DESC LIMIT 20"
+         ORDER BY created_at DESC LIMIT 12"
     )
     .bind(session_id)
     .fetch_all(db.as_ref())

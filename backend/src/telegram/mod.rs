@@ -1863,6 +1863,58 @@ async fn handle_regular_message(
         }
     }
 
+    // Fast path for light chat: avoid creating agent run / workspace prep.
+    let route = crate::services::openclaw_service::classify_prompt(text);
+    if matches!(route, crate::services::openclaw_service::PromptRoute::Smalltalk | crate::services::openclaw_service::PromptRoute::Chat) {
+        let project = sqlx::query_as::<_, (String, String, String)>(
+            "SELECT slug, repo_url, openclaw_agent_id FROM projects WHERE id = $1"
+        ).bind(project_id).fetch_optional(db).await?;
+
+        let (_project_slug, _repo_url, openclaw_agent_id) = match project {
+            Some(p) => p,
+            None => {
+                send_message(client, &config.telegram_bot_token, chat_id,
+                    "❌ Project tidak ditemukan. Pilih ulang dengan /project <slug>").await?;
+                return Ok(());
+            }
+        };
+
+        let session_id = get_or_create_session(db, &mut redis, tg_user, project_id).await?;
+        crate::services::session_service::add_message(db, session_id, "user", text).await?;
+
+        let reply = if matches!(route, crate::services::openclaw_service::PromptRoute::Smalltalk) {
+            crate::services::openclaw_service::fallback_smalltalk_response(text)
+        } else {
+            let history: Vec<(String, String)> = crate::services::session_service::messages(db, session_id)
+                .await?
+                .into_iter()
+                .rev()
+                .take(12)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .filter(|m| !(m.role == "user" && m.content == text))
+                .map(|m| (m.role, m.content))
+                .collect();
+            let input = crate::services::openclaw_service::OpenClawRunInput {
+                agent_id: openclaw_agent_id,
+                session_key: format!("telegram_chat_{}", session_id),
+                user_id: tg_user.user_id.to_string(),
+                instructions: crate::services::openclaw_service::build_chat_instructions(),
+                prompt: text.to_string(),
+                model: "openclaw".to_string(),
+                history,
+            };
+            let response = crate::services::openclaw_service::run_chat(config, input).await?;
+            let safe = crate::services::openclaw_service::sanitize_user_facing_response(&response);
+            if safe.trim().is_empty() { "Siap. Coba kirim ulang dengan sedikit detail tambahan ya.".to_string() } else { safe }
+        };
+
+        crate::services::session_service::add_message(db, session_id, "assistant", &reply).await?;
+        send_long_message(client, &config.telegram_bot_token, chat_id, &reply).await?;
+        return Ok(());
+    }
+
     // Send processing indicator
     send_message(client, &config.telegram_bot_token, chat_id, "⏳ Sedang diproses...").await?;
 
