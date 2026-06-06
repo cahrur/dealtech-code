@@ -106,12 +106,18 @@ pub fn build_full_agent_instructions(
     branch_name: &str,
     worktree_path: &str,
     git_status: &str,
+    task_summary: Option<&str>,
 ) -> String {
     let status_section = if git_status.trim().is_empty() {
         "  (tidak ada perubahan)".to_string()
     } else {
         git_status.to_string()
     };
+    let task_summary_section = task_summary
+        .map(str::trim)
+        .filter(|summary| !summary.is_empty())
+        .map(|summary| format!("\n<active_task_summary>\n{}\n</active_task_summary>", summary))
+        .unwrap_or_default();
     format!(
         r#"<identity>
 Coding agent untuk tim Dealtech. Menulis kode production-ready, bukan prototype. Setiap run adalah sesi terisolasi — abaikan memori sesi sebelumnya.
@@ -172,6 +178,7 @@ SELALU:
 - Permintaan tidak jelas → minta klarifikasi
 - Repo bermasalah → jelaskan dengan jelas apa errornya
 - Riwayat percakapan = konteks sesi ini saja
+- Jika ada <active_task_summary>, pakai itu sebagai ringkasan state terbaru; jangan ulangi seluruh history kalau tidak perlu
 </task_rules>
 
 <output_format>
@@ -198,11 +205,12 @@ Baca SKILL.md jika task butuh standar tertentu atau user minta "baca skills":
 - cloudflare-turnstile (/app/skills/cloudflare-turnstile/SKILL.md): Bot protection
 - license-dealone (/app/skills/license-dealone/SKILL.md): License key DealOne API
 - project-structure (/app/skills/project-structure/SKILL.md): Folder layout multi-stack
-</skills>"#,
+</skills>{task_summary_section}"#,
         repo_url = repo_url,
         branch_name = branch_name,
         worktree_path = worktree_path,
         status_section = status_section,
+        task_summary_section = task_summary_section,
     )
 }
 
@@ -943,6 +951,35 @@ pub fn is_chat_prompt(prompt: &str) -> bool {
     looks_conversational || (line_count <= 3 && word_count <= 40)
 }
 
+pub fn should_escalate_chat_to_coding(prompt: &str, task_summary: Option<&str>) -> bool {
+    let lowered = prompt.trim().to_lowercase();
+    if lowered.is_empty() {
+        return false;
+    }
+
+    let escalation_markers = [
+        "lanjut yang tadi",
+        "lanjutin",
+        "lanjut kerjaan",
+        "kerjain",
+        "eksekusi",
+        "terapkan",
+        "implementasikan",
+        "gas",
+        "coba opsi kedua",
+        "fix aja",
+        "langsung kerjain",
+        "push aja",
+        "commit aja",
+    ];
+
+    let refers_previous_work = escalation_markers.iter().any(|m| lowered.contains(m));
+    let has_task_summary = task_summary.map(str::trim).is_some_and(|s| !s.is_empty());
+    let contains_code_work_hint = is_write_request(&lowered) || lowered.contains("bug") || lowered.contains("error");
+
+    has_task_summary && (refers_previous_work || contains_code_work_hint)
+}
+
 pub fn classify_prompt(prompt: &str) -> PromptRoute {
     if is_push_request(prompt) {
         PromptRoute::RetryPush
@@ -1629,5 +1666,14 @@ mod tests {
     fn keeps_coding_tasks_out_of_chat_path() {
         assert_eq!(classify_prompt("fix bug query di backend lalu commit"), PromptRoute::CodingTask);
         assert!(!is_chat_prompt("fix bug query di backend lalu commit"));
+    }
+
+    #[test]
+    fn escalates_follow_up_chat_when_task_summary_exists() {
+        assert!(should_escalate_chat_to_coding(
+            "lanjut yang tadi aja",
+            Some("Sedang ngerjain bug query backend, branch sudah siap.")
+        ));
+        assert!(!should_escalate_chat_to_coding("lanjut yang tadi aja", None));
     }
 }

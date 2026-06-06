@@ -1882,7 +1882,25 @@ async fn handle_regular_message(
         };
 
         let session_id = get_or_create_session(db, &mut redis, tg_user, project_id).await?;
-        crate::services::session_service::add_message(db, session_id, "user", text).await?;
+        let session = crate::services::session_service::get(db, session_id).await?;
+        let mut route = route;
+        if matches!(route, crate::services::openclaw_service::PromptRoute::Chat)
+            && crate::services::openclaw_service::should_escalate_chat_to_coding(text, session.task_summary.as_deref())
+        {
+            route = crate::services::openclaw_service::PromptRoute::CodingTask;
+        }
+        if matches!(route, crate::services::openclaw_service::PromptRoute::CodingTask) {
+            tracing::info!(
+                chat_id,
+                user_id = %tg_user.user_id,
+                project_id = %project_id,
+                session_id = %session_id,
+                prompt_len = text.len(),
+                "Telegram chat escalated to coding run"
+            );
+        } else {
+            crate::services::session_service::add_message(db, session_id, "user", text).await?;
+        }
 
         let history: Vec<(String, String)> = if matches!(route, crate::services::openclaw_service::PromptRoute::Smalltalk) {
             Vec::new()
@@ -1917,21 +1935,23 @@ async fn handle_regular_message(
             if safe.trim().is_empty() { "Siap. Coba kirim ulang dengan sedikit detail tambahan ya.".to_string() } else { safe }
         };
 
-        crate::services::session_service::add_message(db, session_id, "assistant", &reply).await?;
-        tracing::info!(
-            chat_id,
-            user_id = %tg_user.user_id,
-            project_id = %project_id,
-            session_id = %session_id,
-            route = ?route,
-            history_len,
-            prompt_len = text.len(),
-            reply_len = reply.len(),
-            latency_ms = started_at.elapsed().as_millis(),
-            "Telegram fast chat completed"
-        );
-        send_long_message(client, &config.telegram_bot_token, chat_id, &reply).await?;
-        return Ok(());
+        if !matches!(route, crate::services::openclaw_service::PromptRoute::CodingTask) {
+            crate::services::session_service::add_message(db, session_id, "assistant", &reply).await?;
+            tracing::info!(
+                chat_id,
+                user_id = %tg_user.user_id,
+                project_id = %project_id,
+                session_id = %session_id,
+                route = ?route,
+                history_len,
+                prompt_len = text.len(),
+                reply_len = reply.len(),
+                latency_ms = started_at.elapsed().as_millis(),
+                "Telegram fast chat completed"
+            );
+            send_long_message(client, &config.telegram_bot_token, chat_id, &reply).await?;
+            return Ok(());
+        }
     }
 
     // Send processing indicator

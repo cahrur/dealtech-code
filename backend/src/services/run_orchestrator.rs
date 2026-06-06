@@ -7,7 +7,6 @@ use crate::config::Config;
 use crate::domain::agent_run::{AgentRun, CreateRunRequest};
 use crate::domain::policy::PolicyConfig;
 use crate::services::{
-    usage_service,
     audit_service, git_service, openclaw_service, policy_engine::PolicyEngine,
     realtime_service, workspace_service,
 };
@@ -233,25 +232,39 @@ async fn run_inner(
     // Build instructions: tell OpenClaw the worktree path so it can use its own tools
     let git_status = git_service::get_status(&worktree).await.unwrap_or_default();
     let worktree_str = worktree.to_string_lossy().to_string();
-    let instructions = openclaw_service::build_full_agent_instructions(
-        &repo_url, &branch_name, &worktree_str, &git_status,
-    );
-
-    // Fetch session history — explicit history kept lean because stable
-    // session key already carries continuity inside OpenClaw.
-    let history: Vec<(String, String)> = sqlx::query_as::<_, (String, String)>(
-        "SELECT role, content FROM messages \
-         WHERE session_id = $1 \
-         ORDER BY created_at DESC LIMIT 12"
+    let task_summary = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT task_summary FROM coding_sessions WHERE id = $1"
     )
     .bind(session_id)
-    .fetch_all(db.as_ref())
+    .fetch_optional(db.as_ref())
     .await
-    .unwrap_or_default()
-    .into_iter()
-    .rev() // restore chronological order
-    .filter(|(role, content)| !(content == &run.prompt && role == "user"))
-    .collect();
+    .unwrap_or(None)
+    .flatten();
+    let instructions = openclaw_service::build_full_agent_instructions(
+        &repo_url,
+        &branch_name,
+        &worktree_str,
+        &git_status,
+        task_summary.as_deref(),
+    );
+
+    let sanitized_prompt = openclaw_service::sanitize_user_prompt(&run.prompt);
+    let prompt_len = sanitized_prompt.len();
+    let trimmed_prompt = sanitized_prompt.trim().to_lowercase();
+    let history_limit: i64 = if trimmed_prompt.contains("lanjut") || trimmed_prompt.contains("yang tadi") {
+        4
+    } else {
+        8
+    };
+
+    // Fetch session history — keep it lean and let task summary carry older state.
+    let history: Vec<(String, String)> = crate::services::session_service::recent_messages(db.as_ref(), session_id, history_limit)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|m| !(m.role == "user" && m.content == run.prompt))
+        .map(|m| (m.role, m.content))
+        .collect();
 
     // Single OpenClaw call — streaming, OpenClaw writes files directly via its own tools
     let input = openclaw_service::OpenClawRunInput {
@@ -264,9 +277,7 @@ async fn run_inner(
         history,
     };
 
-    let history_len = history.len();
-    let sanitized_prompt = openclaw_service::sanitize_user_prompt(&run.prompt);
-    let prompt_len = sanitized_prompt.len();
+    let history_len = input.history.len();
 
     let agent_response = match tokio::time::timeout(
         tokio::time::Duration::from_secs(7200),
@@ -343,6 +354,17 @@ async fn run_inner(
     }
 
     // Build final reply: OpenClaw's reply augmented with git status
+    let task_summary_text = openclaw_service::synthesize_task_summary(
+        &run.prompt,
+        &changed,
+        commit_sha.as_deref(),
+        &branch_name,
+        pushed_branch,
+        false,
+        push_error.as_deref(),
+    );
+    let _ = crate::services::session_service::update_task_summary(db.as_ref(), session_id, &task_summary_text).await;
+
     let mut final_reply = agent_reply.clone();
     if final_reply.trim().is_empty() {
         final_reply = if changed.is_empty() {
@@ -518,6 +540,7 @@ async fn finish_with_reply(
     bot_token: &str,
 ) -> anyhow::Result<()> {
     let _ = crate::services::session_service::add_message(db, session_id, "assistant", reply).await;
+    let _ = crate::services::session_service::update_task_summary(db, session_id, reply).await;
     let status = if is_failure { "failed_agent" } else { "completed" };
     if is_failure {
         let error_msg = if reply.trim().is_empty() { "Unknown error" } else { reply };

@@ -9,6 +9,12 @@ pub struct CodingSession {
     pub project_id: Uuid,
     pub user_id: Uuid,
     pub title: String,
+    pub active_branch: Option<String>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub branch_created_at: Option<OffsetDateTime>,
+    pub task_summary: Option<String>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub task_summary_updated_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]

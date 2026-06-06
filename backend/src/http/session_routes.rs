@@ -60,24 +60,27 @@ pub async fn chat(
     session_service::add_message(&state.db, session_id, "user", &req.prompt).await?;
     let mode = req.mode.as_deref().unwrap_or("openclaw");
     let model = if mode == "hermes" { "hermes-3" } else { "openclaw" };
-    let history: Vec<(String, String)> = session_service::messages(&state.db, session_id)
+    let history: Vec<(String, String)> = session_service::recent_messages(&state.db, session_id, 8)
         .await?
         .into_iter()
-        .rev()
-        .take(12)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
         .filter(|m| !(m.role == "user" && m.content == req.prompt))
         .map(|m| (m.role, m.content))
         .collect();
 
-    let route = openclaw_service::classify_prompt(&req.prompt);
+    let mut route = openclaw_service::classify_prompt(&req.prompt);
+    if matches!(route, openclaw_service::PromptRoute::Chat)
+        && openclaw_service::should_escalate_chat_to_coding(&req.prompt, session.task_summary.as_deref())
+    {
+        route = openclaw_service::PromptRoute::CodingTask;
+    }
     let history_len = history.len();
     let prompt_len = req.prompt.len();
     let reply = match route {
         openclaw_service::PromptRoute::Smalltalk => {
             openclaw_service::fallback_smalltalk_response(&req.prompt)
+        }
+        openclaw_service::PromptRoute::CodingTask => {
+            "Permintaan ini butuh jalur coding task, bukan chat ringan. Jalankan dari sesi coding / Telegram project chat supaya saya bisa kerjain repo dan file-nya langsung.".to_string()
         }
         _ => {
             let input = openclaw_service::OpenClawRunInput {
