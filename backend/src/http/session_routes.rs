@@ -54,6 +54,7 @@ pub async fn chat(
     Path(session_id): Path<Uuid>,
     Json(req): Json<crate::domain::session::ChatRequest>,
 ) -> Result<Json<serde_json::Value>> {
+    let started_at = std::time::Instant::now();
     let session = session_service::get(&state.db, session_id).await?;
     project_service::check_member(&state.db, session.project_id, user_id).await?;
     session_service::add_message(&state.db, session_id, "user", &req.prompt).await?;
@@ -72,6 +73,8 @@ pub async fn chat(
         .collect();
 
     let route = openclaw_service::classify_prompt(&req.prompt);
+    let history_len = history.len();
+    let prompt_len = req.prompt.len();
     let reply = match route {
         openclaw_service::PromptRoute::Smalltalk => {
             openclaw_service::fallback_smalltalk_response(&req.prompt)
@@ -94,5 +97,15 @@ pub async fn chat(
         }
     };
     session_service::add_message(&state.db, session_id, "assistant", &reply).await?;
+    tracing::info!(
+        session_id = %session_id,
+        user_id = %user_id,
+        route = ?route,
+        history_len,
+        prompt_len,
+        reply_len = reply.len(),
+        latency_ms = started_at.elapsed().as_millis(),
+        "Session chat completed"
+    );
     Ok(Json(serde_json::json!({ "data": { "response": reply }, "success": true })))
 }

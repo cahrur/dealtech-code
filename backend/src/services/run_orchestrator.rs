@@ -259,10 +259,14 @@ async fn run_inner(
         session_key: run.openclaw_session_key.clone(),
         user_id: user_id.to_string(),
         instructions,
-        prompt: openclaw_service::sanitize_user_prompt(&run.prompt),
+        prompt: sanitized_prompt,
         model: run.model.clone(),
         history,
     };
+
+    let history_len = history.len();
+    let sanitized_prompt = openclaw_service::sanitize_user_prompt(&run.prompt);
+    let prompt_len = sanitized_prompt.len();
 
     let agent_response = match tokio::time::timeout(
         tokio::time::Duration::from_secs(7200),
@@ -483,7 +487,21 @@ async fn run_inner(
     let _ = workspace_service::cleanup_worktree(&worktree, &workspace_path).await;
 
     // Improvement 5: Log run duration on success
-    tracing::info!(run_id = %run_id, duration_ms = start_time.elapsed().as_millis(), status = "completed", "Run finished");
+    tracing::info!(
+        run_id = %run_id,
+        session_id = %session_id,
+        route = ?route,
+        history_len,
+        prompt_len,
+        changed_files = changed.len(),
+        pushed_branch,
+        input_tokens = tokens_input,
+        output_tokens = tokens_output,
+        cost_usd,
+        duration_ms = start_time.elapsed().as_millis(),
+        status = "completed",
+        "Run finished"
+    );
 
     Ok(())
 }

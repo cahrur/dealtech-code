@@ -1863,6 +1863,8 @@ async fn handle_regular_message(
         }
     }
 
+    let started_at = std::time::Instant::now();
+
     // Fast path for light chat: avoid creating agent run / workspace prep.
     let route = crate::services::openclaw_service::classify_prompt(text);
     if matches!(route, crate::services::openclaw_service::PromptRoute::Smalltalk | crate::services::openclaw_service::PromptRoute::Chat) {
@@ -1882,10 +1884,10 @@ async fn handle_regular_message(
         let session_id = get_or_create_session(db, &mut redis, tg_user, project_id).await?;
         crate::services::session_service::add_message(db, session_id, "user", text).await?;
 
-        let reply = if matches!(route, crate::services::openclaw_service::PromptRoute::Smalltalk) {
-            crate::services::openclaw_service::fallback_smalltalk_response(text)
+        let history: Vec<(String, String)> = if matches!(route, crate::services::openclaw_service::PromptRoute::Smalltalk) {
+            Vec::new()
         } else {
-            let history: Vec<(String, String)> = crate::services::session_service::messages(db, session_id)
+            crate::services::session_service::messages(db, session_id)
                 .await?
                 .into_iter()
                 .rev()
@@ -1895,7 +1897,12 @@ async fn handle_regular_message(
                 .rev()
                 .filter(|m| !(m.role == "user" && m.content == text))
                 .map(|m| (m.role, m.content))
-                .collect();
+                .collect()
+        };
+        let history_len = history.len();
+        let reply = if matches!(route, crate::services::openclaw_service::PromptRoute::Smalltalk) {
+            crate::services::openclaw_service::fallback_smalltalk_response(text)
+        } else {
             let input = crate::services::openclaw_service::OpenClawRunInput {
                 agent_id: openclaw_agent_id,
                 session_key: format!("telegram_chat_{}", session_id),
@@ -1911,6 +1918,18 @@ async fn handle_regular_message(
         };
 
         crate::services::session_service::add_message(db, session_id, "assistant", &reply).await?;
+        tracing::info!(
+            chat_id,
+            user_id = %tg_user.user_id,
+            project_id = %project_id,
+            session_id = %session_id,
+            route = ?route,
+            history_len,
+            prompt_len = text.len(),
+            reply_len = reply.len(),
+            latency_ms = started_at.elapsed().as_millis(),
+            "Telegram fast chat completed"
+        );
         send_long_message(client, &config.telegram_bot_token, chat_id, &reply).await?;
         return Ok(());
     }
