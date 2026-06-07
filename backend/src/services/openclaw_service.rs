@@ -933,6 +933,7 @@ pub fn is_chat_prompt(prompt: &str) -> bool {
         "file", "folder", "endpoint", "api", "test", "migration", "schema", "query",
         "controller", "service", "frontend", "backend", "database", "docker", "deploy",
         "workspace", "scan", "security", "nuclei", "lint", "build", "error", "bug",
+        "clean code", "solid", "prinsip solid", "design pattern", "arsitektur",
     ];
     if code_or_repo_markers.iter().any(|m| lowered.contains(m)) {
         return false;
@@ -941,7 +942,8 @@ pub fn is_chat_prompt(prompt: &str) -> bool {
     let conversational_markers = [
         "gimana", "bagaimana", "kenapa", "maksudnya", "jelasin", "jelaskan", "tolong jelasin",
         "bisa bantu", "apa itu", "siapa kamu", "lanjut yang tadi", "lanjut", "ringkas", "summary",
-        "kok", "boleh", "perlu apa", "opsi", "saran", "rekomendasi",
+        "kok", "boleh", "perlu apa", "opsi", "saran", "rekomendasi", "bedanya", "contohnya",
+        "prinsip", "konsep", "teori",
     ];
 
     let looks_conversational = conversational_markers.iter().any(|m| lowered.contains(m));
@@ -1226,6 +1228,15 @@ pub fn is_write_request(prompt: &str) -> bool {
         "isi",
         "isinya",
         "berisi",
+        "implement",
+        "terapkan",
+        "kerjain",
+        "perbaiki",
+        "fix",
+        "commit",
+        "push",
+        "refactor",
+        "debug",
     ]
     .iter()
     .any(|marker| lowered.contains(marker))
