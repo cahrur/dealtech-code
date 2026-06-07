@@ -3,6 +3,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use sqlx::PgPool;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::config::Config;
@@ -1939,9 +1940,7 @@ async fn handle_regular_message(
                 model: "openclaw".to_string(),
                 history,
             };
-            let response = crate::services::openclaw_service::run_chat(config, input).await?;
-            let safe = crate::services::openclaw_service::sanitize_user_facing_response(&response);
-            if safe.trim().is_empty() { "Siap. Coba kirim ulang dengan sedikit detail tambahan ya.".to_string() } else { safe }
+            stream_chat_reply(client, &config.telegram_bot_token, chat_id, config, input).await?
         };
 
         if !matches!(route, crate::services::openclaw_service::PromptRoute::CodingTask) {
@@ -1958,7 +1957,6 @@ async fn handle_regular_message(
                 latency_ms = started_at.elapsed().as_millis(),
                 "Telegram fast chat completed"
             );
-            send_long_message(client, &config.telegram_bot_token, chat_id, &reply).await?;
             return Ok(());
         }
     }
@@ -2124,12 +2122,169 @@ async fn send_long_message(
     Ok(())
 }
 
+async fn stream_chat_reply(
+    client: &Client,
+    token: &str,
+    chat_id: i64,
+    config: &Config,
+    input: crate::services::openclaw_service::OpenClawRunInput,
+) -> anyhow::Result<String> {
+    let placeholder_id = send_message_with_id(client, token, chat_id, "💭 Lagi mikir...").await.ok();
+    let mut last_typing_at = Instant::now() - Duration::from_secs(10);
+    let mut last_edit_at = Instant::now() - Duration::from_secs(10);
+    let mut last_sent_text = String::new();
+    let mut stream_text = String::new();
+    let mut final_done_text = String::new();
+    let mut stream_broken = false;
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::services::openclaw_service::OpenClawEvent>(100);
+    let cfg = config.clone();
+    let inp = input.clone();
+    tokio::spawn(async move {
+        let _ = crate::services::openclaw_service::run_stream(&cfg, inp, tx).await;
+    });
+
+    while let Some(ev) = rx.recv().await {
+        if last_typing_at.elapsed() >= Duration::from_secs(4) {
+            let _ = send_chat_action(client, token, chat_id, "typing").await;
+            last_typing_at = Instant::now();
+        }
+
+        if matches!(ev.event_type.as_str(), "response.output_text.done" | "message.completed" | "response.completed") {
+            if let Some(t) = ev.payload.get("text").and_then(|v| v.as_str()) {
+                if !t.is_empty() {
+                    final_done_text = t.to_string();
+                }
+            }
+            if final_done_text.is_empty() {
+                if let Some(arr) = ev.payload.get("response")
+                    .and_then(|r| r.get("output"))
+                    .and_then(|o| o.as_array())
+                {
+                    for msg in arr.iter().rev() {
+                        if let Some(parts) = msg.get("content").and_then(|c| c.as_array()) {
+                            for part in parts {
+                                let is_text = part.get("type").and_then(|t| t.as_str()) == Some("text");
+                                if is_text {
+                                    if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                                        if !t.is_empty() {
+                                            final_done_text = t.to_string();
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if !final_done_text.is_empty() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        let is_delta = matches!(ev.event_type.as_str(),
+            "assistant.delta" | "response.output_text.delta" | "content_block_delta");
+        if is_delta {
+            let delta = ev.payload.get("delta").and_then(|d| d.as_str())
+                .or_else(|| ev.payload.get("text").and_then(|d| d.as_str()))
+                .or_else(|| ev.payload.get("delta").and_then(|d| d.get("text")).and_then(|t| t.as_str()))
+                .unwrap_or("");
+            if !delta.is_empty() {
+                stream_text.push_str(delta);
+            }
+        }
+
+        if stream_broken {
+            continue;
+        }
+
+        let Some(message_id) = placeholder_id else { continue; };
+        if stream_text.trim().is_empty() {
+            continue;
+        }
+        if last_edit_at.elapsed() < Duration::from_millis(900)
+            && stream_text.len().saturating_sub(last_sent_text.len()) < 80
+        {
+            continue;
+        }
+
+        let preview = crate::services::openclaw_service::sanitize_user_facing_response(&stream_text);
+        let preview = preview.trim();
+        if preview.is_empty() {
+            continue;
+        }
+        let preview = if preview.len() > 3800 {
+            &preview[..3800]
+        } else {
+            preview
+        };
+        if preview == last_sent_text {
+            continue;
+        }
+
+        if edit_message_text(client, token, chat_id, message_id, preview).await.is_ok() {
+            last_edit_at = Instant::now();
+            last_sent_text = preview.to_string();
+        } else {
+            stream_broken = true;
+        }
+    }
+
+    let chosen = if !final_done_text.trim().is_empty() {
+        final_done_text
+    } else {
+        stream_text
+    };
+    let mut safe = crate::services::openclaw_service::sanitize_user_facing_response(&chosen);
+    if safe.trim().is_empty() {
+        let fallback = crate::services::openclaw_service::run_chat(config, input).await?;
+        safe = crate::services::openclaw_service::sanitize_user_facing_response(&fallback);
+    }
+    if safe.trim().is_empty() {
+        safe = "Siap. Coba kirim ulang dengan sedikit detail tambahan ya.".to_string();
+    }
+
+    if let Some(message_id) = placeholder_id {
+        if safe.len() <= 4000 {
+            if edit_message_text(client, token, chat_id, message_id, &safe).await.is_err() {
+                send_long_message(client, token, chat_id, &safe).await?;
+            }
+        } else {
+            let first_window = safe.len().min(4000);
+            let first_chunk_end = safe[..first_window].rfind('\n').unwrap_or(first_window);
+            let first_chunk = &safe[..first_chunk_end];
+            if edit_message_text(client, token, chat_id, message_id, first_chunk).await.is_err() {
+                send_message(client, token, chat_id, first_chunk).await?;
+            }
+            let remaining = safe[first_chunk_end..].trim_start();
+            if !remaining.is_empty() {
+                send_long_message(client, token, chat_id, remaining).await?;
+            }
+        }
+    } else {
+        send_long_message(client, token, chat_id, &safe).await?;
+    }
+
+    Ok(safe)
+}
+
 async fn send_message(
     client: &Client,
     token: &str,
     chat_id: i64,
     text: &str,
 ) -> anyhow::Result<()> {
+    let _ = send_message_with_id(client, token, chat_id, text).await?;
+    Ok(())
+}
+
+async fn send_message_with_id(
+    client: &Client,
+    token: &str,
+    chat_id: i64,
+    text: &str,
+) -> anyhow::Result<i64> {
     let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
     let body = serde_json::json!({
         "chat_id": chat_id,
@@ -2153,7 +2308,51 @@ async fn send_message(
             tokio::time::sleep(tokio::time::Duration::from_secs(wait)).await;
             continue;
         }
-        break;
+        let status = resp.status();
+        let parsed: TelegramResponse<TelegramMessage> = resp.json().await?;
+        if !status.is_success() || !parsed.ok {
+            anyhow::bail!("Telegram sendMessage failed with status {}", status);
+        }
+        let message_id = parsed
+            .result
+            .map(|m| m.message_id)
+            .ok_or_else(|| anyhow::anyhow!("Telegram sendMessage missing message_id"))?;
+        return Ok(message_id);
+    }
+}
+
+async fn send_chat_action(
+    client: &Client,
+    token: &str,
+    chat_id: i64,
+    action: &str,
+) -> anyhow::Result<()> {
+    let url = format!("https://api.telegram.org/bot{}/sendChatAction", token);
+    let body = serde_json::json!({
+        "chat_id": chat_id,
+        "action": action,
+    });
+    let _ = client.post(&url).json(&body).send().await?;
+    Ok(())
+}
+
+async fn edit_message_text(
+    client: &Client,
+    token: &str,
+    chat_id: i64,
+    message_id: i64,
+    text: &str,
+) -> anyhow::Result<()> {
+    let url = format!("https://api.telegram.org/bot{}/editMessageText", token);
+    let body = serde_json::json!({
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+    });
+    let resp = client.post(&url).json(&body).send().await?;
+    if !resp.status().is_success() {
+        let err = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Telegram editMessageText failed: {}", err);
     }
     Ok(())
 }
