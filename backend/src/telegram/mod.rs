@@ -1879,10 +1879,24 @@ async fn handle_regular_message(
 
     // Fast path for light chat: avoid creating agent run / workspace prep.
     let route = crate::services::openclaw_service::classify_prompt(text);
+    tracing::info!(
+        chat_id,
+        prompt_len = text.len(),
+        route = ?route,
+        elapsed_ms = started_at.elapsed().as_millis(),
+        "Telegram fast chat step: classified prompt"
+    );
     if matches!(route, crate::services::openclaw_service::PromptRoute::Smalltalk | crate::services::openclaw_service::PromptRoute::Chat) {
+        let project_lookup_started = std::time::Instant::now();
         let project = sqlx::query_as::<_, (String, String, String)>(
             "SELECT slug, repo_url, openclaw_agent_id FROM projects WHERE id = $1"
         ).bind(project_id).fetch_optional(db).await?;
+        tracing::info!(
+            chat_id,
+            elapsed_ms = started_at.elapsed().as_millis(),
+            step_ms = project_lookup_started.elapsed().as_millis(),
+            "Telegram fast chat step: loaded project"
+        );
 
         let (_project_slug, _repo_url, openclaw_agent_id) = match project {
             Some(p) => p,
@@ -1893,8 +1907,24 @@ async fn handle_regular_message(
             }
         };
 
+        let session_lookup_started = std::time::Instant::now();
         let session_id = get_or_create_session(db, &mut redis, tg_user, project_id).await?;
+        tracing::info!(
+            chat_id,
+            session_id = %session_id,
+            elapsed_ms = started_at.elapsed().as_millis(),
+            step_ms = session_lookup_started.elapsed().as_millis(),
+            "Telegram fast chat step: got session"
+        );
+        let session_fetch_started = std::time::Instant::now();
         let session = crate::services::session_service::get(db, session_id).await?;
+        tracing::info!(
+            chat_id,
+            session_id = %session_id,
+            elapsed_ms = started_at.elapsed().as_millis(),
+            step_ms = session_fetch_started.elapsed().as_millis(),
+            "Telegram fast chat step: loaded session"
+        );
         let mut route = route;
         if matches!(route, crate::services::openclaw_service::PromptRoute::Chat)
             && crate::services::openclaw_service::should_escalate_chat_to_coding(text, session.task_summary.as_deref())
@@ -1911,9 +1941,18 @@ async fn handle_regular_message(
                 "Telegram chat escalated to coding run"
             );
         } else {
+            let add_user_msg_started = std::time::Instant::now();
             crate::services::session_service::add_message(db, session_id, "user", text).await?;
+            tracing::info!(
+                chat_id,
+                session_id = %session_id,
+                elapsed_ms = started_at.elapsed().as_millis(),
+                step_ms = add_user_msg_started.elapsed().as_millis(),
+                "Telegram fast chat step: stored user message"
+            );
         }
 
+        let history_started = std::time::Instant::now();
         let history: Vec<(String, String)> = if matches!(route, crate::services::openclaw_service::PromptRoute::Smalltalk) {
             Vec::new()
         } else {
@@ -1929,10 +1968,33 @@ async fn handle_regular_message(
                 .map(|m| (m.role, m.content))
                 .collect()
         };
+        tracing::info!(
+            chat_id,
+            session_id = %session_id,
+            elapsed_ms = started_at.elapsed().as_millis(),
+            step_ms = history_started.elapsed().as_millis(),
+            "Telegram fast chat step: built history"
+        );
         let history_len = history.len();
         let reply = if matches!(route, crate::services::openclaw_service::PromptRoute::Smalltalk) {
+            let typing_started = std::time::Instant::now();
             let _ = send_chat_action(client, &config.telegram_bot_token, chat_id, "typing").await;
+            tracing::info!(
+                chat_id,
+                elapsed_ms = started_at.elapsed().as_millis(),
+                step_ms = typing_started.elapsed().as_millis(),
+                "Telegram fast chat step: sent typing action"
+            );
+            let reply_started = std::time::Instant::now();
             let reply = crate::services::openclaw_service::fallback_smalltalk_response(text);
+            tracing::info!(
+                chat_id,
+                elapsed_ms = started_at.elapsed().as_millis(),
+                step_ms = reply_started.elapsed().as_millis(),
+                reply_len = reply.len(),
+                "Telegram fast chat step: built smalltalk reply"
+            );
+            let finalize_started = std::time::Instant::now();
             send_placeholder_then_finalize(
                 client,
                 &config.telegram_bot_token,
@@ -1940,6 +2002,12 @@ async fn handle_regular_message(
                 "💭 Lagi mikir...",
                 &reply,
             ).await?;
+            tracing::info!(
+                chat_id,
+                elapsed_ms = started_at.elapsed().as_millis(),
+                step_ms = finalize_started.elapsed().as_millis(),
+                "Telegram fast chat step: finalized smalltalk reply"
+            );
             reply
         } else {
             let input = crate::services::openclaw_service::OpenClawRunInput {
@@ -1951,11 +2019,29 @@ async fn handle_regular_message(
                 model: "openclaw".to_string(),
                 history,
             };
-            stream_chat_reply(client, &config.telegram_bot_token, chat_id, config, input).await?
+            let stream_started = std::time::Instant::now();
+            let reply = stream_chat_reply(client, &config.telegram_bot_token, chat_id, config, input).await?;
+            tracing::info!(
+                chat_id,
+                session_id = %session_id,
+                elapsed_ms = started_at.elapsed().as_millis(),
+                step_ms = stream_started.elapsed().as_millis(),
+                reply_len = reply.len(),
+                "Telegram fast chat step: streamed chat reply"
+            );
+            reply
         };
 
         if !matches!(route, crate::services::openclaw_service::PromptRoute::CodingTask) {
+            let add_assistant_msg_started = std::time::Instant::now();
             crate::services::session_service::add_message(db, session_id, "assistant", &reply).await?;
+            tracing::info!(
+                chat_id,
+                session_id = %session_id,
+                elapsed_ms = started_at.elapsed().as_millis(),
+                step_ms = add_assistant_msg_started.elapsed().as_millis(),
+                "Telegram fast chat step: stored assistant message"
+            );
             tracing::info!(
                 chat_id,
                 user_id = %tg_user.user_id,
