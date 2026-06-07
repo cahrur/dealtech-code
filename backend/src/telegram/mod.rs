@@ -13,6 +13,8 @@ use crate::services::run_orchestrator;
 struct TelegramResponse<T> {
     ok: bool,
     result: Option<T>,
+    description: Option<String>,
+    error_code: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -2138,17 +2140,25 @@ async fn send_placeholder_then_finalize(
     placeholder: &str,
     final_text: &str,
 ) -> anyhow::Result<()> {
-    let placeholder_id = send_message_with_id(client, token, chat_id, placeholder).await.ok();
+    let placeholder_id = match send_message_with_id(client, token, chat_id, placeholder).await {
+        Ok(id) => Some(id),
+        Err(e) => {
+            tracing::error!(chat_id, error = %e, "Telegram placeholder send failed");
+            None
+        }
+    };
     if let Some(message_id) = placeholder_id {
         if final_text.len() <= 4000 {
-            if edit_message_text(client, token, chat_id, message_id, final_text).await.is_err() {
+            if let Err(e) = edit_message_text(client, token, chat_id, message_id, final_text).await {
+                tracing::error!(chat_id, message_id, error = %e, "Telegram placeholder finalize edit failed");
                 send_long_message(client, token, chat_id, final_text).await?;
             }
         } else {
             let first_window = final_text.len().min(4000);
             let first_chunk_end = final_text[..first_window].rfind('\n').unwrap_or(first_window);
             let first_chunk = &final_text[..first_chunk_end];
-            if edit_message_text(client, token, chat_id, message_id, first_chunk).await.is_err() {
+            if let Err(e) = edit_message_text(client, token, chat_id, message_id, first_chunk).await {
+                tracing::error!(chat_id, message_id, error = %e, "Telegram placeholder first chunk edit failed");
                 send_message(client, token, chat_id, first_chunk).await?;
             }
             let remaining = final_text[first_chunk_end..].trim_start();
@@ -2169,7 +2179,13 @@ async fn stream_chat_reply(
     config: &Config,
     input: crate::services::openclaw_service::OpenClawRunInput,
 ) -> anyhow::Result<String> {
-    let placeholder_id = send_message_with_id(client, token, chat_id, "💭 Lagi mikir...").await.ok();
+    let placeholder_id = match send_message_with_id(client, token, chat_id, "💭 Lagi mikir...").await {
+        Ok(id) => Some(id),
+        Err(e) => {
+            tracing::error!(chat_id, error = %e, "Telegram stream placeholder send failed");
+            None
+        }
+    };
     let mut last_typing_at = Instant::now() - Duration::from_secs(10);
     let mut last_edit_at = Instant::now() - Duration::from_secs(10);
     let mut last_sent_text = String::new();
@@ -2267,6 +2283,7 @@ async fn stream_chat_reply(
             last_edit_at = Instant::now();
             last_sent_text = preview.to_string();
         } else {
+            tracing::error!(chat_id, message_id, "Telegram stream preview edit failed; falling back to final send");
             stream_broken = true;
         }
     }
@@ -2285,7 +2302,28 @@ async fn stream_chat_reply(
         safe = "Siap. Coba kirim ulang dengan sedikit detail tambahan ya.".to_string();
     }
 
-    send_placeholder_then_finalize(client, token, chat_id, "💭 Lagi mikir...", &safe).await?;
+    if let Some(message_id) = placeholder_id {
+        if safe.len() <= 4000 {
+            if let Err(e) = edit_message_text(client, token, chat_id, message_id, &safe).await {
+                tracing::error!(chat_id, message_id, error = %e, "Telegram final stream edit failed");
+                send_long_message(client, token, chat_id, &safe).await?;
+            }
+        } else {
+            let first_window = safe.len().min(4000);
+            let first_chunk_end = safe[..first_window].rfind('\n').unwrap_or(first_window);
+            let first_chunk = &safe[..first_chunk_end];
+            if let Err(e) = edit_message_text(client, token, chat_id, message_id, first_chunk).await {
+                tracing::error!(chat_id, message_id, error = %e, "Telegram final first chunk edit failed");
+                send_message(client, token, chat_id, first_chunk).await?;
+            }
+            let remaining = safe[first_chunk_end..].trim_start();
+            if !remaining.is_empty() {
+                send_long_message(client, token, chat_id, remaining).await?;
+            }
+        }
+    } else {
+        send_placeholder_then_finalize(client, token, chat_id, "💭 Lagi mikir...", &safe).await?;
+    }
 
     Ok(safe)
 }
@@ -2332,7 +2370,12 @@ async fn send_message_with_id(
         let status = resp.status();
         let parsed: TelegramResponse<TelegramMessage> = resp.json().await?;
         if !status.is_success() || !parsed.ok {
-            anyhow::bail!("Telegram sendMessage failed with status {}", status);
+            anyhow::bail!(
+                "Telegram sendMessage failed with status {} code {:?}: {}",
+                status,
+                parsed.error_code,
+                parsed.description.unwrap_or_else(|| "unknown error".to_string())
+            );
         }
         let message_id = parsed
             .result
@@ -2373,6 +2416,7 @@ async fn edit_message_text(
     let resp = client.post(&url).json(&body).send().await?;
     if !resp.status().is_success() {
         let err = resp.text().await.unwrap_or_default();
+        tracing::error!(chat_id, message_id, error = %err, "Telegram editMessageText failed");
         anyhow::bail!("Telegram editMessageText failed: {}", err);
     }
     Ok(())
