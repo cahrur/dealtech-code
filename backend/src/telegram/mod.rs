@@ -1982,6 +1982,20 @@ async fn handle_regular_message(
     }
 
     if matches!(route, crate::services::openclaw_service::PromptRoute::Chat) {
+        let early_placeholder_started = std::time::Instant::now();
+        let early_placeholder_id = send_message_with_id(
+            client,
+            &config.telegram_bot_token,
+            chat_id,
+            "💭 Lagi mikir...",
+        ).await.ok();
+        tracing::info!(
+            chat_id,
+            elapsed_ms = started_at.elapsed().as_millis(),
+            step_ms = early_placeholder_started.elapsed().as_millis(),
+            has_placeholder = early_placeholder_id.is_some(),
+            "Telegram fast chat step: sent early chat placeholder"
+        );
         let project_lookup_started = std::time::Instant::now();
         let project = sqlx::query_as::<_, (String, String, String)>(
             "SELECT slug, repo_url, openclaw_agent_id FROM projects WHERE id = $1"
@@ -2115,7 +2129,14 @@ async fn handle_regular_message(
                 history,
             };
             let stream_started = std::time::Instant::now();
-            let reply = stream_chat_reply(client, &config.telegram_bot_token, chat_id, config, input).await?;
+            let reply = stream_chat_reply_with_placeholder(
+                client,
+                &config.telegram_bot_token,
+                chat_id,
+                config,
+                input,
+                early_placeholder_id,
+            ).await?;
             tracing::info!(
                 chat_id,
                 session_id = %session_id,
@@ -2360,11 +2381,26 @@ async fn stream_chat_reply(
     config: &Config,
     input: crate::services::openclaw_service::OpenClawRunInput,
 ) -> anyhow::Result<String> {
-    let placeholder_id = match send_message_with_id(client, token, chat_id, "💭 Lagi mikir...").await {
-        Ok(id) => Some(id),
-        Err(e) => {
-            tracing::error!(chat_id, error = %e, "Telegram stream placeholder send failed");
-            None
+    stream_chat_reply_with_placeholder(client, token, chat_id, config, input, None).await
+}
+
+async fn stream_chat_reply_with_placeholder(
+    client: &Client,
+    token: &str,
+    chat_id: i64,
+    config: &Config,
+    input: crate::services::openclaw_service::OpenClawRunInput,
+    existing_placeholder_id: Option<i64>,
+) -> anyhow::Result<String> {
+    let placeholder_id = if let Some(id) = existing_placeholder_id {
+        Some(id)
+    } else {
+        match send_message_with_id(client, token, chat_id, "💭 Lagi mikir...").await {
+            Ok(id) => Some(id),
+            Err(e) => {
+                tracing::error!(chat_id, error = %e, "Telegram stream placeholder send failed");
+                None
+            }
         }
     };
     let mut last_typing_at = Instant::now() - Duration::from_secs(10);
