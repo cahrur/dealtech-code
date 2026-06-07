@@ -1929,7 +1929,16 @@ async fn handle_regular_message(
         };
         let history_len = history.len();
         let reply = if matches!(route, crate::services::openclaw_service::PromptRoute::Smalltalk) {
-            crate::services::openclaw_service::fallback_smalltalk_response(text)
+            let _ = send_chat_action(client, &config.telegram_bot_token, chat_id, "typing").await;
+            let reply = crate::services::openclaw_service::fallback_smalltalk_response(text);
+            send_placeholder_then_finalize(
+                client,
+                &config.telegram_bot_token,
+                chat_id,
+                "💭 Lagi mikir...",
+                &reply,
+            ).await?;
+            reply
         } else {
             let input = crate::services::openclaw_service::OpenClawRunInput {
                 agent_id: openclaw_agent_id,
@@ -2122,6 +2131,37 @@ async fn send_long_message(
     Ok(())
 }
 
+async fn send_placeholder_then_finalize(
+    client: &Client,
+    token: &str,
+    chat_id: i64,
+    placeholder: &str,
+    final_text: &str,
+) -> anyhow::Result<()> {
+    let placeholder_id = send_message_with_id(client, token, chat_id, placeholder).await.ok();
+    if let Some(message_id) = placeholder_id {
+        if final_text.len() <= 4000 {
+            if edit_message_text(client, token, chat_id, message_id, final_text).await.is_err() {
+                send_long_message(client, token, chat_id, final_text).await?;
+            }
+        } else {
+            let first_window = final_text.len().min(4000);
+            let first_chunk_end = final_text[..first_window].rfind('\n').unwrap_or(first_window);
+            let first_chunk = &final_text[..first_chunk_end];
+            if edit_message_text(client, token, chat_id, message_id, first_chunk).await.is_err() {
+                send_message(client, token, chat_id, first_chunk).await?;
+            }
+            let remaining = final_text[first_chunk_end..].trim_start();
+            if !remaining.is_empty() {
+                send_long_message(client, token, chat_id, remaining).await?;
+            }
+        }
+    } else {
+        send_long_message(client, token, chat_id, final_text).await?;
+    }
+    Ok(())
+}
+
 async fn stream_chat_reply(
     client: &Client,
     token: &str,
@@ -2245,26 +2285,7 @@ async fn stream_chat_reply(
         safe = "Siap. Coba kirim ulang dengan sedikit detail tambahan ya.".to_string();
     }
 
-    if let Some(message_id) = placeholder_id {
-        if safe.len() <= 4000 {
-            if edit_message_text(client, token, chat_id, message_id, &safe).await.is_err() {
-                send_long_message(client, token, chat_id, &safe).await?;
-            }
-        } else {
-            let first_window = safe.len().min(4000);
-            let first_chunk_end = safe[..first_window].rfind('\n').unwrap_or(first_window);
-            let first_chunk = &safe[..first_chunk_end];
-            if edit_message_text(client, token, chat_id, message_id, first_chunk).await.is_err() {
-                send_message(client, token, chat_id, first_chunk).await?;
-            }
-            let remaining = safe[first_chunk_end..].trim_start();
-            if !remaining.is_empty() {
-                send_long_message(client, token, chat_id, remaining).await?;
-            }
-        }
-    } else {
-        send_long_message(client, token, chat_id, &safe).await?;
-    }
+    send_placeholder_then_finalize(client, token, chat_id, "💭 Lagi mikir...", &safe).await?;
 
     Ok(safe)
 }
