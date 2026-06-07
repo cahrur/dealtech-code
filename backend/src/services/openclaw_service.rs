@@ -1024,7 +1024,7 @@ pub async fn route_prompt(config: &Config, input: &OpenClawRunInput) -> Result<R
         agent_id: input.agent_id.clone(),
         session_key: format!("{}:route", input.session_key),
         user_id: input.user_id.clone(),
-        instructions: "You are an intent router for a coding assistant app. Return JSON only with shape {\"intent\":\"smalltalk|coding_task|retry_push\",\"reply\":\"optional short user-facing reply\"}. Choose retry_push only when user mainly asks to push/try push again without asking for new code changes. Choose smalltalk for greetings or casual clarification. Choose coding_task for anything that asks to create/edit/debug/write files or code. Do not include any text outside JSON.".to_string(),
+        instructions: "You are an intent router for a coding assistant app. Return JSON only with shape {\"intent\":\"smalltalk|chat|coding_task|retry_push\",\"reply\":\"optional short user-facing reply\"}. Choose retry_push only when user mainly asks to push/try push again without asking for new code changes. Choose smalltalk for greetings or very casual lightweight chatter. Choose chat for conceptual questions, brainstorming, explanation, advice, planning, strategy, opinion, and general discussion even when the topic is software, projects, deadlines, clean code, architecture, or engineering. Choose coding_task only when the user clearly wants concrete execution on code, files, repo, branch, bug fixing, implementation, editing, commit, push, debugging, or continuing an existing code task. When unsure, prefer chat over coding_task. Do not include any text outside JSON.".to_string(),
         prompt: format!("Route this user message: {}", input.prompt),
         model: input.model.clone(),
         history: vec![],

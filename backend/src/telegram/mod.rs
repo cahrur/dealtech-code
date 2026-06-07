@@ -1877,13 +1877,47 @@ async fn handle_regular_message(
 
     let started_at = std::time::Instant::now();
 
-    // Fast path for light chat: avoid creating agent run / workspace prep.
-    let route = crate::services::openclaw_service::classify_prompt(text);
+    // Non-command messages are routed by AI first; fallback classifier is only a safety net.
+    let early_router_placeholder_started = std::time::Instant::now();
+    let router_placeholder_id = send_message_with_id(
+        client,
+        &config.telegram_bot_token,
+        chat_id,
+        "💭 Lagi mikir...",
+    ).await.ok();
+    tracing::info!(
+        chat_id,
+        elapsed_ms = started_at.elapsed().as_millis(),
+        step_ms = early_router_placeholder_started.elapsed().as_millis(),
+        has_placeholder = router_placeholder_id.is_some(),
+        "Telegram fast chat step: sent router placeholder"
+    );
+
+    let router_started = std::time::Instant::now();
+    let route_input = crate::services::openclaw_service::OpenClawRunInput {
+        agent_id: "default".to_string(),
+        session_key: format!("telegram_route_{}_{}", tg_user.user_id, project_id),
+        user_id: tg_user.user_id.to_string(),
+        instructions: String::new(),
+        prompt: text.to_string(),
+        model: "openclaw".to_string(),
+        history: vec![],
+    };
+    let route_decision = crate::services::openclaw_service::route_prompt(config, &route_input).await.ok();
+    let mut route = match route_decision.as_ref().map(|d| d.intent.as_str()) {
+        Some("smalltalk") => crate::services::openclaw_service::PromptRoute::Smalltalk,
+        Some("chat") => crate::services::openclaw_service::PromptRoute::Chat,
+        Some("retry_push") => crate::services::openclaw_service::PromptRoute::RetryPush,
+        Some("coding_task") => crate::services::openclaw_service::PromptRoute::CodingTask,
+        _ => crate::services::openclaw_service::classify_prompt(text),
+    };
     tracing::info!(
         chat_id,
         prompt_len = text.len(),
         route = ?route,
         elapsed_ms = started_at.elapsed().as_millis(),
+        step_ms = router_started.elapsed().as_millis(),
+        used_ai_router = route_decision.is_some(),
         "Telegram fast chat step: classified prompt"
     );
 
@@ -1908,13 +1942,20 @@ async fn handle_regular_message(
         );
 
         let finalize_started = std::time::Instant::now();
-        send_placeholder_then_finalize(
-            client,
-            &config.telegram_bot_token,
-            chat_id,
-            "💭 Lagi mikir...",
-            &reply,
-        ).await?;
+        if let Some(message_id) = router_placeholder_id {
+            if let Err(e) = edit_message_text(client, &config.telegram_bot_token, chat_id, message_id, &reply).await {
+                tracing::error!(chat_id, message_id, error = %e, "Telegram router placeholder finalize edit failed");
+                send_long_message(client, &config.telegram_bot_token, chat_id, &reply).await?;
+            }
+        } else {
+            send_placeholder_then_finalize(
+                client,
+                &config.telegram_bot_token,
+                chat_id,
+                "💭 Lagi mikir...",
+                &reply,
+            ).await?;
+        }
         tracing::info!(
             chat_id,
             elapsed_ms = started_at.elapsed().as_millis(),
@@ -1982,20 +2023,7 @@ async fn handle_regular_message(
     }
 
     if matches!(route, crate::services::openclaw_service::PromptRoute::Chat) {
-        let early_placeholder_started = std::time::Instant::now();
-        let early_placeholder_id = send_message_with_id(
-            client,
-            &config.telegram_bot_token,
-            chat_id,
-            "💭 Lagi mikir...",
-        ).await.ok();
-        tracing::info!(
-            chat_id,
-            elapsed_ms = started_at.elapsed().as_millis(),
-            step_ms = early_placeholder_started.elapsed().as_millis(),
-            has_placeholder = early_placeholder_id.is_some(),
-            "Telegram fast chat step: sent early chat placeholder"
-        );
+        let early_placeholder_id = router_placeholder_id;
         let project_lookup_started = std::time::Instant::now();
         let project = sqlx::query_as::<_, (String, String, String)>(
             "SELECT slug, repo_url, openclaw_agent_id FROM projects WHERE id = $1"
