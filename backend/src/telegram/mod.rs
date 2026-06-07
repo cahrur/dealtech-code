@@ -2555,6 +2555,23 @@ async fn send_message(
     Ok(())
 }
 
+fn convert_markdown_for_telegram(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    for line in text.lines() {
+        let line = if line.starts_with("### ") { &line[4..] }
+            else if line.starts_with("## ") { &line[3..] }
+            else if line.starts_with("# ") { &line[2..] }
+            else { line };
+        let line = line.replace("**", "*");
+        let line = line.replace("__", "_");
+        let line = line.replace("~~", "");
+        result.push_str(&line);
+        result.push('\n');
+    }
+    if result.ends_with('\n') { result.pop(); }
+    result
+}
+
 async fn send_message_with_id(
     client: &Client,
     token: &str,
@@ -2562,14 +2579,20 @@ async fn send_message_with_id(
     text: &str,
 ) -> anyhow::Result<i64> {
     let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
-    let body = serde_json::json!({
+    let converted = convert_markdown_for_telegram(text);
+    let body_md = serde_json::json!({
+        "chat_id": chat_id,
+        "text": converted,
+        "parse_mode": "Markdown",
+    });
+    let body_plain = serde_json::json!({
         "chat_id": chat_id,
         "text": text,
     });
 
     let mut retries = 0u32;
     loop {
-        let resp = client.post(&url).json(&body).send().await?;
+        let resp = client.post(&url).json(&body_md).send().await?;
         if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
             retries += 1;
             if retries > 5 {
@@ -2586,15 +2609,28 @@ async fn send_message_with_id(
         }
         let status = resp.status();
         let parsed: TelegramResponse<TelegramMessage> = resp.json().await?;
-        if !status.is_success() || !parsed.ok {
+        if status.is_success() && parsed.ok {
+            let message_id = parsed
+                .result
+                .map(|m| m.message_id)
+                .ok_or_else(|| anyhow::anyhow!("Telegram sendMessage missing message_id"))?;
+            return Ok(message_id);
+        }
+
+        let markdown_desc = parsed.description.unwrap_or_else(|| "unknown error".to_string());
+        tracing::warn!(chat_id, status = %status, error = %markdown_desc, "Telegram Markdown send failed; retrying as plain text");
+        let resp_plain = client.post(&url).json(&body_plain).send().await?;
+        let status_plain = resp_plain.status();
+        let parsed_plain: TelegramResponse<TelegramMessage> = resp_plain.json().await?;
+        if !status_plain.is_success() || !parsed_plain.ok {
             anyhow::bail!(
                 "Telegram sendMessage failed with status {} code {:?}: {}",
-                status,
-                parsed.error_code,
-                parsed.description.unwrap_or_else(|| "unknown error".to_string())
+                status_plain,
+                parsed_plain.error_code,
+                parsed_plain.description.unwrap_or_else(|| "unknown error".to_string())
             );
         }
-        let message_id = parsed
+        let message_id = parsed_plain
             .result
             .map(|m| m.message_id)
             .ok_or_else(|| anyhow::anyhow!("Telegram sendMessage missing message_id"))?;
@@ -2625,14 +2661,29 @@ async fn edit_message_text(
     text: &str,
 ) -> anyhow::Result<()> {
     let url = format!("https://api.telegram.org/bot{}/editMessageText", token);
-    let body = serde_json::json!({
+    let converted = convert_markdown_for_telegram(text);
+    let body_md = serde_json::json!({
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": converted,
+        "parse_mode": "Markdown",
+    });
+    let resp = client.post(&url).json(&body_md).send().await?;
+    if resp.status().is_success() {
+        return Ok(());
+    }
+
+    let err_md = resp.text().await.unwrap_or_default();
+    tracing::warn!(chat_id, message_id, error = %err_md, "Telegram Markdown edit failed; retrying as plain text");
+
+    let body_plain = serde_json::json!({
         "chat_id": chat_id,
         "message_id": message_id,
         "text": text,
     });
-    let resp = client.post(&url).json(&body).send().await?;
-    if !resp.status().is_success() {
-        let err = resp.text().await.unwrap_or_default();
+    let resp_plain = client.post(&url).json(&body_plain).send().await?;
+    if !resp_plain.status().is_success() {
+        let err = resp_plain.text().await.unwrap_or_default();
         tracing::error!(chat_id, message_id, error = %err, "Telegram editMessageText failed");
         anyhow::bail!("Telegram editMessageText failed: {}", err);
     }
