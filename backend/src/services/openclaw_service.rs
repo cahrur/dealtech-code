@@ -927,6 +927,18 @@ pub fn is_chat_prompt(prompt: &str) -> bool {
     }
 
     let lowered = trimmed.to_lowercase();
+    let conversational_markers = [
+        "gimana", "bagaimana", "kenapa", "maksudnya", "jelasin", "jelaskan", "tolong jelasin",
+        "bisa bantu", "apa itu", "siapa kamu", "lanjut yang tadi", "lanjut", "ringkas", "summary",
+        "kok", "boleh", "perlu apa", "opsi", "saran", "rekomendasi", "bedanya", "contohnya",
+        "prinsip", "konsep", "teori",
+    ];
+
+    let looks_conversational = conversational_markers.iter().any(|m| lowered.contains(m));
+    if looks_conversational {
+        return true;
+    }
+
     let code_or_repo_markers = [
         "buat", "bikin", "tulis", "edit", "ubah", "refactor", "debug", "fix",
         "commit", "push", "pull request", "pr", "branch", "repo", "github", "git",
@@ -939,18 +951,10 @@ pub fn is_chat_prompt(prompt: &str) -> bool {
         return false;
     }
 
-    let conversational_markers = [
-        "gimana", "bagaimana", "kenapa", "maksudnya", "jelasin", "jelaskan", "tolong jelasin",
-        "bisa bantu", "apa itu", "siapa kamu", "lanjut yang tadi", "lanjut", "ringkas", "summary",
-        "kok", "boleh", "perlu apa", "opsi", "saran", "rekomendasi", "bedanya", "contohnya",
-        "prinsip", "konsep", "teori",
-    ];
-
-    let looks_conversational = conversational_markers.iter().any(|m| lowered.contains(m));
     let line_count = trimmed.lines().count();
     let word_count = trimmed.split_whitespace().count();
 
-    looks_conversational || (line_count <= 3 && word_count <= 40)
+    line_count <= 3 && word_count <= 40
 }
 
 pub fn should_escalate_chat_to_coding(prompt: &str, task_summary: Option<&str>) -> bool {
