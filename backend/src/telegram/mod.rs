@@ -3,6 +3,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use sqlx::PgPool;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::config::Config;
@@ -12,6 +13,8 @@ use crate::services::run_orchestrator;
 struct TelegramResponse<T> {
     ok: bool,
     result: Option<T>,
+    description: Option<String>,
+    error_code: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -77,6 +80,19 @@ pub async fn start_polling(config: Arc<Config>, db: PgPool, redis: ConnectionMan
         .build()
         .unwrap_or_default();
     let mut offset: i64 = 0;
+
+    // Persistent scan-result deliverer: survives backend restarts.
+    // Worker pushes finished chat_ids to the `scan:delivery` Redis list; this
+    // task drains it and sends the report. If the backend restarts mid-scan,
+    // the result stays queued in Redis and is delivered once we're back up.
+    {
+        let deliver_client = api_client.clone();
+        let deliver_config = config.clone();
+        let deliver_redis = redis.clone();
+        tokio::spawn(async move {
+            scan_result_deliverer(deliver_client, deliver_config, deliver_redis).await;
+        });
+    }
 
     loop {
         match get_updates(&polling_client, &config.telegram_bot_token, offset).await {
@@ -263,6 +279,11 @@ async fn handle_command(
         "/runs" => cmd_runs(client, config, db, tg_user, chat_id).await?,
         "/cost" => cmd_cost(client, config, db, tg_user, chat_id, &parts).await?,
         "/status" => cmd_status(client, config, db, tg_user, chat_id).await?,
+        "/scan" => cmd_scan(client, config, db, tg_user, chat_id, &parts, redis.clone()).await?,
+        "/setauth" => cmd_setauth(client, config, chat_id, &parts, &mut redis).await?,
+        "/clearauth" => cmd_clearauth(client, config, chat_id, &mut redis).await?,
+        "/scanstatus" => cmd_scanstatus(client, config, chat_id, &mut redis).await?,
+        "/cancelscan" => cmd_cancelscan(client, config, chat_id, &mut redis).await?,
         "/help" => cmd_help(client, config, db, &tg_user, chat_id).await?,
         "/adduser" => cmd_adduser(client, config, db, tg_user, chat_id, &parts).await?,
         "/removeuser" => cmd_removeuser(client, config, db, tg_user, chat_id, &parts).await?,
@@ -815,16 +836,25 @@ async fn cmd_newsession(
         }
     };
 
-    // Set force_new_branch flag in Redis — consumed once by next run
-    let force_key = format!("tg:force_new_branch:{}:{}", tg_user.user_id, project_id);
+    // Force a fresh session+branch once on the next user message.
+    // Default behaviour should be session reuse; /newsession is the explicit reset.
+    let force_branch_key = format!("tg:force_new_branch:{}:{}", tg_user.user_id, project_id);
     let _: std::result::Result<(), _> = redis::cmd("SETEX")
-        .arg(&force_key)
+        .arg(&force_branch_key)
         .arg(86400u64)
         .arg("1")
         .query_async(redis)
         .await;
 
-    // Also clear any pinned session so get_or_create_session makes a fresh one
+    let force_session_key = format!("tg:force_new_session:{}:{}", tg_user.user_id, project_id);
+    let _: std::result::Result<(), _> = redis::cmd("SETEX")
+        .arg(&force_session_key)
+        .arg(86400u64)
+        .arg("1")
+        .query_async(redis)
+        .await;
+
+    // Clear the cached pin too so the next lookup cannot accidentally reuse stale state.
     let pin_key = format!("tg:pinned_session:{}:{}", tg_user.user_id, project_id);
     let _: std::result::Result<(), _> = redis::cmd("DEL")
         .arg(&pin_key)
@@ -1102,6 +1132,547 @@ async fn cmd_cost(
     Ok(())
 }
 
+// Mask a secret for display so the bot never echoes the real value back:
+// keep only the last 4 chars, e.g. "...a1b2". Empty/short -> fully masked.
+fn mask_secret(s: &str) -> String {
+    let n = s.chars().count();
+    if n <= 4 { "****".to_string() } else { format!("...{}", &s[s.len().saturating_sub(4)..]) }
+}
+
+// /setauth <type> <value...> — store scan auth for THIS chat in Redis (TTL 2h).
+// type: cookie | bearer | header   (header value form: "Name: Value")
+// SECURITY: the raw value is never echoed back (only masked) and is never
+// written to logs. Stored short-lived in Redis, auto-expires after 2h.
+async fn cmd_setauth(
+    client: &Client,
+    config: &Config,
+    chat_id: i64,
+    parts: &[&str],
+    redis: &mut ConnectionManager,
+) -> anyhow::Result<()> {
+    let kind = parts.get(1).unwrap_or(&"").trim().to_lowercase();
+    let is_refresh = kind == "refresh";
+    let refresh_url = if is_refresh {
+        parts.get(3).map(|s| s.trim().to_string()).unwrap_or_default()
+    } else { String::new() };
+    let value: String = if is_refresh {
+        parts.get(2).map(|s| s.trim().to_string()).unwrap_or_default()
+    } else {
+        parts.get(2..).map(|p| p.join(" ")).unwrap_or_default().trim().to_string()
+    };
+
+    let valid_kind = matches!(kind.as_str(), "cookie" | "bearer" | "header" | "refresh");
+    if !valid_kind || value.is_empty() {
+        send_message(client, &config.telegram_bot_token, chat_id,
+            "🔐 Set kredensial untuk authenticated scan (berlaku 2 jam)\n\n\
+            Gunakan: /setauth <type> <value>\n\n\
+            Type:\n\
+            • cookie — /setauth cookie SESSIONID=abc123; role=admin\n\
+            • bearer — /setauth bearer eyJhbGci...\n\
+            • header — /setauth header X-Api-Key: rahasia\n\
+            • refresh — /setauth refresh <refresh_token> [refresh_url]\n\
+               (tukar refresh→access token tiap scan; url default <target>/api/auth/refresh)\n\n\
+            Setelah diset, /scan <url> <mode> otomatis pakai auth ini \
+            (nuclei/dalfox/sqlmap). Hapus dengan /clearauth.\n\n\
+            ⚠️ Nilai kredensial akan terlihat di history chat Telegram & \
+            tersimpan sementara di server. Jangan pakai kredensial produksi \
+            yang sensitif kalau tidak perlu.").await?;
+        return Ok(());
+    }
+
+    let mut payload = serde_json::json!({ "kind": kind, "value": value });
+    if is_refresh && !refresh_url.is_empty() {
+        payload["refresh_url"] = serde_json::json!(refresh_url);
+    }
+    let key = format!("scan:auth:{}", chat_id);
+    let _: () = redis::cmd("SET")
+        .arg(&key)
+        .arg(payload.to_string())
+        .arg("EX").arg(7200) // 2 hours
+        .query_async(redis)
+        .await
+        .unwrap_or(());
+
+    send_message(client, &config.telegram_bot_token, chat_id,
+        &format!("🔐 Auth tersimpan untuk scan kamu (berlaku 2 jam).\n\n\
+        Type: {}\nValue: {}\n\n\
+        Scan berikutnya otomatis pakai auth ini. /clearauth untuk hapus.",
+        kind, mask_secret(&value))).await?;
+    Ok(())
+}
+
+// /clearauth — remove stored scan auth for this chat.
+async fn cmd_clearauth(
+    client: &Client,
+    config: &Config,
+    chat_id: i64,
+    redis: &mut ConnectionManager,
+) -> anyhow::Result<()> {
+    let key = format!("scan:auth:{}", chat_id);
+    let _: () = redis::cmd("DEL").arg(&key).query_async(redis).await.unwrap_or(());
+    send_message(client, &config.telegram_bot_token, chat_id,
+        "🔓 Auth scan dihapus. Scan berikutnya jalan sebagai anonim.").await?;
+    Ok(())
+}
+
+async fn cmd_scan(
+    client: &Client,
+    config: &Config,
+    db: &PgPool,
+    tg_user: &TelegramDbUser,
+    chat_id: i64,
+    parts: &[&str],
+    mut redis: ConnectionManager,
+) -> anyhow::Result<()> {
+    // Usage: /scan <url> [mode]
+    // Modes: quick (default), full, recon, cves, misconfig, exposure
+    let url = parts.get(1).unwrap_or(&"").trim();
+    if url.is_empty() {
+        send_message(client, &config.telegram_bot_token, chat_id,
+            "🔒 Security Scanner\n\n\
+            Gunakan: /scan <url> [mode]\n\n\
+            Mode:\n\
+            • quick — Top critical checks (default, ~2-5 min)\n\
+            • full — Semua templates (~15-30 min)\n\
+            • recon — Reconnaissance only\n\
+            • cves — Known CVEs\n\
+            • misconfig — Misconfigurations\n\
+            • exposure — Exposed files/panels\n\
+            • sqli — Active SQL injection test (sqlmap)\n\
+            • xss — Active XSS test (dalfox)\n\
+            • tls — TLS/SSL config audit (testssl.sh)\n\
+            • deps — Dependency CVE + secret + IaC scan repo git (trivy)\n\
+            • discovery — Petakan subdomain & host hidup (subfinder+httpx)\n\n\
+            Contoh:\n\
+            /scan https://myapp.com\n\
+            /scan https://myapp.com full\n\
+            /scan https://myapp.com/page?id=1 sqli\n\
+            /scan https://github.com/user/repo deps\n\
+            /scan siwanu.com discovery").await?;
+        return Ok(());
+    }
+
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        send_message(client, &config.telegram_bot_token, chat_id,
+            "❌ URL harus dimulai dengan http:// atau https://").await?;
+        return Ok(());
+    }
+
+    let mode = parts.get(2).unwrap_or(&"quick").trim();
+    let valid_modes = ["quick", "full", "recon", "cves", "misconfig", "exposure", "sqli", "xss", "tls", "deps", "discovery"];
+    if !valid_modes.contains(&mode) {
+        send_message(client, &config.telegram_bot_token, chat_id,
+            &format!("❌ Mode tidak valid: {}\nPilih: quick, full, recon, cves, misconfig, exposure, sqli, xss, tls, deps, discovery", mode)).await?;
+        return Ok(());
+    }
+
+    // Prevent the same chat from queueing two scans at once
+    let active_self: Option<String> = redis::cmd("GET")
+        .arg(format!("scan:active:{}", chat_id))
+        .query_async(&mut redis)
+        .await
+        .unwrap_or(None);
+    if active_self.is_some() {
+        send_message(client, &config.telegram_bot_token, chat_id,
+            "⚠️ Kamu sudah punya scan yang sedang berjalan atau mengantri.\n\
+            Gunakan /scanstatus untuk cek, atau /cancelscan untuk membatalkan.").await?;
+        return Ok(());
+    }
+
+    // Check if another scan is already running (single-scan policy)
+    let running_for: Option<String> = redis::cmd("GET")
+        .arg("scan:running")
+        .query_async(&mut redis)
+        .await
+        .unwrap_or(None);
+    let queue_len: i64 = redis::cmd("LLEN")
+        .arg("scan:queue")
+        .query_async(&mut redis)
+        .await
+        .unwrap_or(0);
+
+    // Load stored auth for this chat (if any) so the scan runs authenticated.
+    let auth_key = format!("scan:auth:{}", chat_id);
+    let auth_raw: Option<String> = redis::cmd("GET")
+        .arg(&auth_key)
+        .query_async(&mut redis)
+        .await
+        .unwrap_or(None);
+    let auth_val: Option<serde_json::Value> =
+        auth_raw.as_deref().and_then(|s| serde_json::from_str(s).ok());
+    let auth_note = if auth_val.is_some() { "\n🔐 Mode: authenticated" } else { "" };
+
+    if running_for.is_some() {
+        // Position = scans already queued ahead + the one currently running
+        let position = queue_len + 1;
+        send_message(client, &config.telegram_bot_token, chat_id,
+            &format!("⏳ Ada scan lain yang sedang berjalan.\n\n\
+            🎯 Target kamu: {}\n📋 Mode: {}{}\n🔢 Posisi antrian: #{}\n\n\
+            Scan kamu akan diproses otomatis setelah antrian selesai. \
+            Aku kabari kalau sudah jalan dan setelah selesai.", url, mode, auth_note, position)).await?;
+    } else {
+        send_message(client, &config.telegram_bot_token, chat_id,
+            &format!("🔒 Memulai security scan...\n\n🎯 Target: {}\n📋 Mode: {}{}\n\n⏳ Ini bisa memakan waktu beberapa menit.", url, mode, auth_note)).await?;
+    }
+
+    // Store scan state in Redis
+    let scan_key = format!("scan:active:{}", chat_id);
+    let scan_info = serde_json::json!({
+        "url": url,
+        "mode": mode,
+        "started_at": format!("{}", std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default().as_secs()),
+        "status": "running"
+    });
+    let _: () = redis::cmd("SET")
+        .arg(&scan_key)
+        .arg(scan_info.to_string())
+        .arg("EX").arg(3600)
+        .query_async(&mut redis)
+        .await
+        .unwrap_or(());
+
+    // Push scan job to queue (worker on host picks it up). Include auth when set.
+    let mut job = serde_json::json!({
+        "url": url,
+        "mode": mode,
+        "chat_id": chat_id
+    });
+    if let Some(a) = auth_val {
+        job["auth"] = a;
+    }
+    let _: () = redis::cmd("LPUSH")
+        .arg("scan:queue")
+        .arg(job.to_string())
+        .query_async(&mut redis)
+        .await
+        .unwrap_or(());
+
+    // Delivery is handled by the persistent scan_result_deliverer task (see
+    // start_polling). The worker pushes the chat_id to `scan:delivery` when the
+    // scan finishes, so results survive backend restarts.
+
+    Ok(())
+}
+
+// Persistent scan-result deliverer. Drains the `scan:delivery` Redis list
+// (chat_ids pushed by the host worker when a scan finishes) and sends the
+// formatted report. Because it reads from Redis rather than per-request memory,
+// results survive a backend restart/crash that happens mid-scan.
+async fn scan_result_deliverer(
+    client: Client,
+    config: Arc<Config>,
+    mut redis: ConnectionManager,
+) {
+    tracing::info!("Scan result deliverer started");
+    loop {
+        // BRPOP blocks up to 30s; returns [list_name, value] on hit.
+        let popped: Option<(String, String)> = redis::cmd("BRPOP")
+            .arg("scan:delivery")
+            .arg(30)
+            .query_async(&mut redis)
+            .await
+            .unwrap_or(None);
+
+        let chat_id_str = match popped {
+            Some((_, v)) => v,
+            None => continue, // timeout, loop again
+        };
+
+        let chat_id: i64 = match chat_id_str.trim().parse() {
+            Ok(id) => id,
+            Err(_) => {
+                tracing::warn!(value = %chat_id_str, "deliverer: bad chat_id");
+                continue;
+            }
+        };
+
+        let result_key = format!("scan:result:{}", chat_id);
+        let scan_key = format!("scan:active:{}", chat_id);
+
+        let data: Option<String> = redis::cmd("GET")
+            .arg(&result_key)
+            .query_async(&mut redis)
+            .await
+            .unwrap_or(None);
+
+        let data = match data {
+            Some(d) => d,
+            None => {
+                tracing::warn!(chat_id = %chat_id, "deliverer: no result payload");
+                continue;
+            }
+        };
+
+        let report = format_scan_report(&data);
+        if report.is_empty() {
+            let _ = send_message(&client, &config.telegram_bot_token, chat_id,
+                "✅ Scan selesai!\n\nTidak ditemukan vulnerability.\n\n\
+                ⚠️ Note: Automated scanner hanya mendeteksi ~30-40% vulnerability.").await;
+        } else {
+            let _ = send_long_message(&client, &config.telegram_bot_token, chat_id, &report).await;
+            // Also send downloadable HTML + JSON reports (actionable/auditable).
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default().as_secs();
+            let html = build_html_report(&data);
+            if !html.is_empty() {
+                let _ = send_scan_document(&client, &config.telegram_bot_token, chat_id,
+                    html.into_bytes(), &format!("scan_report_{}.html", ts),
+                    "text/html", "📄 Report HTML (buka di browser)").await;
+            }
+            // Pretty-print JSON for the machine-readable export.
+            let json_pretty = serde_json::from_str::<serde_json::Value>(&data)
+                .ok().and_then(|v| serde_json::to_vec_pretty(&v).ok())
+                .unwrap_or_else(|| data.clone().into_bytes());
+            let _ = send_scan_document(&client, &config.telegram_bot_token, chat_id,
+                json_pretty, &format!("scan_report_{}.json", ts),
+                "application/json", "🗂 Report JSON (machine-readable)").await;
+        }
+
+        // Clean up markers
+        let _: () = redis::cmd("DEL").arg(&result_key)
+            .query_async(&mut redis).await.unwrap_or(());
+        let _: () = redis::cmd("DEL").arg(&scan_key)
+            .query_async(&mut redis).await.unwrap_or(());
+
+        tracing::info!(chat_id = %chat_id, "deliverer: report sent");
+    }
+}
+
+// Build a downloadable HTML report from the raw scan result JSON.
+// Self-contained (inline CSS), grouped by severity, safe-escaped.
+fn build_html_report(data: &str) -> String {
+    fn esc(s: &str) -> String {
+        s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+         .replace('"', "&quot;")
+    }
+    let parsed: serde_json::Value = match serde_json::from_str(data) {
+        Ok(v) => v,
+        Err(_) => return String::new(),
+    };
+    let empty = vec![];
+    let findings = parsed["findings"].as_array().unwrap_or(&empty);
+    let order = ["critical", "high", "medium", "low", "info"];
+    let mut rows = String::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for sev in order {
+        for f in findings {
+            let fsev = f["info"]["severity"].as_str().unwrap_or("info");
+            if fsev != sev { continue; }
+            let name = f["info"]["name"].as_str().unwrap_or("Unknown");
+            let tid = f["template-id"].as_str().unwrap_or("unknown");
+            let key = format!("{}|{}", name, tid);
+            if !seen.insert(key) { continue; }
+            let matched = f["matched-at"].as_str()
+                .or_else(|| f["host"].as_str()).unwrap_or("N/A");
+            let desc = f["info"]["description"].as_str().unwrap_or("");
+            rows.push_str(&format!(
+                "<tr class=\"{}\"><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>\n",
+                esc(sev), esc(&sev.to_uppercase()), esc(name), esc(tid),
+                esc(matched), esc(desc)));
+        }
+    }
+    let total = seen.len();
+    format!(r####"<!DOCTYPE html><html lang="id"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Security Scan Report</title><style>
+body{{font-family:system-ui,Arial,sans-serif;margin:24px;color:#1a1a1a;background:#fafafa}}
+h1{{font-size:20px}} .meta{{color:#666;font-size:13px;margin-bottom:16px}}
+table{{border-collapse:collapse;width:100%;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.1)}}
+th,td{{padding:8px 10px;text-align:left;border-bottom:1px solid #eee;font-size:13px;vertical-align:top}}
+th{{background:#222;color:#fff;position:sticky;top:0}}
+td:first-child{{font-weight:700;white-space:nowrap}}
+tr.critical td:first-child{{color:#c0392b}} tr.high td:first-child{{color:#e67e22}}
+tr.medium td:first-child{{color:#b7950b}} tr.low td:first-child{{color:#2980b9}}
+tr.info td:first-child{{color:#7f8c8d}}
+</style></head><body>
+<h1>&#128274; Security Scan Report</h1>
+<div class="meta">Total temuan: <b>{}</b> &middot; Dibuat oleh Dealtech Code Scanner</div>
+<table><thead><tr><th>Severity</th><th>Nama</th><th>Template</th><th>Lokasi</th><th>Detail</th></tr></thead>
+<tbody>{}</tbody></table>
+<p class="meta">&#9888;&#65039; Automated scanner mendeteksi ~30-40% vulnerability. Hasil ini bukan jaminan aman; tetap perlu review manual.</p>
+</body></html>"####, total, rows)
+}
+
+fn format_scan_report(data: &str) -> String {
+    let parsed: serde_json::Value = match serde_json::from_str(data) {
+        Ok(v) => v,
+        Err(_) => return String::new(),
+    };
+
+    let findings = match parsed["findings"].as_array() {
+        Some(f) if !f.is_empty() => f,
+        _ => return String::new(),
+    };
+
+    let mut critical = 0u32;
+    let mut high = 0u32;
+    let mut medium = 0u32;
+    let mut low = 0u32;
+    let mut info = 0u32;
+    let mut finding_lines: Vec<String> = Vec::new();
+    // Collapse duplicate findings (same name+template repeated across many URLs)
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for f in findings {
+        let name = f["info"]["name"].as_str().unwrap_or("Unknown");
+        let sev = f["info"]["severity"].as_str().unwrap_or("unknown");
+        let matched = f["matched-at"].as_str()
+            .or_else(|| f["host"].as_str())
+            .unwrap_or("N/A");
+        let template_id = f["template-id"].as_str().unwrap_or("unknown");
+
+        // Dedupe: same name + template = same issue type, show once
+        let key = format!("{}|{}", name, template_id);
+        if !seen.insert(key) {
+            continue;
+        }
+
+        match sev {
+            "critical" => critical += 1,
+            "high" => high += 1,
+            "medium" => medium += 1,
+            "low" => low += 1,
+            _ => info += 1,
+        }
+
+        let icon = match sev {
+            "critical" => "🔴",
+            "high" => "🟠",
+            "medium" => "🟡",
+            "low" => "🔵",
+            _ => "⚪",
+        };
+
+        finding_lines.push(format!(
+            "{} [{}] {}\n   Template: {}\n   URL: {}",
+            icon, sev.to_uppercase(), name, template_id, matched
+        ));
+    }
+
+    let total = critical + high + medium + low + info;
+    let mut report = format!("🔒 Security Scan Report\n\n📊 Total: {} finding(s)\n", total);
+    if critical > 0 { report.push_str(&format!("🔴 Critical: {}\n", critical)); }
+    if high > 0 { report.push_str(&format!("🟠 High: {}\n", high)); }
+    if medium > 0 { report.push_str(&format!("🟡 Medium: {}\n", medium)); }
+    if low > 0 { report.push_str(&format!("🔵 Low: {}\n", low)); }
+    if info > 0 { report.push_str(&format!("⚪ Info: {}\n", info)); }
+    report.push_str("\n━━━━━━━━━━━━━━━━━━━━\n\n");
+    report.push_str(&finding_lines.join("\n\n"));
+    report.push_str("\n\n━━━━━━━━━━━━━━━━━━━━\n");
+    // Footer hint depends on what was scanned. If this report already contains
+    // an active SQLi finding (sqlmap), the signature-mode disclaimer would be
+    // contradictory — so only show the "use sqli mode" hint for nuclei scans.
+    let tid = |id: &str| findings.iter().any(|f| {
+        f["template-id"].as_str().map(|t| t.starts_with(id)).unwrap_or(false)
+    });
+    let has_sqli = tid("sqlmap-sqli");
+    let has_xss = tid("dalfox-xss");
+    let has_tls = tid("testssl-");
+    let has_deps = tid("trivy-");
+    if has_deps {
+        report.push_str("⚠️ Temuan dependency/secret/IaC dari repo — update library ke versi fixed, rotasi & cabut secret yang bocor, perbaiki misconfig.\n");
+        report.push_str("💡 Cek lainnya: /scan <url> full  |  /scan <url> xss  |  /scan <url> tls");
+    } else if has_sqli {
+        report.push_str("⚠️ SQL injection terdeteksi — perbaiki dengan parameterized query / prepared statement.\n");
+        report.push_str("💡 Cek lainnya: /scan <url> full  |  /scan <url> xss  |  /scan <url> tls");
+    } else if has_xss {
+        report.push_str("⚠️ XSS terdeteksi — sanitasi/escape output & pakai Content-Security-Policy.\n");
+        report.push_str("💡 Cek lainnya: /scan <url> full  |  /scan <url>?param=nilai sqli  |  /scan <url> tls");
+    } else if has_tls {
+        report.push_str("⚠️ Masalah TLS/SSL terdeteksi — perbaiki cipher/protokol lemah & sertifikat.\n");
+        report.push_str("💡 Cek lainnya: /scan <url> full  |  /scan <url> xss  |  /scan <url>?param=nilai sqli");
+    } else {
+        report.push_str("⚠️ Mode signature (quick/full/cves/misconfig/exposure) cek misconfig, CVE, exposed files — BUKAN uji SQLi/XSS aktif.\n");
+        report.push_str("💡 Uji aktif: /scan <url> sqli  |  /scan <url> xss  |  /scan <url> tls");
+    }
+
+    report
+}
+
+async fn cmd_scanstatus(
+    client: &Client,
+    config: &Config,
+    chat_id: i64,
+    redis: &mut ConnectionManager,
+) -> anyhow::Result<()> {
+    let scan_key = format!("scan:active:{}", chat_id);
+    let scan_data: Option<String> = redis::cmd("GET")
+        .arg(&scan_key)
+        .query_async(redis)
+        .await
+        .unwrap_or(None);
+
+    match scan_data {
+        Some(data) => {
+            if let Ok(info) = serde_json::from_str::<serde_json::Value>(&data) {
+                let url = info["url"].as_str().unwrap_or("unknown");
+                let mode = info["mode"].as_str().unwrap_or("unknown");
+                let started_secs = info["started_at"].as_str()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default().as_secs();
+                let elapsed = now_secs.saturating_sub(started_secs);
+                let elapsed_str = if started_secs == 0 {
+                    "tidak diketahui".to_string()
+                } else if elapsed < 60 {
+                    format!("{} detik lalu", elapsed)
+                } else {
+                    format!("{} menit {} detik lalu", elapsed / 60, elapsed % 60)
+                };
+                send_message(client, &config.telegram_bot_token, chat_id,
+                    &format!("🔄 Scan sedang berjalan\n\n🎯 Target: {}\n📋 Mode: {}\n⏱ Mulai: {}", url, mode, elapsed_str)).await?;
+            } else {
+                send_message(client, &config.telegram_bot_token, chat_id,
+                    "🔄 Ada scan yang sedang berjalan.").await?;
+            }
+        }
+        None => {
+            send_message(client, &config.telegram_bot_token, chat_id,
+                "✅ Tidak ada scan yang sedang berjalan.").await?;
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_cancelscan(
+    client: &Client,
+    config: &Config,
+    chat_id: i64,
+    redis: &mut ConnectionManager,
+) -> anyhow::Result<()> {
+    let scan_key = format!("scan:active:{}", chat_id);
+    let scan_data: Option<String> = redis::cmd("GET")
+        .arg(&scan_key)
+        .query_async(redis)
+        .await
+        .unwrap_or(None);
+
+    if scan_data.is_none() {
+        send_message(client, &config.telegram_bot_token, chat_id,
+            "✅ Tidak ada scan yang sedang berjalan.").await?;
+        return Ok(());
+    }
+
+    // Kill nuclei processes
+    let _ = tokio::process::Command::new("pkill")
+        .args(&["-f", "nuclei.*-u"])
+        .output()
+        .await;
+
+    // Clear Redis key
+    let _: () = redis::cmd("DEL").arg(&scan_key)
+        .query_async(redis).await.unwrap_or(());
+
+    send_message(client, &config.telegram_bot_token, chat_id,
+        "⛔ Scan dibatalkan.").await?;
+    Ok(())
+}
+
 async fn cmd_help(
     client: &Client,
     config: &Config,
@@ -1120,6 +1691,11 @@ async fn cmd_help(
         /cost — Lihat penggunaan token & biaya\n\
         /diff — Lihat file yang diubah di run terakhir\n\
         /pr — Lihat PR terbaru project ini\n\
+        /scan <url> [mode] — Security scan website\n\
+        /setauth <type> <value> — Set login utk authenticated scan\n\
+        /clearauth — Hapus kredensial scan\n\
+        /scanstatus — Cek status scan yang berjalan\n\
+        /cancelscan — Batalkan scan yang berjalan\n\
         /newsession — Mulai session baru (branch baru)\n\
         /retry — Ulangi run terakhir yang gagal\n\
         /cancel — Batalkan run yang sedang berjalan\n\
@@ -1299,6 +1875,231 @@ async fn handle_regular_message(
         }
     }
 
+    let started_at = std::time::Instant::now();
+
+    // Non-command messages are routed by AI first; fallback classifier is only a safety net.
+    let early_router_placeholder_started = std::time::Instant::now();
+    let router_placeholder_id = send_message_with_id(
+        client,
+        &config.telegram_bot_token,
+        chat_id,
+        "💭 Lagi mikir...",
+    ).await.ok();
+    tracing::info!(
+        chat_id,
+        elapsed_ms = started_at.elapsed().as_millis(),
+        step_ms = early_router_placeholder_started.elapsed().as_millis(),
+        has_placeholder = router_placeholder_id.is_some(),
+        "Telegram fast chat step: sent router placeholder"
+    );
+
+    let router_started = std::time::Instant::now();
+    let route_input = crate::services::openclaw_service::OpenClawRunInput {
+        agent_id: "default".to_string(),
+        session_key: format!("telegram_route_{}_{}", tg_user.user_id, project_id),
+        user_id: tg_user.user_id.to_string(),
+        instructions: String::new(),
+        prompt: text.to_string(),
+        model: "openclaw".to_string(),
+        history: vec![],
+    };
+    let route_decision = crate::services::openclaw_service::route_prompt(config, &route_input).await.ok();
+    let mut route = match route_decision.as_ref().map(|d| d.intent.as_str()) {
+        Some("smalltalk") => crate::services::openclaw_service::PromptRoute::Smalltalk,
+        Some("chat") => crate::services::openclaw_service::PromptRoute::Chat,
+        Some("retry_push") => crate::services::openclaw_service::PromptRoute::RetryPush,
+        Some("coding_task") => crate::services::openclaw_service::PromptRoute::CodingTask,
+        _ => crate::services::openclaw_service::classify_prompt(text),
+    };
+    tracing::info!(
+        chat_id,
+        prompt_len = text.len(),
+        route = ?route,
+        elapsed_ms = started_at.elapsed().as_millis(),
+        step_ms = router_started.elapsed().as_millis(),
+        used_ai_router = route_decision.is_some(),
+        "Telegram fast chat step: classified prompt"
+    );
+
+    if matches!(route, crate::services::openclaw_service::PromptRoute::Smalltalk) {
+        let typing_started = std::time::Instant::now();
+        let _ = send_chat_action(client, &config.telegram_bot_token, chat_id, "typing").await;
+        tracing::info!(
+            chat_id,
+            elapsed_ms = started_at.elapsed().as_millis(),
+            step_ms = typing_started.elapsed().as_millis(),
+            "Telegram fast chat step: sent typing action"
+        );
+
+        let reply_started = std::time::Instant::now();
+        let reply = crate::services::openclaw_service::fallback_smalltalk_response(text);
+        tracing::info!(
+            chat_id,
+            elapsed_ms = started_at.elapsed().as_millis(),
+            step_ms = reply_started.elapsed().as_millis(),
+            reply_len = reply.len(),
+            "Telegram fast chat step: built smalltalk reply"
+        );
+
+        let finalize_started = std::time::Instant::now();
+        if let Some(message_id) = router_placeholder_id {
+            if let Err(e) = edit_message_text(client, &config.telegram_bot_token, chat_id, message_id, &reply).await {
+                tracing::error!(chat_id, message_id, error = %e, "Telegram router placeholder finalize edit failed");
+                send_long_message(client, &config.telegram_bot_token, chat_id, &reply).await?;
+            }
+        } else {
+            send_placeholder_then_finalize(
+                client,
+                &config.telegram_bot_token,
+                chat_id,
+                "💭 Lagi mikir...",
+                &reply,
+            ).await?;
+        }
+        tracing::info!(
+            chat_id,
+            elapsed_ms = started_at.elapsed().as_millis(),
+            step_ms = finalize_started.elapsed().as_millis(),
+            "Telegram fast chat step: finalized smalltalk reply"
+        );
+
+        let project_lookup_started = std::time::Instant::now();
+        let project = sqlx::query_as::<_, (String, String, String)>(
+            "SELECT slug, repo_url, openclaw_agent_id FROM projects WHERE id = $1"
+        ).bind(project_id).fetch_optional(db).await?;
+        tracing::info!(
+            chat_id,
+            elapsed_ms = started_at.elapsed().as_millis(),
+            step_ms = project_lookup_started.elapsed().as_millis(),
+            "Telegram fast chat step: loaded project"
+        );
+
+        if project.is_some() {
+            let session_lookup_started = std::time::Instant::now();
+            if let Ok(session_id) = get_or_create_session(db, &mut redis, tg_user, project_id).await {
+                tracing::info!(
+                    chat_id,
+                    session_id = %session_id,
+                    elapsed_ms = started_at.elapsed().as_millis(),
+                    step_ms = session_lookup_started.elapsed().as_millis(),
+                    "Telegram fast chat step: got session"
+                );
+                let add_user_msg_started = std::time::Instant::now();
+                let _ = crate::services::session_service::add_message(db, session_id, "user", text).await;
+                tracing::info!(
+                    chat_id,
+                    session_id = %session_id,
+                    elapsed_ms = started_at.elapsed().as_millis(),
+                    step_ms = add_user_msg_started.elapsed().as_millis(),
+                    "Telegram fast chat step: stored user message"
+                );
+                let add_assistant_msg_started = std::time::Instant::now();
+                let _ = crate::services::session_service::add_message(db, session_id, "assistant", &reply).await;
+                tracing::info!(
+                    chat_id,
+                    session_id = %session_id,
+                    elapsed_ms = started_at.elapsed().as_millis(),
+                    step_ms = add_assistant_msg_started.elapsed().as_millis(),
+                    "Telegram fast chat step: stored assistant message"
+                );
+                tracing::info!(
+                    chat_id,
+                    user_id = %tg_user.user_id,
+                    project_id = %project_id,
+                    session_id = %session_id,
+                    route = ?route,
+                    history_len = 0,
+                    prompt_len = text.len(),
+                    reply_len = reply.len(),
+                    latency_ms = started_at.elapsed().as_millis(),
+                    "Telegram fast chat completed"
+                );
+            } else {
+                tracing::warn!(chat_id, "Telegram fast chat step: session persistence skipped for smalltalk");
+            }
+        }
+
+        return Ok(());
+    }
+
+    if matches!(route, crate::services::openclaw_service::PromptRoute::Chat) {
+        let early_placeholder_id = router_placeholder_id;
+        let project_lookup_started = std::time::Instant::now();
+        let project = sqlx::query_as::<_, (String, String, String)>(
+            "SELECT slug, repo_url, openclaw_agent_id FROM projects WHERE id = $1"
+        ).bind(project_id).fetch_optional(db).await?;
+        tracing::info!(
+            chat_id,
+            elapsed_ms = started_at.elapsed().as_millis(),
+            step_ms = project_lookup_started.elapsed().as_millis(),
+            "Telegram fast chat step: loaded project"
+        );
+
+        let (_project_slug, _repo_url, openclaw_agent_id) = match project {
+            Some(p) => p,
+            None => {
+                send_message(client, &config.telegram_bot_token, chat_id,
+                    "❌ Project tidak ditemukan. Pilih ulang dengan /project <slug>").await?;
+                return Ok(());
+            }
+        };
+
+        let history: Vec<(String, String)> = Vec::new();
+        let history_len = history.len();
+        let input = crate::services::openclaw_service::OpenClawRunInput {
+            agent_id: openclaw_agent_id,
+            session_key: format!("telegram_chat_user_{}_project_{}", tg_user.user_id, project_id),
+            user_id: tg_user.user_id.to_string(),
+            instructions: crate::services::openclaw_service::build_chat_instructions(),
+            prompt: text.to_string(),
+            model: "openclaw".to_string(),
+            history,
+        };
+        let stream_started = std::time::Instant::now();
+        let reply = stream_chat_reply_with_placeholder(
+            client,
+            &config.telegram_bot_token,
+            chat_id,
+            config,
+            input,
+            early_placeholder_id,
+        ).await?;
+        tracing::info!(
+            chat_id,
+            elapsed_ms = started_at.elapsed().as_millis(),
+            step_ms = stream_started.elapsed().as_millis(),
+            reply_len = reply.len(),
+            "Telegram fast chat step: streamed chat reply"
+        );
+
+        let persist_started = std::time::Instant::now();
+        if let Ok(real_session_id) = get_or_create_session(db, &mut redis, tg_user, project_id).await {
+            let _ = crate::services::session_service::add_message(db, real_session_id, "user", text).await;
+            let _ = crate::services::session_service::add_message(db, real_session_id, "assistant", &reply).await;
+            tracing::info!(
+                chat_id,
+                session_id = %real_session_id,
+                elapsed_ms = started_at.elapsed().as_millis(),
+                step_ms = persist_started.elapsed().as_millis(),
+                "Telegram fast chat step: persisted chat exchange"
+            );
+        } else {
+            tracing::warn!(chat_id, "Telegram fast chat step: session persistence skipped for chat");
+        }
+        tracing::info!(
+            chat_id,
+            user_id = %tg_user.user_id,
+            project_id = %project_id,
+            route = ?route,
+            history_len,
+            prompt_len = text.len(),
+            reply_len = reply.len(),
+            latency_ms = started_at.elapsed().as_millis(),
+            "Telegram fast chat completed"
+        );
+        return Ok(());
+    }
+
     // Send processing indicator
     send_message(client, &config.telegram_bot_token, chat_id, "⏳ Sedang diproses...").await?;
 
@@ -1349,50 +2150,65 @@ async fn get_or_create_session(
     project_id: Uuid,
 ) -> anyhow::Result<Uuid> {
     let pin_key = format!("tg:pinned_session:{}:{}", tg_user.user_id, project_id);
+    let force_session_key = format!("tg:force_new_session:{}:{}", tg_user.user_id, project_id);
 
-    // Check Redis for pinned session — cleared by /newsession to force a fresh one
-    let pinned: Option<String> = redis::cmd("GET")
-        .arg(&pin_key)
+    // /newsession should be the only thing that rotates the coding session.
+    // Consume this one-shot flag first before checking any cached/default session.
+    let force_new_session: bool = redis::cmd("GETDEL")
+        .arg(&force_session_key)
         .query_async(redis)
         .await
-        .unwrap_or(None);
+        .unwrap_or(None::<String>)
+        .is_some();
 
-    if let Some(sid_str) = pinned {
-        if let Ok(sid) = sid_str.parse::<Uuid>() {
-            let exists = sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS(SELECT 1 FROM coding_sessions WHERE id = $1)"
-            )
-            .bind(sid)
-            .fetch_one(db)
+    if !force_new_session {
+        // Fast path: cached pinned session for this user+project.
+        let pinned: Option<String> = redis::cmd("GET")
+            .arg(&pin_key)
+            .query_async(redis)
             .await
-            .unwrap_or(false);
-            if exists {
-                return Ok(sid);
+            .unwrap_or(None);
+
+        if let Some(sid_str) = pinned {
+            if let Ok(sid) = sid_str.parse::<Uuid>() {
+                let exists = sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM coding_sessions WHERE id = $1 AND project_id = $2 AND user_id = $3)"
+                )
+                .bind(sid)
+                .bind(project_id)
+                .bind(tg_user.user_id)
+                .fetch_one(db)
+                .await
+                .unwrap_or(false);
+                if exists {
+                    return Ok(sid);
+                }
             }
+        }
+
+        // Fallback: reuse the latest existing session for this user+project,
+        // regardless of day. Daily rollover was causing unnecessary cold starts.
+        let existing_session = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM coding_sessions \
+             WHERE project_id = $1 AND user_id = $2 \
+             ORDER BY created_at DESC LIMIT 1"
+        )
+        .bind(project_id)
+        .bind(tg_user.user_id)
+        .fetch_optional(db)
+        .await?;
+
+        if let Some(sid) = existing_session {
+            let _: std::result::Result<(), _> = redis::cmd("SET")
+                .arg(&pin_key)
+                .arg(sid.to_string())
+                .query_async(redis)
+                .await;
+            return Ok(sid);
         }
     }
 
-    // Check for existing session today for this user + project
-    let today_session = sqlx::query_scalar::<_, Uuid>(
-        "SELECT id FROM coding_sessions \
-         WHERE project_id = $1 AND user_id = $2 \
-         AND created_at::date = CURRENT_DATE \
-         ORDER BY created_at DESC LIMIT 1"
-    )
-    .bind(project_id)
-    .bind(tg_user.user_id)
-    .fetch_optional(db)
-    .await?;
-
-    if let Some(sid) = today_session {
-        // Pin so /newsession can clear it next time
-        let _: std::result::Result<(), _> = redis::cmd("SETEX")
-            .arg(&pin_key).arg(86400u64).arg(sid.to_string())
-            .query_async(redis).await;
-        return Ok(sid);
-    }
-
-    // Create new session
+    // Create new session only when no reusable one exists, or after explicit /newsession.
     let session_id = Uuid::new_v4();
     let title = format!("Telegram - {} - {}", tg_user.name, chrono_today());
     sqlx::query(
@@ -1401,10 +2217,11 @@ async fn get_or_create_session(
     .bind(session_id).bind(project_id).bind(tg_user.user_id).bind(&title)
     .execute(db).await?;
 
-    // Pin the new session in Redis (24h TTL)
-    let _: std::result::Result<(), _> = redis::cmd("SETEX")
-        .arg(&pin_key).arg(86400u64).arg(session_id.to_string())
-        .query_async(redis).await;
+    let _: std::result::Result<(), _> = redis::cmd("SET")
+        .arg(&pin_key)
+        .arg(session_id.to_string())
+        .query_async(redis)
+        .await;
 
     Ok(session_id)
 }
@@ -1444,21 +2261,264 @@ async fn send_long_message(
     Ok(())
 }
 
+async fn send_placeholder_then_finalize(
+    client: &Client,
+    token: &str,
+    chat_id: i64,
+    placeholder: &str,
+    final_text: &str,
+) -> anyhow::Result<()> {
+    let placeholder_id = match send_message_with_id(client, token, chat_id, placeholder).await {
+        Ok(id) => Some(id),
+        Err(e) => {
+            tracing::error!(chat_id, error = %e, "Telegram placeholder send failed");
+            None
+        }
+    };
+    if let Some(message_id) = placeholder_id {
+        if final_text.len() <= 4000 {
+            if let Err(e) = edit_message_text(client, token, chat_id, message_id, final_text).await {
+                tracing::error!(chat_id, message_id, error = %e, "Telegram placeholder finalize edit failed");
+                send_long_message(client, token, chat_id, final_text).await?;
+            }
+        } else {
+            let first_window = final_text.len().min(4000);
+            let first_chunk_end = final_text[..first_window].rfind('\n').unwrap_or(first_window);
+            let first_chunk = &final_text[..first_chunk_end];
+            if let Err(e) = edit_message_text(client, token, chat_id, message_id, first_chunk).await {
+                tracing::error!(chat_id, message_id, error = %e, "Telegram placeholder first chunk edit failed");
+                send_message(client, token, chat_id, first_chunk).await?;
+            }
+            let remaining = final_text[first_chunk_end..].trim_start();
+            if !remaining.is_empty() {
+                send_long_message(client, token, chat_id, remaining).await?;
+            }
+        }
+    } else {
+        send_long_message(client, token, chat_id, final_text).await?;
+    }
+    Ok(())
+}
+
+async fn stream_chat_reply(
+    client: &Client,
+    token: &str,
+    chat_id: i64,
+    config: &Config,
+    input: crate::services::openclaw_service::OpenClawRunInput,
+) -> anyhow::Result<String> {
+    stream_chat_reply_with_placeholder(client, token, chat_id, config, input, None).await
+}
+
+async fn stream_chat_reply_with_placeholder(
+    client: &Client,
+    token: &str,
+    chat_id: i64,
+    config: &Config,
+    input: crate::services::openclaw_service::OpenClawRunInput,
+    existing_placeholder_id: Option<i64>,
+) -> anyhow::Result<String> {
+    let placeholder_id = if let Some(id) = existing_placeholder_id {
+        Some(id)
+    } else {
+        match send_message_with_id(client, token, chat_id, "💭 Lagi mikir...").await {
+            Ok(id) => Some(id),
+            Err(e) => {
+                tracing::error!(chat_id, error = %e, "Telegram stream placeholder send failed");
+                None
+            }
+        }
+    };
+    let mut last_typing_at = Instant::now() - Duration::from_secs(10);
+    let mut last_edit_at = Instant::now() - Duration::from_secs(10);
+    let mut last_sent_text = String::new();
+    let mut stream_text = String::new();
+    let mut final_done_text = String::new();
+    let mut stream_broken = false;
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::services::openclaw_service::OpenClawEvent>(100);
+    let cfg = config.clone();
+    let inp = input.clone();
+    tokio::spawn(async move {
+        let _ = crate::services::openclaw_service::run_stream(&cfg, inp, tx).await;
+    });
+
+    while let Some(ev) = rx.recv().await {
+        if last_typing_at.elapsed() >= Duration::from_secs(4) {
+            let _ = send_chat_action(client, token, chat_id, "typing").await;
+            last_typing_at = Instant::now();
+        }
+
+        if matches!(ev.event_type.as_str(), "response.output_text.done" | "message.completed" | "response.completed") {
+            if let Some(t) = ev.payload.get("text").and_then(|v| v.as_str()) {
+                if !t.is_empty() {
+                    final_done_text = t.to_string();
+                }
+            }
+            if final_done_text.is_empty() {
+                if let Some(arr) = ev.payload.get("response")
+                    .and_then(|r| r.get("output"))
+                    .and_then(|o| o.as_array())
+                {
+                    for msg in arr.iter().rev() {
+                        if let Some(parts) = msg.get("content").and_then(|c| c.as_array()) {
+                            for part in parts {
+                                let is_text = part.get("type").and_then(|t| t.as_str()) == Some("text");
+                                if is_text {
+                                    if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                                        if !t.is_empty() {
+                                            final_done_text = t.to_string();
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if !final_done_text.is_empty() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        let is_delta = matches!(ev.event_type.as_str(),
+            "assistant.delta" | "response.output_text.delta" | "content_block_delta");
+        if is_delta {
+            let delta = ev.payload.get("delta").and_then(|d| d.as_str())
+                .or_else(|| ev.payload.get("text").and_then(|d| d.as_str()))
+                .or_else(|| ev.payload.get("delta").and_then(|d| d.get("text")).and_then(|t| t.as_str()))
+                .unwrap_or("");
+            if !delta.is_empty() {
+                stream_text.push_str(delta);
+            }
+        }
+
+        if stream_broken {
+            continue;
+        }
+
+        let Some(message_id) = placeholder_id else { continue; };
+        if stream_text.trim().is_empty() {
+            continue;
+        }
+        if last_edit_at.elapsed() < Duration::from_millis(900)
+            && stream_text.len().saturating_sub(last_sent_text.len()) < 80
+        {
+            continue;
+        }
+
+        let preview = crate::services::openclaw_service::sanitize_user_facing_response(&stream_text);
+        let preview = preview.trim();
+        if preview.is_empty() {
+            continue;
+        }
+        let preview = if preview.len() > 3800 {
+            &preview[..3800]
+        } else {
+            preview
+        };
+        if preview == last_sent_text {
+            continue;
+        }
+
+        if edit_message_text(client, token, chat_id, message_id, preview).await.is_ok() {
+            last_edit_at = Instant::now();
+            last_sent_text = preview.to_string();
+        } else {
+            tracing::error!(chat_id, message_id, "Telegram stream preview edit failed; falling back to final send");
+            stream_broken = true;
+        }
+    }
+
+    let chosen = if !final_done_text.trim().is_empty() {
+        final_done_text
+    } else {
+        stream_text
+    };
+    let mut safe = crate::services::openclaw_service::sanitize_user_facing_response(&chosen);
+    if safe.trim().is_empty() {
+        let fallback = crate::services::openclaw_service::run_chat(config, input).await?;
+        safe = crate::services::openclaw_service::sanitize_user_facing_response(&fallback);
+    }
+    if safe.trim().is_empty() {
+        safe = "Siap. Coba kirim ulang dengan sedikit detail tambahan ya.".to_string();
+    }
+
+    if let Some(message_id) = placeholder_id {
+        if safe.len() <= 4000 {
+            if let Err(e) = edit_message_text(client, token, chat_id, message_id, &safe).await {
+                tracing::error!(chat_id, message_id, error = %e, "Telegram final stream edit failed");
+                send_long_message(client, token, chat_id, &safe).await?;
+            }
+        } else {
+            let first_window = safe.len().min(4000);
+            let first_chunk_end = safe[..first_window].rfind('\n').unwrap_or(first_window);
+            let first_chunk = &safe[..first_chunk_end];
+            if let Err(e) = edit_message_text(client, token, chat_id, message_id, first_chunk).await {
+                tracing::error!(chat_id, message_id, error = %e, "Telegram final first chunk edit failed");
+                send_message(client, token, chat_id, first_chunk).await?;
+            }
+            let remaining = safe[first_chunk_end..].trim_start();
+            if !remaining.is_empty() {
+                send_long_message(client, token, chat_id, remaining).await?;
+            }
+        }
+    } else {
+        send_placeholder_then_finalize(client, token, chat_id, "💭 Lagi mikir...", &safe).await?;
+    }
+
+    Ok(safe)
+}
+
 async fn send_message(
     client: &Client,
     token: &str,
     chat_id: i64,
     text: &str,
 ) -> anyhow::Result<()> {
+    let _ = send_message_with_id(client, token, chat_id, text).await?;
+    Ok(())
+}
+
+fn convert_markdown_for_telegram(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    for line in text.lines() {
+        let line = if line.starts_with("### ") { &line[4..] }
+            else if line.starts_with("## ") { &line[3..] }
+            else if line.starts_with("# ") { &line[2..] }
+            else { line };
+        let line = line.replace("**", "*");
+        let line = line.replace("__", "_");
+        let line = line.replace("~~", "");
+        result.push_str(&line);
+        result.push('\n');
+    }
+    if result.ends_with('\n') { result.pop(); }
+    result
+}
+
+async fn send_message_with_id(
+    client: &Client,
+    token: &str,
+    chat_id: i64,
+    text: &str,
+) -> anyhow::Result<i64> {
     let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
-    let body = serde_json::json!({
+    let converted = convert_markdown_for_telegram(text);
+    let body_md = serde_json::json!({
+        "chat_id": chat_id,
+        "text": converted,
+        "parse_mode": "Markdown",
+    });
+    let body_plain = serde_json::json!({
         "chat_id": chat_id,
         "text": text,
     });
 
     let mut retries = 0u32;
     loop {
-        let resp = client.post(&url).json(&body).send().await?;
+        let resp = client.post(&url).json(&body_md).send().await?;
         if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
             retries += 1;
             if retries > 5 {
@@ -1473,8 +2533,112 @@ async fn send_message(
             tokio::time::sleep(tokio::time::Duration::from_secs(wait)).await;
             continue;
         }
-        break;
+        let status = resp.status();
+        let parsed: TelegramResponse<TelegramMessage> = resp.json().await?;
+        if status.is_success() && parsed.ok {
+            let message_id = parsed
+                .result
+                .map(|m| m.message_id)
+                .ok_or_else(|| anyhow::anyhow!("Telegram sendMessage missing message_id"))?;
+            return Ok(message_id);
+        }
+
+        let markdown_desc = parsed.description.unwrap_or_else(|| "unknown error".to_string());
+        tracing::warn!(chat_id, status = %status, error = %markdown_desc, "Telegram Markdown send failed; retrying as plain text");
+        let resp_plain = client.post(&url).json(&body_plain).send().await?;
+        let status_plain = resp_plain.status();
+        let parsed_plain: TelegramResponse<TelegramMessage> = resp_plain.json().await?;
+        if !status_plain.is_success() || !parsed_plain.ok {
+            anyhow::bail!(
+                "Telegram sendMessage failed with status {} code {:?}: {}",
+                status_plain,
+                parsed_plain.error_code,
+                parsed_plain.description.unwrap_or_else(|| "unknown error".to_string())
+            );
+        }
+        let message_id = parsed_plain
+            .result
+            .map(|m| m.message_id)
+            .ok_or_else(|| anyhow::anyhow!("Telegram sendMessage missing message_id"))?;
+        return Ok(message_id);
     }
+}
+
+async fn send_chat_action(
+    client: &Client,
+    token: &str,
+    chat_id: i64,
+    action: &str,
+) -> anyhow::Result<()> {
+    let url = format!("https://api.telegram.org/bot{}/sendChatAction", token);
+    let body = serde_json::json!({
+        "chat_id": chat_id,
+        "action": action,
+    });
+    let _ = client.post(&url).json(&body).send().await?;
+    Ok(())
+}
+
+async fn edit_message_text(
+    client: &Client,
+    token: &str,
+    chat_id: i64,
+    message_id: i64,
+    text: &str,
+) -> anyhow::Result<()> {
+    let url = format!("https://api.telegram.org/bot{}/editMessageText", token);
+    let converted = convert_markdown_for_telegram(text);
+    let body_md = serde_json::json!({
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": converted,
+        "parse_mode": "Markdown",
+    });
+    let resp = client.post(&url).json(&body_md).send().await?;
+    if resp.status().is_success() {
+        return Ok(());
+    }
+
+    let err_md = resp.text().await.unwrap_or_default();
+    tracing::warn!(chat_id, message_id, error = %err_md, "Telegram Markdown edit failed; retrying as plain text");
+
+    let body_plain = serde_json::json!({
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+    });
+    let resp_plain = client.post(&url).json(&body_plain).send().await?;
+    if !resp_plain.status().is_success() {
+        let err = resp_plain.text().await.unwrap_or_default();
+        tracing::error!(chat_id, message_id, error = %err, "Telegram editMessageText failed");
+        anyhow::bail!("Telegram editMessageText failed: {}", err);
+    }
+    Ok(())
+}
+
+// Send an in-memory file as a Telegram document (used for scan report export).
+// Skips silently if too large for Telegram (50MB). Best-effort, never panics.
+async fn send_scan_document(
+    client: &Client,
+    token: &str,
+    chat_id: i64,
+    bytes: Vec<u8>,
+    file_name: &str,
+    mime: &str,
+    caption: &str,
+) -> anyhow::Result<()> {
+    if bytes.is_empty() || bytes.len() >= 50 * 1024 * 1024 {
+        return Ok(());
+    }
+    let url = format!("https://api.telegram.org/bot{}/sendDocument", token);
+    let part = reqwest::multipart::Part::bytes(bytes)
+        .file_name(file_name.to_string())
+        .mime_str(mime)?;
+    let form = reqwest::multipart::Form::new()
+        .text("chat_id", chat_id.to_string())
+        .text("caption", caption.to_string())
+        .part("document", part);
+    let _ = client.post(&url).multipart(form).send().await?;
     Ok(())
 }
 

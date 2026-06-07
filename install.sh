@@ -563,6 +563,196 @@ install_nodejs_9router() {
   command -v 9router &>/dev/null && log "9router installed" || warn "9router not found in PATH"
 }
 
+# ─── Install Security Scanner (Nuclei) ────────────────────────────────────────
+install_security_scanner() {
+  section "Installing Security Scanner (Nuclei)"
+  local NUCLEI_VERSION="3.3.7"
+  local SCANNER_DIR="$REPO_DIR/security-scanner"
+
+  if command -v nuclei &>/dev/null; then
+    log "Nuclei already installed: $(nuclei -version 2>&1 | grep -oP 'v[\d.]+' | head -1)"
+  else
+    info "Installing Nuclei v${NUCLEI_VERSION}..."
+    local TEMP_DIR=$(mktemp -d)
+    local NUCLEI_URL="https://github.com/projectdiscovery/nuclei/releases/download/v${NUCLEI_VERSION}/nuclei_${NUCLEI_VERSION}_linux_amd64.zip"
+    curl -sL "$NUCLEI_URL" -o "${TEMP_DIR}/nuclei.zip"
+    unzip -q "${TEMP_DIR}/nuclei.zip" -d "${TEMP_DIR}"
+    mv "${TEMP_DIR}/nuclei" /usr/local/bin/nuclei
+    chmod +x /usr/local/bin/nuclei
+    rm -rf "${TEMP_DIR}"
+    log "Nuclei installed: v${NUCLEI_VERSION}"
+  fi
+
+  # Update templates
+  info "Updating Nuclei templates..."
+  nuclei -update-templates -silent 2>/dev/null || nuclei -ut -silent 2>/dev/null || true
+  log "Nuclei templates updated"
+
+  # Install sqlmap (active SQL-injection testing for the `sqli` scan mode)
+  if command -v sqlmap &>/dev/null; then
+    log "sqlmap already installed: $(sqlmap --version 2>/dev/null | head -1)"
+  else
+    info "Installing sqlmap..."
+    apt-get install -y -qq sqlmap >/dev/null 2>&1 && log "sqlmap installed" || warn "sqlmap install failed (sqli mode will be unavailable)"
+  fi
+
+  # Install dalfox (active XSS testing for the `xss` scan mode).
+  # Pin v2.9.0: newer releases are built against GLIBC 2.38 and won't run on
+  # Ubuntu 22.04 (GLIBC 2.35). v2.9.0 is a static-friendly build that works.
+  if command -v dalfox &>/dev/null; then
+    log "dalfox already installed: $(dalfox version 2>&1 | tail -1)"
+  else
+    info "Installing dalfox (XSS scanner)..."
+    DALFOX_URL="https://github.com/hahwul/dalfox/releases/download/v2.9.0/dalfox_2.9.0_linux_amd64.tar.gz"
+    if curl -sL "$DALFOX_URL" -o "${TEMP_DIR}/dalfox.tar.gz" \
+       && tar xzf "${TEMP_DIR}/dalfox.tar.gz" -C "${TEMP_DIR}" 2>/dev/null; then
+      DALFOX_BIN=$(find "${TEMP_DIR}" -type f -name dalfox | head -1)
+      if [[ -n "$DALFOX_BIN" ]]; then
+        mv -f "$DALFOX_BIN" /usr/local/bin/dalfox && chmod +x /usr/local/bin/dalfox
+        log "dalfox installed"
+      else
+        warn "dalfox binary not found in archive (xss mode unavailable)"
+      fi
+    else
+      warn "dalfox install failed (xss mode will be unavailable)"
+    fi
+  fi
+
+  # Install katana (crawler used by `xss` mode to auto-discover parameterized
+  # URLs when the user gives a bare domain -- no manual ?param= needed).
+  # ProjectDiscovery Go binary: statically linked, runs fine on glibc 2.35.
+  if command -v katana &>/dev/null; then
+    log "katana already installed: $(katana -version 2>&1 | tail -1)"
+  else
+    info "Installing katana (crawler for xss auto-discovery)..."
+    KATANA_VERSION="1.6.1"
+    KATANA_URL="https://github.com/projectdiscovery/katana/releases/download/v${KATANA_VERSION}/katana_${KATANA_VERSION}_linux_amd64.zip"
+    if curl -sL "$KATANA_URL" -o "${TEMP_DIR}/katana.zip" \
+       && unzip -o -q "${TEMP_DIR}/katana.zip" katana -d "${TEMP_DIR}" 2>/dev/null; then
+      mv -f "${TEMP_DIR}/katana" /usr/local/bin/katana && chmod +x /usr/local/bin/katana
+      log "katana installed"
+    else
+      warn "katana install failed (xss auto-crawl unavailable; xss still works with explicit ?param=)"
+    fi
+  fi
+
+  # Install trivy (dependency CVE + secret + IaC scan for the `deps` mode).
+  # Static Go binary; runs fine on glibc 2.35. Used as `trivy repo <git-url>`.
+  if command -v trivy &>/dev/null; then
+    log "trivy already installed: $(trivy --version 2>&1 | head -1)"
+  else
+    info "Installing trivy (dependency/secret/IaC scanner)..."
+    TRIVY_VERSION="0.70.0"
+    TRIVY_URL="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+    if curl -sL "$TRIVY_URL" -o "${TEMP_DIR}/trivy.tar.gz" \
+       && tar xzf "${TEMP_DIR}/trivy.tar.gz" -C "${TEMP_DIR}" trivy 2>/dev/null; then
+      mv -f "${TEMP_DIR}/trivy" /usr/local/bin/trivy && chmod +x /usr/local/bin/trivy
+      log "trivy installed"
+      # Pre-download the vuln DB so the first scan is not slow (best-effort).
+      HOME=/root trivy image --download-db-only >/dev/null 2>&1 || \
+        warn "trivy DB pre-download failed (first deps scan will fetch it)"
+    else
+      warn "trivy install failed (deps mode will be unavailable)"
+    fi
+  fi
+
+  # Install subfinder + httpx (attack-surface discovery for the `discovery`
+  # mode). ProjectDiscovery Go binaries: static, run fine on glibc 2.35.
+  for pdtool in subfinder httpx; do
+    if command -v "$pdtool" &>/dev/null; then
+      log "$pdtool already installed"
+      continue
+    fi
+    info "Installing $pdtool (attack-surface discovery)..."
+    case "$pdtool" in
+      subfinder) PD_VER="2.14.0" ;;
+      httpx)     PD_VER="1.9.0" ;;
+    esac
+    PD_URL="https://github.com/projectdiscovery/${pdtool}/releases/download/v${PD_VER}/${pdtool}_${PD_VER}_linux_amd64.zip"
+    if curl -sL "$PD_URL" -o "${TEMP_DIR}/${pdtool}.zip" \
+       && unzip -o -q "${TEMP_DIR}/${pdtool}.zip" "$pdtool" -d "${TEMP_DIR}" 2>/dev/null; then
+      mv -f "${TEMP_DIR}/${pdtool}" /usr/local/bin/${pdtool} && chmod +x /usr/local/bin/${pdtool}
+      log "$pdtool installed"
+    else
+      warn "$pdtool install failed (discovery mode partially unavailable)"
+    fi
+  done
+
+  # Install testssl.sh (TLS/SSL config audit for the `tls` scan mode).
+  # Pure-bash tool; clone the repo and symlink the script.
+  if command -v testssl.sh &>/dev/null; then
+    log "testssl.sh already installed"
+  else
+    info "Installing testssl.sh (TLS auditor)..."
+    if [[ ! -d /opt/testssl.sh ]]; then
+      git clone --depth 1 -q https://github.com/drwetter/testssl.sh.git /opt/testssl.sh 2>/dev/null || true
+    fi
+    if [[ -f /opt/testssl.sh/testssl.sh ]]; then
+      chmod +x /opt/testssl.sh/testssl.sh
+      ln -sf /opt/testssl.sh/testssl.sh /usr/local/bin/testssl.sh
+      log "testssl.sh installed"
+    else
+      warn "testssl.sh install failed (tls mode will be unavailable)"
+    fi
+  fi
+
+  # Setup scanner symlink
+  if [[ -f "$SCANNER_DIR/scan.sh" ]]; then
+    chmod +x "$SCANNER_DIR/scan.sh" "$SCANNER_DIR/lib/"*.sh 2>/dev/null || true
+    ln -sf "$SCANNER_DIR/scan.sh" /usr/local/bin/secscan
+    mkdir -p "$SCANNER_DIR/results"
+    log "Security scanner ready: secscan <url>"
+  else
+    warn "Scanner scripts not found at $SCANNER_DIR — skipping symlink"
+  fi
+
+  # Ensure swap exists (Nuclei loads many templates; low-RAM VPS will OOM without swap)
+  if [[ $(free -m | awk '/^Swap:/{print $2}') -lt 1024 ]]; then
+    if [[ ! -f /swapfile ]]; then
+      info "Creating 2G swapfile (prevents Nuclei OOM on low-RAM VPS)..."
+      fallocate -l 2G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=2048 status=none
+      chmod 600 /swapfile
+      mkswap /swapfile >/dev/null 2>&1
+      swapon /swapfile 2>/dev/null || true
+      grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+      echo 'vm.swappiness=10' > /etc/sysctl.d/99-swap.conf
+      sysctl vm.swappiness=10 >/dev/null 2>&1 || true
+      log "Swap enabled (2G)"
+    fi
+  else
+    log "Swap already present — skipping"
+  fi
+
+  # Install scan worker as a systemd service (single-scan queue consumer)
+  if [[ -f "$SCANNER_DIR/scan-worker.sh" ]]; then
+    chmod +x "$SCANNER_DIR/scan-worker.sh"
+    cat > /etc/systemd/system/security-scan-worker.service <<EOF
+[Unit]
+Description=Security Scan Worker (Nuclei queue consumer)
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+Environment=HOME=/root
+ExecStart=${SCANNER_DIR}/scan-worker.sh
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/log/scan-worker.log
+StandardError=append:/var/log/scan-worker.log
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable security-scan-worker.service >/dev/null 2>&1 || true
+    systemctl restart security-scan-worker.service 2>/dev/null || true
+    log "Scan worker service enabled (security-scan-worker.service)"
+  else
+    warn "scan-worker.sh not found — skipping worker service"
+  fi
+}
+
 # ─── Install OpenClaw Gateway ─────────────────────────────────────────────────
 install_openclaw() {
   section "Installing OpenClaw Gateway"
@@ -602,6 +792,93 @@ configure_openclaw() {
   python3 /tmp/oc_cfg.py && log "OpenClaw configured (bind=lan, /v1/responses=enabled, token synced)" || warn "OpenClaw config failed"
   rm -f /tmp/oc_cfg.py
   pgrep -f openclaw > /dev/null && { pkill -f openclaw 2>/dev/null; sleep 2; nohup openclaw start > /srv/ai-platform/logs/openclaw.log 2>&1 & log "OpenClaw restarted"; }
+}
+
+# ─── Session auto-cleanup cron ───────────────────────────────────────────────
+setup_session_cleanup_cron() {
+  section "Setting up OpenClaw session auto-cleanup"
+  # Wait for OpenClaw to be ready
+  local retries=0
+  while ! pgrep -f openclaw > /dev/null && [[ $retries -lt 10 ]]; do
+    sleep 2
+    ((retries++))
+  done
+  if ! pgrep -f openclaw > /dev/null; then
+    warn "OpenClaw not running — skipping session cleanup cron setup"
+    return
+  fi
+
+  # Write the cleanup script that will be called by cron
+  cat > /usr/local/bin/openclaw-session-cleanup.sh <<'CLEANUP'
+#!/bin/bash
+# OpenClaw Session Auto-Cleanup
+# Deletes sessions inactive for more than 2 days
+# Keeps: active telegram session + main session
+set -euo pipefail
+
+SESSIONS_DIR="$HOME/.openclaw/agents/main/sessions"
+SESSIONS_FILE="$SESSIONS_DIR/sessions.json"
+
+if [[ ! -f "$SESSIONS_FILE" ]]; then
+  echo "No sessions.json found — nothing to clean"
+  exit 0
+fi
+
+# Backup
+BACKUP_FILE="${SESSIONS_FILE}.bak.$(date +%Y%m%d%H%M%S)"
+cp "$SESSIONS_FILE" "$BACKUP_FILE"
+
+python3 -c "
+import json, time
+
+with open('$SESSIONS_FILE') as f:
+    data = json.load(f)
+
+now = time.time() * 1000
+cutoff = now - (2 * 24 * 3600 * 1000)  # 2 days in ms
+
+to_delete = []
+for key, s in data.items():
+    updated = s.get('updatedAt', 0)
+    if updated < cutoff:
+        to_delete.append(key)
+
+for key in to_delete:
+    del data[key]
+
+with open('$SESSIONS_FILE', 'w') as f:
+    json.dump(data, f, indent=2)
+
+print(f'Deleted {len(to_delete)} inactive sessions (>2 days), {len(data)} remaining')
+"
+
+# Keep only last 3 backups
+ls -t "$SESSIONS_DIR"/sessions.json.bak.* 2>/dev/null | tail -n +4 | xargs rm -f 2>/dev/null || true
+echo "Session cleanup complete — $(date)"
+CLEANUP
+  chmod +x /usr/local/bin/openclaw-session-cleanup.sh
+
+  # Register cron job via OpenClaw CLI
+  # Schedule: daily at 3:00 AM Asia/Shanghai
+  openclaw cron add \
+    --name "session-cleanup-2day" \
+    --schedule-kind cron \
+    --schedule-expr "0 3 * * *" \
+    --schedule-tz "Asia/Shanghai" \
+    --session-target isolated \
+    --payload-kind agentTurn \
+    --payload-message "Run the session cleanup script: bash /usr/local/bin/openclaw-session-cleanup.sh — then report how many sessions were deleted." \
+    --payload-timeout 120 \
+    --delivery-mode none \
+    --description "Auto-delete OpenClaw sessions inactive >2 days. Daily 3AM." \
+    2>/dev/null && log "Session cleanup cron registered (daily 3:00 AM)" \
+    || warn "OpenClaw cron add failed — script installed at /usr/local/bin/openclaw-session-cleanup.sh (run manually or add cron later)"
+
+  # Also add a system crontab as fallback
+  if ! crontab -l 2>/dev/null | grep -q "openclaw-session-cleanup"; then
+    (crontab -l 2>/dev/null; echo "0 19 * * * /usr/local/bin/openclaw-session-cleanup.sh >> /var/log/openclaw-cleanup.log 2>&1") | crontab -
+    log "System crontab fallback added (daily 19:00 UTC = 03:00 Asia/Shanghai)"
+  fi
 }
 
 # ─── Install Hermes Agent ─────────────────────────────────────────────────────
@@ -806,9 +1083,9 @@ print_summary() {
   echo "     b. Edit .env: TELEGRAM_BOT_TOKEN=<token> dan TELEGRAM_ENABLED=true"
   echo "     c. Restart: cd $PLATFORM_DIR && docker compose up -d --no-deps backend"
   echo "     d. Daftarkan admin pertama ke whitelist:"
-  echo "        docker exec ai-platform-postgres-1 psql -U postgres -d aicode -c \\""
+  echo "        docker exec ai-platform-postgres-1 psql -U postgres -d aicode -c \""
   echo "        INSERT INTO telegram_users (telegram_id, user_id, name)"
-  echo "        VALUES (<telegram_id>, '<user_id_dari_DB>', '<nama>');\\""
+  echo "        VALUES (<telegram_id>, '<user_id_dari_DB>', '<nama>');\""
   echo ""
   echo "  6. Setup Swap (WAJIB untuk VPS RAM <= 4GB):"
   echo "     fallocate -l 2G /swapfile"
@@ -850,12 +1127,14 @@ main() {
   install_nodejs_9router
   install_openclaw
   install_hermes
+  install_security_scanner
   create_dirs
   write_env
   write_compose
   write_caddyfile
   write_9router_config
   configure_openclaw
+  setup_session_cleanup_cron
   setup_firewall
   write_backend_placeholder
   write_systemd

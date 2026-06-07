@@ -69,3 +69,34 @@ pub async fn add_message(
     .await
     .map_err(Into::into)
 }
+
+pub async fn recent_messages(
+    db: &PgPool,
+    session_id: Uuid,
+    limit: i64,
+) -> Result<Vec<Message>> {
+    sqlx::query_as::<_, Message>(
+        "SELECT * FROM messages WHERE session_id = $1 ORDER BY created_at DESC LIMIT $2",
+    )
+    .bind(session_id)
+    .bind(limit)
+    .fetch_all(db)
+    .await
+    .map(|messages| messages.into_iter().rev().collect())
+    .map_err(Into::into)
+}
+
+pub async fn update_task_summary(
+    db: &PgPool,
+    session_id: Uuid,
+    summary: &str,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE coding_sessions SET task_summary=$1, task_summary_updated_at=NOW(), updated_at=NOW() WHERE id=$2",
+    )
+    .bind(summary)
+    .bind(session_id)
+    .execute(db)
+    .await?;
+    Ok(())
+}

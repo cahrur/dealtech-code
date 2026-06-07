@@ -1,0 +1,15 @@
+[Unit]
+Description=Security Scan Worker (Nuclei queue consumer)
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/srv/ai-platform/app/security-scanner/scan-worker.sh
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/log/scan-worker.log
+StandardError=append:/var/log/scan-worker.log
+
+[Install]
+WantedBy=multi-user.target

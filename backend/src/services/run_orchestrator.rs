@@ -7,7 +7,6 @@ use crate::config::Config;
 use crate::domain::agent_run::{AgentRun, CreateRunRequest};
 use crate::domain::policy::PolicyConfig;
 use crate::services::{
-    usage_service,
     audit_service, git_service, openclaw_service, policy_engine::PolicyEngine,
     realtime_service, workspace_service,
 };
@@ -24,9 +23,9 @@ pub async fn create_run(
     let run_id = Uuid::new_v4();
     let auto_mode = req.auto_mode.unwrap_or_else(|| "auto_trusted".to_string());
     let model = req.model.clone().unwrap_or_default();
-    // Use run_id (not session_id) so each run gets its own isolated OpenClaw session.
-    // Sharing session_id caused OpenClaw to see stale system prompts from previous runs.
-    let session_key = format!("project_{}:run_{}", project_id, run_id);
+    // Stable OpenClaw session per coding session keeps continuity and avoids
+    // paying full cold-start context repeatedly on every run.
+    let session_key = format!("project_{}:session_{}", project_id, session_id);
     let run = sqlx::query_as::<_, AgentRun>(
         "INSERT INTO agent_runs
          (id, session_id, project_id, user_id, prompt, status, auto_mode, openclaw_agent_id, openclaw_session_key, model, timeout_at, telegram_chat_id)
@@ -126,6 +125,7 @@ async fn run_inner(
 
     let policy = PolicyEngine::new(policy_config);
     let (session_id, project_id, user_id) = (run.session_id, run.project_id, run.user_id);
+    let mut telegram_progress_message_id: Option<i64> = None;
 
     // Improvement 2: Concurrency guard — only one active run per session
     let concurrent_count = sqlx::query_scalar::<_, i64>(
@@ -139,7 +139,7 @@ async fn run_inner(
 
     if concurrent_count > 0 {
         let reply = "Masih ada run yang sedang berjalan di sesi ini. Tunggu sebentar lalu coba lagi.";
-        return finish_with_reply(db.as_ref(), &mut redis, run_id, session_id, reply, false, &config.telegram_bot_token).await;
+        return finish_with_reply(db.as_ref(), &mut redis, run_id, session_id, reply, false, &config.telegram_bot_token, telegram_progress_message_id).await;
     }
 
     // Persist user message immediately so reopening a session still shows it
@@ -151,10 +151,17 @@ async fn run_inner(
     emit(&db, &mut redis, run_id, session_id, "agent_run.started",
         serde_json::json!({"run_id": run_id})).await?;
 
-    // Notify Telegram user that agent is working
+    // Notify Telegram user that agent is working using one editable progress message.
     if let Some(chat_id) = run.telegram_chat_id {
-        notify_telegram(&config.telegram_bot_token, chat_id,
-            "⏳ Agent sedang bekerja... Saya akan kabari kalau sudah selesai.").await;
+        telegram_progress_message_id = send_telegram_message_with_id(
+            &config.telegram_bot_token,
+            chat_id,
+            "💭 Lagi mikir...",
+        ).await.ok();
+        if telegram_progress_message_id.is_none() {
+            notify_telegram(&config.telegram_bot_token, chat_id,
+                "💭 Lagi mikir...").await;
+        }
         // Store active run_id in Redis so /cancel can find it
         let key = format!("tg:active_run:{}", chat_id);
         let _: std::result::Result<(), _> = redis::cmd("SETEX")
@@ -165,10 +172,17 @@ async fn run_inner(
             .await;
     }
 
+    let route = openclaw_service::classify_prompt(&run.prompt);
+    tracing::info!(run_id = %run_id, route = ?route, "Prompt classified for run");
+
     // Prepare workspace — graceful error: tell user instead of crashing
     if let Some(chat_id) = run.telegram_chat_id {
-        notify_telegram(&config.telegram_bot_token, chat_id,
-            "📂 Menyiapkan workspace...").await;
+        update_telegram_progress(
+            &config.telegram_bot_token,
+            chat_id,
+            telegram_progress_message_id,
+            "📂 Menyiapkan workspace...",
+        ).await;
     }
     let github_token = config.github_token.as_deref();
     let workspace_path = match workspace_service::prepare_workspace(
@@ -180,7 +194,7 @@ async fn run_inner(
                 "Tidak bisa mengakses repository `{}`. Pastikan URL repo benar dan credentials sudah dikonfigurasi.\n\nDetail: {}",
                 repo_url, e
             );
-            return finish_with_reply(db.as_ref(), &mut redis, run_id, session_id, &reply, false, &config.telegram_bot_token).await;
+            return finish_with_reply(db.as_ref(), &mut redis, run_id, session_id, &reply, false, &config.telegram_bot_token, telegram_progress_message_id).await;
         }
     };
 
@@ -200,7 +214,7 @@ async fn run_inner(
         Ok(b) => b,
         Err(e) => {
             let reply = format!("Gagal menyiapkan branch untuk sesi ini. Detail: {}", e);
-            return finish_with_reply(db.as_ref(), &mut redis, run_id, session_id, &reply, false, &config.telegram_bot_token).await;
+            return finish_with_reply(db.as_ref(), &mut redis, run_id, session_id, &reply, false, &config.telegram_bot_token, telegram_progress_message_id).await;
         }
     };
 
@@ -211,7 +225,7 @@ async fn run_inner(
         Ok(w) => w,
         Err(e) => {
             let reply = format!("Gagal membuat branch kerja `{}`. Detail: {}", branch_name, e);
-            return finish_with_reply(db.as_ref(), &mut redis, run_id, session_id, &reply, false, &config.telegram_bot_token).await;
+            return finish_with_reply(db.as_ref(), &mut redis, run_id, session_id, &reply, false, &config.telegram_bot_token, telegram_progress_message_id).await;
         }
     };
 
@@ -223,32 +237,50 @@ async fn run_inner(
 
     // Progress update: agent is now running
     if let Some(chat_id) = run.telegram_chat_id {
-        notify_telegram(&config.telegram_bot_token, chat_id,
-            "🤖 Agent sedang menganalisis dan menulis kode...").await;
+        update_telegram_progress(
+            &config.telegram_bot_token,
+            chat_id,
+            telegram_progress_message_id,
+            "🤖 Agent sedang menganalisis dan menulis kode...",
+        ).await;
     }
 
     // Build instructions: tell OpenClaw the worktree path so it can use its own tools
     let git_status = git_service::get_status(&worktree).await.unwrap_or_default();
     let worktree_str = worktree.to_string_lossy().to_string();
-    let instructions = openclaw_service::build_full_agent_instructions(
-        &repo_url, &branch_name, &worktree_str, &git_status,
-    );
-
-    // Fetch session history — cap at last 20 messages to avoid context bloat
-    // (unbounded history = higher cost + slower responses over time)
-    let history: Vec<(String, String)> = sqlx::query_as::<_, (String, String)>(
-        "SELECT role, content FROM messages \
-         WHERE session_id = $1 \
-         ORDER BY created_at DESC LIMIT 20"
+    let task_summary = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT task_summary FROM coding_sessions WHERE id = $1"
     )
     .bind(session_id)
-    .fetch_all(db.as_ref())
+    .fetch_optional(db.as_ref())
     .await
-    .unwrap_or_default()
-    .into_iter()
-    .rev() // restore chronological order
-    .filter(|(role, content)| !(content == &run.prompt && role == "user"))
-    .collect();
+    .unwrap_or(None)
+    .flatten();
+    let instructions = openclaw_service::build_full_agent_instructions(
+        &repo_url,
+        &branch_name,
+        &worktree_str,
+        &git_status,
+        task_summary.as_deref(),
+    );
+
+    let sanitized_prompt = openclaw_service::sanitize_user_prompt(&run.prompt);
+    let prompt_len = sanitized_prompt.len();
+    let trimmed_prompt = sanitized_prompt.trim().to_lowercase();
+    let history_limit: i64 = if trimmed_prompt.contains("lanjut") || trimmed_prompt.contains("yang tadi") {
+        4
+    } else {
+        8
+    };
+
+    // Fetch session history — keep it lean and let task summary carry older state.
+    let history: Vec<(String, String)> = crate::services::session_service::recent_messages(db.as_ref(), session_id, history_limit)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|m| !(m.role == "user" && m.content == run.prompt))
+        .map(|m| (m.role, m.content))
+        .collect();
 
     // Single OpenClaw call — streaming, OpenClaw writes files directly via its own tools
     let input = openclaw_service::OpenClawRunInput {
@@ -256,10 +288,12 @@ async fn run_inner(
         session_key: run.openclaw_session_key.clone(),
         user_id: user_id.to_string(),
         instructions,
-        prompt: openclaw_service::sanitize_user_prompt(&run.prompt),
+        prompt: sanitized_prompt,
         model: run.model.clone(),
         history,
     };
+
+    let history_len = input.history.len();
 
     let agent_response = match tokio::time::timeout(
         tokio::time::Duration::from_secs(7200),
@@ -272,14 +306,14 @@ async fn run_inner(
         Ok(Err(e)) => {
             tracing::error!("OpenClaw call failed: {:#}", e);
             let reply = "Agent tidak bisa diproses saat ini. Silakan coba lagi.".to_string();
-            return finish_with_reply(db.as_ref(), &mut redis, run_id, session_id, &reply, true, &config.telegram_bot_token).await;
+            return finish_with_reply(db.as_ref(), &mut redis, run_id, session_id, &reply, true, &config.telegram_bot_token, telegram_progress_message_id).await;
         }
         Err(_elapsed) => {
             tracing::error!(run_id = %run_id, "OpenClaw call timed out after 60 minutes");
             sqlx::query("UPDATE agent_runs SET error_message='Run timed out after 120 minutes' WHERE id=$1")
                 .bind(run_id).execute(db.as_ref()).await?;
             let reply = "Run timed out after 120 minutes. Silakan coba lagi dengan prompt yang lebih sederhana.";
-            return finish_with_reply(db.as_ref(), &mut redis, run_id, session_id, reply, true, &config.telegram_bot_token).await;
+            return finish_with_reply(db.as_ref(), &mut redis, run_id, session_id, reply, true, &config.telegram_bot_token, telegram_progress_message_id).await;
         }
     };
     let agent_reply = agent_response.reply.clone();
@@ -314,8 +348,12 @@ async fn run_inner(
                     set_status(&db, run_id, "auto_push_or_pr").await?;
                     // Progress update: pushing
                     if let Some(chat_id) = run.telegram_chat_id {
-                        notify_telegram(&config.telegram_bot_token, chat_id,
-                            "🔀 Commit dibuat, sedang push ke branch...").await;
+                        update_telegram_progress(
+                            &config.telegram_bot_token,
+                            chat_id,
+                            telegram_progress_message_id,
+                            "🔀 Commit dibuat, sedang push ke branch...",
+                        ).await;
                     }
                     match git_service::push_branch(&worktree, &branch_name, config.github_token.as_deref()).await {
                         Ok(()) => {
@@ -336,6 +374,17 @@ async fn run_inner(
     }
 
     // Build final reply: OpenClaw's reply augmented with git status
+    let task_summary_text = openclaw_service::synthesize_task_summary(
+        &run.prompt,
+        &changed,
+        commit_sha.as_deref(),
+        &branch_name,
+        pushed_branch,
+        false,
+        push_error.as_deref(),
+    );
+    let _ = crate::services::session_service::update_task_summary(db.as_ref(), session_id, &task_summary_text).await;
+
     let mut final_reply = agent_reply.clone();
     if final_reply.trim().is_empty() {
         final_reply = if changed.is_empty() {
@@ -406,7 +455,11 @@ async fn run_inner(
             .query_async(&mut redis)
             .await;
         let tg_msg = format!("{}", final_reply);
-        notify_telegram(&config.telegram_bot_token, chat_id, &tg_msg).await;
+        if let Some(message_id) = telegram_progress_message_id {
+            edit_telegram_message(&config.telegram_bot_token, chat_id, message_id, &tg_msg).await;
+        } else {
+            notify_telegram(&config.telegram_bot_token, chat_id, &tg_msg).await;
+        }
     }
 
     // Cost tracking: use real token usage from OpenClaw response
@@ -480,7 +533,21 @@ async fn run_inner(
     let _ = workspace_service::cleanup_worktree(&worktree, &workspace_path).await;
 
     // Improvement 5: Log run duration on success
-    tracing::info!(run_id = %run_id, duration_ms = start_time.elapsed().as_millis(), status = "completed", "Run finished");
+    tracing::info!(
+        run_id = %run_id,
+        session_id = %session_id,
+        route = ?route,
+        history_len,
+        prompt_len,
+        changed_files = changed.len(),
+        pushed_branch,
+        input_tokens = tokens_input,
+        output_tokens = tokens_output,
+        cost_usd,
+        duration_ms = start_time.elapsed().as_millis(),
+        status = "completed",
+        "Run finished"
+    );
 
     Ok(())
 }
@@ -495,8 +562,10 @@ async fn finish_with_reply(
     reply: &str,
     is_failure: bool,
     bot_token: &str,
+    telegram_progress_message_id: Option<i64>,
 ) -> anyhow::Result<()> {
     let _ = crate::services::session_service::add_message(db, session_id, "assistant", reply).await;
+    let _ = crate::services::session_service::update_task_summary(db, session_id, reply).await;
     let status = if is_failure { "failed_agent" } else { "completed" };
     if is_failure {
         let error_msg = if reply.trim().is_empty() { "Unknown error" } else { reply };
@@ -528,7 +597,11 @@ async fn finish_with_reply(
             .query_async(redis)
             .await;
         // Send the reply/error text to Telegram so user isn't left hanging
-        notify_telegram(bot_token, cid, reply).await;
+        if let Some(message_id) = telegram_progress_message_id {
+            edit_telegram_message(bot_token, cid, message_id, reply).await;
+        } else {
+            notify_telegram(bot_token, cid, reply).await;
+        }
     }
 
     Ok(())
@@ -558,6 +631,54 @@ async fn emit(
     payload["session_id"] = serde_json::json!(session_id);
     realtime_service::publish_event(redis, session_id, &payload).await?;
     Ok(())
+}
+
+async fn send_telegram_message_with_id(bot_token: &str, chat_id: i64, text: &str) -> anyhow::Result<i64> {
+    static TG_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    let client = TG_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_default()
+    });
+    let url = format!("https://api.telegram.org/bot{}/sendMessage", bot_token);
+    let body = serde_json::json!({ "chat_id": chat_id, "text": text });
+    let resp = client.post(&url).json(&body).send().await?;
+    let status = resp.status();
+    let value: serde_json::Value = resp.json().await?;
+    if !status.is_success() {
+        anyhow::bail!("telegram sendMessage failed: {}", status);
+    }
+    value.get("result")
+        .and_then(|r| r.get("message_id"))
+        .and_then(|m| m.as_i64())
+        .ok_or_else(|| anyhow::anyhow!("telegram sendMessage missing message_id"))
+}
+
+async fn edit_telegram_message(bot_token: &str, chat_id: i64, message_id: i64, text: &str) {
+    static TG_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    let client = TG_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_default()
+    });
+    let converted = convert_markdown_for_telegram(text);
+    let url = format!("https://api.telegram.org/bot{}/editMessageText", bot_token);
+    let body = serde_json::json!({ "chat_id": chat_id, "message_id": message_id, "text": converted });
+    let resp = client.post(&url).json(&body).send().await;
+    let ok = resp.map(|r| r.status().is_success()).unwrap_or(false);
+    if !ok {
+        notify_telegram(bot_token, chat_id, text).await;
+    }
+}
+
+async fn update_telegram_progress(bot_token: &str, chat_id: i64, message_id: Option<i64>, text: &str) {
+    if let Some(mid) = message_id {
+        edit_telegram_message(bot_token, chat_id, mid, text).await;
+    } else {
+        notify_telegram(bot_token, chat_id, text).await;
+    }
 }
 
 /// Send a Telegram message directly via Bot API (fire-and-forget).
